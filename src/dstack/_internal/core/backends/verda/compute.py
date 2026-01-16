@@ -373,11 +373,14 @@ def _get_sfs_mount_commands(
     Generate NFS mount commands for SFS volumes.
 
     SFS (Shared File System) volumes in Verda are NFS-based.
-    Mount command format: mount -t nfs -o nconnect=16 nfs.<DC>.datacrunch.io:<PSEUDO> <MOUNT_PATH>
+    Mount command format: mount -t nfs -o nconnect=16 nfs.<DC>.datacrunch.io:<PSEUDO> <HOST_PATH>
+
+    The volume is mounted at /mnt/disks/dstack-volumes/<volume_name> on the host.
+    The shim then bind-mounts this to the user-specified container path.
 
     Args:
         volumes: List of Volume objects with provisioning data
-        volume_mounts: Mapping of volume_id -> mount_path
+        volume_mounts: Mapping of volume_id -> mount_path (used to filter which volumes to mount)
         instance_region: The region/datacenter of the instance (e.g., "FIN-01")
 
     Returns:
@@ -392,8 +395,6 @@ def _get_sfs_mount_commands(
         volume_id = volume.volume_id
         if not volume_id or volume_id not in volume_mounts:
             continue
-
-        mount_path = volume_mounts[volume_id]
 
         try:
             backend_data = json.loads(volume.provisioning_data.backend_data)
@@ -411,17 +412,21 @@ def _get_sfs_mount_commands(
         # Datacenter code for NFS server (lowercase, e.g., "fin-01")
         dc = location_code.lower()
 
+        # Mount at the path the shim expects: /mnt/disks/dstack-volumes/<volume_name>
+        # The shim will bind-mount this to the user-specified container path
+        host_mount_path = f"/mnt/disks/dstack-volumes/{volume.name}"
+
         # Generate mount commands
         # 1. Create mount directory
-        commands.append(f"mkdir -p {mount_path}")
+        commands.append(f"mkdir -p {host_mount_path}")
         # 2. Mount the SFS volume via NFS
         commands.append(
-            f"mount -t nfs -o nconnect=16 nfs.{dc}.datacrunch.io:{pseudo_path} {mount_path}"
+            f"mount -t nfs -o nconnect=16 nfs.{dc}.datacrunch.io:{pseudo_path} {host_mount_path}"
         )
 
         logger.debug(
-            f"SFS mount command for volume {volume_id}: "
-            f"mount -t nfs -o nconnect=16 nfs.{dc}.datacrunch.io:{pseudo_path} {mount_path}"
+            f"SFS mount for volume {volume.name}: "
+            f"nfs.{dc}.datacrunch.io:{pseudo_path} -> {host_mount_path}"
         )
 
     return commands

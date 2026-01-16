@@ -555,6 +555,24 @@ func unmountVolumes(ctx context.Context, taskConfig TaskConfig) error {
 }
 
 func formatAndMountVolume(ctx context.Context, volume VolumeInfo) error {
+	mountPoint := getVolumeMountPoint(volume.Name)
+
+	// For NFS/network volumes (no DeviceName), the volume is already mounted by startup script.
+	// Just verify the mount point exists.
+	if volume.DeviceName == "" {
+		log.Info(ctx, "Volume has no device name (NFS/network volume), checking if already mounted",
+			"volume", volume.Name, "mountpoint", mountPoint)
+
+		// Check if mount point exists and is a mount
+		cmd := exec.CommandContext(ctx, "mountpoint", "-q", mountPoint)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("NFS volume %s not mounted at %s (should be mounted by startup script): %w",
+				volume.Name, mountPoint, err)
+		}
+		log.Info(ctx, "NFS volume already mounted", "volume", volume.Name, "mountpoint", mountPoint)
+		return nil
+	}
+
 	backend, err := getBackend(volume.Backend)
 	if err != nil {
 		return fmt.Errorf("get backend: %w", err)
