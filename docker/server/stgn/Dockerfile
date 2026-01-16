@@ -25,6 +25,9 @@ COPY src src
 COPY examples examples
 RUN uv sync --extra all
 
+# Add virtualenv to PATH so entrypoint can find dstack
+ENV PATH="/dstack-server/.venv/bin:$PATH"
+
 COPY docker/server/entrypoint.sh entrypoint.sh
 RUN chmod 777 entrypoint.sh
 
