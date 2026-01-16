@@ -78,8 +78,8 @@ pattern = '<picture>\s*|<source[^>]*>\s*|\s*</picture>|<video[^>]*>\s*|</video>\
 replacement = ''
 ignore-case = true
 
-[tool.uv.sources]
-dstack-plugin-server = { path = "examples/plugins/example_plugin_server", editable = true }
+#[tool.uv.sources]
+#dstack-plugin-server = { path = "examples/plugins/example_plugin_server", editable = true }
 
 [tool.pyright]
 typeCheckingMode = "standard"
@@ -115,7 +115,7 @@ dev = [
     "kubernetes-stubs-elephant-fork",
     # docs
     "dstack[server]; python_version >= '3.11'",
-    "dstack-plugin-server; python_version >= '3.11'",
+    # "dstack-plugin-server; python_version >= '3.11'",
     "pillow; python_version >= '3.11'",
     "cairosvg; python_version >= '3.11'",
     "mkdocs-material>=9.7.0; python_version >= '3.11'",
