@@ -22,6 +22,7 @@ ENV PATH="/root/.local/bin/:$PATH"
 
 COPY pyproject.toml uv.lock README.md ./
 COPY src src
+COPY examples examples
 RUN uv sync --extra all
 
 COPY docker/server/entrypoint.sh entrypoint.sh
