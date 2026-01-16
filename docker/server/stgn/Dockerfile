@@ -1,3 +1,13 @@
+# Stage 1: Build frontend
+FROM node:20-slim AS frontend-builder
+
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# Stage 2: Python server
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1
@@ -23,6 +33,10 @@ ENV PATH="/root/.local/bin/:$PATH"
 COPY pyproject.toml uv.lock README.md ./
 COPY src src
 COPY examples examples
+
+# Copy built frontend to statics directory
+COPY --from=frontend-builder /frontend/build src/dstack/_internal/server/statics
+
 RUN uv sync --extra all
 
 # Add virtualenv to PATH so entrypoint can find dstack
