@@ -331,51 +331,34 @@ class VerdaCompute(
 
 def _get_volume_by_id(client: VerdaClient, volume_id: str) -> Optional[Dict]:
     """
-    Fetch volume details from Verda API.
-    Returns a dict with volume properties.
+    Fetch volume details from Verda API via direct HTTP request.
+    The SDK's volume methods may not return all fields we need, so we use the REST API directly.
     """
+    import requests
+
     try:
-        # Try using the client's volumes API if available
-        if hasattr(client, "volumes") and hasattr(client.volumes, "get_by_id"):
-            vol = client.volumes.get_by_id(volume_id)
-            # Convert SDK object to dict if needed
-            if vol is not None and not isinstance(vol, dict):
-                # Try __dict__ or vars()
-                if hasattr(vol, "__dict__"):
-                    return vars(vol)
-                # Try common attribute access pattern
-                return {
-                    "id": getattr(vol, "id", None),
-                    "type": getattr(vol, "type", None),
-                    "pseudo_path": getattr(vol, "pseudo_path", None),
-                    "location": getattr(vol, "location", None),
-                    "size": getattr(vol, "size", None),
-                    "monthly_price": getattr(vol, "monthly_price", None),
-                    "is_shared_fs": getattr(vol, "is_shared_fs", None),
-                }
-            return vol
+        # Get access token from client
+        token = client._get_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
 
-        # Fall back to using the client's HTTP methods
-        if hasattr(client, "_get"):
-            response = client._get(f"/volumes/{volume_id}")
-            return response
-
-        # Last resort: direct HTTP request
-        import requests
-        headers = {"Authorization": f"Bearer {client._get_access_token()}"}
         response = requests.get(
             f"https://api.datacrunch.io/v1/volumes/{volume_id}",
             headers=headers,
             timeout=30,
         )
+
         if response.status_code == 404:
             return None
+
         response.raise_for_status()
-        return response.json()
-    except APIException as e:
-        if "not found" in str(e.message).lower():
+        data = response.json()
+        logger.debug(f"Volume API response for {volume_id}: {data}")
+        return data
+
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
             return None
-        raise
+        raise ComputeError(f"Failed to fetch volume {volume_id}: {e}")
     except Exception as e:
         logger.warning(f"Failed to fetch volume {volume_id}: {e}")
         raise ComputeError(f"Failed to fetch volume {volume_id}: {e}")
