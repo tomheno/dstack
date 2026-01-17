@@ -332,18 +332,35 @@ class VerdaCompute(
 def _get_volume_by_id(client: VerdaClient, volume_id: str) -> Optional[Dict]:
     """
     Fetch volume details from Verda API.
-    Uses the client's internal auth to make the request.
+    Returns a dict with volume properties.
     """
     try:
-        # The verda client has a volumes property that we can use
-        # If not available, we fall back to direct API call
+        # Try using the client's volumes API if available
         if hasattr(client, "volumes") and hasattr(client.volumes, "get_by_id"):
-            return client.volumes.get_by_id(volume_id)
+            vol = client.volumes.get_by_id(volume_id)
+            # Convert SDK object to dict if needed
+            if vol is not None and not isinstance(vol, dict):
+                # Try __dict__ or vars()
+                if hasattr(vol, "__dict__"):
+                    return vars(vol)
+                # Try common attribute access pattern
+                return {
+                    "id": getattr(vol, "id", None),
+                    "type": getattr(vol, "type", None),
+                    "pseudo_path": getattr(vol, "pseudo_path", None),
+                    "location": getattr(vol, "location", None),
+                    "size": getattr(vol, "size", None),
+                    "monthly_price": getattr(vol, "monthly_price", None),
+                    "is_shared_fs": getattr(vol, "is_shared_fs", None),
+                }
+            return vol
+
         # Fall back to using the client's HTTP methods
         if hasattr(client, "_get"):
             response = client._get(f"/volumes/{volume_id}")
             return response
-        # Last resort: use the client's session/auth
+
+        # Last resort: direct HTTP request
         import requests
         headers = {"Authorization": f"Bearer {client._get_access_token()}"}
         response = requests.get(
