@@ -268,7 +268,7 @@ class VerdaCompute(
         The volume must already exist in Verda and be of type *_Shared (e.g. NVMe_Shared).
         """
         volume_id = get_or_error(volume.configuration.volume_id)
-        volume_data = _get_volume_by_id(self.client, volume_id)
+        volume_data = _get_volume_by_id(self.config, volume_id)
 
         if volume_data is None:
             raise ComputeError(f"Volume {volume_id} not found in Verda")
@@ -307,9 +307,9 @@ class VerdaCompute(
             availability_zone=location,
             # SFS volumes don't have dynamic pricing; use monthly price / 730 hours as estimate
             price=volume_data.get("monthly_price"),
-            # SFS volumes are mounted via NFS at instance creation, not attached via cloud API
-            attachable=False,
-            detachable=False,
+            # SFS volumes must be attached via Verda API to authorize instance IP access
+            attachable=True,
+            detachable=True,
             backend_data=backend_data,
         )
 
@@ -337,37 +337,179 @@ class VerdaCompute(
         self, volume: Volume, provisioning_data: JobProvisioningData
     ) -> VolumeAttachmentData:
         """
-        SFS volumes are mounted via NFS in the instance startup script.
-        No cloud API attachment is needed. Return empty attachment data.
-        This method exists to handle legacy volumes registered with attachable=True.
+        Attach an SFS volume to an instance via Verda API.
+
+        This authorizes the instance IP to access the NFS share.
+        The actual NFS mount is done via the startup script.
+
+        API: PUT /v1/volumes with body {"action": "attach", "id": "<volume_id>", "instance_ids": ["<instance_id>"]}
         """
-        logger.debug(
-            f"SFS volume {volume.name} uses NFS mount, no cloud attachment needed"
+        import requests
+
+        volume_id = volume.volume_id
+        instance_id = provisioning_data.instance_id
+
+        logger.info(
+            "Attaching SFS volume %s to instance %s",
+            volume_id, instance_id
         )
-        return VolumeAttachmentData()
+
+        try:
+            token = _get_verda_access_token(
+                self.config.creds.client_id,
+                self.config.creds.client_secret,
+            )
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+
+            payload = {
+                "action": "attach",
+                "id": volume_id,
+                "instance_ids": [instance_id],
+            }
+
+            logger.info(
+                "Calling Verda volume API: PUT /v1/volumes with payload=%s",
+                payload
+            )
+
+            response = requests.put(
+                "https://api.datacrunch.io/v1/volumes",
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+
+            logger.info(
+                "Verda volume API response: status=%d body=%s",
+                response.status_code, response.text[:500] if response.text else "(empty)"
+            )
+
+            # 202 Accepted is a valid response - means the request was accepted for async processing
+            if response.status_code not in (200, 201, 202, 204):
+                error_msg = response.text
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get("message", error_data)
+                except Exception:
+                    pass
+                raise ComputeError(
+                    f"Failed to attach volume {volume_id} to instance {instance_id}: "
+                    f"HTTP {response.status_code} - {error_msg}"
+                )
+
+            logger.info(
+                "Successfully attached SFS volume %s to instance %s",
+                volume_id, instance_id
+            )
+
+            # SFS volumes don't have a device_name - they're mounted via NFS
+            return VolumeAttachmentData(device_name=None)
+
+        except requests.exceptions.RequestException as e:
+            raise ComputeError(f"Failed to attach volume {volume_id}: {e}")
 
     def detach_volume(
         self, volume: Volume, provisioning_data: JobProvisioningData, force: bool = False
     ):
         """
-        SFS volumes are unmounted automatically when the instance terminates.
-        No cloud API detachment is needed.
-        This method exists to handle legacy volumes registered with detachable=True.
+        Detach an SFS volume from an instance via Verda API.
+
+        This revokes the instance IP's authorization to access the NFS share.
+
+        API: PUT /v1/volumes with body {"action": "detach", "id": "<volume_id>", "instance_ids": ["<instance_id>"]}
         """
-        logger.debug(
-            f"SFS volume {volume.name} uses NFS mount, no cloud detachment needed"
+        import requests
+
+        volume_id = volume.volume_id
+        instance_id = provisioning_data.instance_id
+
+        logger.info(
+            "Detaching SFS volume %s from instance %s (force=%s)",
+            volume_id, instance_id, force
         )
 
-    def is_volume_detached(
-        self, volume: Volume, provisioning_data: JobProvisioningData
-    ) -> bool:
-        """
-        SFS volumes don't need explicit detachment. Always return True.
-        """
-        return True
+        try:
+            token = _get_verda_access_token(
+                self.config.creds.client_id,
+                self.config.creds.client_secret,
+            )
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+
+            payload = {
+                "action": "detach",
+                "id": volume_id,
+                "instance_ids": [instance_id],
+            }
+
+            response = requests.put(
+                "https://api.datacrunch.io/v1/volumes",
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+
+            # 202 Accepted is a valid response - means the request was accepted for async processing
+            if response.status_code not in (200, 201, 202, 204):
+                error_msg = response.text
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get("message", error_data)
+                except Exception:
+                    pass
+                # Don't fail on detach errors unless not forcing
+                if not force:
+                    raise ComputeError(
+                        f"Failed to detach volume {volume_id} from instance {instance_id}: "
+                        f"HTTP {response.status_code} - {error_msg}"
+                    )
+                else:
+                    logger.warning(
+                        "Failed to detach volume %s from instance %s (force=True, ignoring): %s",
+                        volume_id, instance_id, error_msg
+                    )
+                    return
+
+            logger.info(
+                "Successfully detached SFS volume %s from instance %s",
+                volume_id, instance_id
+            )
+
+        except requests.exceptions.RequestException as e:
+            if not force:
+                raise ComputeError(f"Failed to detach volume {volume_id}: {e}")
+            else:
+                logger.warning(
+                    "Failed to detach volume %s (force=True, ignoring): %s",
+                    volume_id, e
+                )
 
 
-def _get_volume_by_id(client: VerdaClient, volume_id: str) -> Optional[Dict]:
+def _get_verda_access_token(client_id: str, client_secret: str) -> str:
+    """
+    Get an OAuth2 access token from the Verda/DataCrunch API using client credentials.
+    """
+    import requests
+
+    token_url = "https://api.datacrunch.io/v1/oauth2/token"
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+
+    response = requests.post(token_url, data=data, timeout=30)
+    response.raise_for_status()
+    token_data = response.json()
+    return token_data["access_token"]
+
+
+def _get_volume_by_id(config: VerdaConfig, volume_id: str) -> Optional[Dict]:
     """
     Fetch volume details from Verda API via direct HTTP request.
     The SDK's volume methods may not return all fields we need, so we use the REST API directly.
@@ -375,8 +517,11 @@ def _get_volume_by_id(client: VerdaClient, volume_id: str) -> Optional[Dict]:
     import requests
 
     try:
-        # Get access token from client
-        token = client._get_access_token()
+        # Get access token using OAuth2 client credentials
+        token = _get_verda_access_token(
+            config.creds.client_id,
+            config.creds.client_secret,
+        )
         headers = {"Authorization": f"Bearer {token}"}
 
         response = requests.get(
