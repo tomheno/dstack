@@ -44,7 +44,7 @@ from dstack._internal.utils.common import get_or_error
 from dstack._internal.utils.logging import get_logger
 from dstack._internal.utils.ssh import get_public_key_fingerprint
 
-logger = get_logger("verda.compute")
+logger = get_logger(__name__)
 
 MAX_INSTANCE_NAME_LEN = 60
 
@@ -134,6 +134,12 @@ class VerdaCompute(
         )
 
         # Build volume mount mapping: volume_id -> mount_path
+        logger.info(
+            "run_job called with %d volumes: %s",
+            len(volumes),
+            [(v.name, v.volume_id, v.provisioning_data.backend_data if v.provisioning_data else None) for v in volumes]
+        )
+
         volume_mounts: Dict[str, str] = {}
         if run.run_spec.configuration.volumes:
             for mount_point in run.run_spec.configuration.volumes:
@@ -147,7 +153,13 @@ class VerdaCompute(
                     for vol in volumes:
                         if vol.name in names and vol.volume_id:
                             volume_mounts[vol.volume_id] = mount_point.path
+                            logger.info(
+                                "Mapped volume %s (id=%s) to mount path %s",
+                                vol.name, vol.volume_id, mount_point.path
+                            )
                             break
+
+        logger.info("Final volume_mounts: %s", volume_mounts)
 
         instance_offer = instance_offer.copy()
         self._restrict_instance_offer_az_to_volumes_az(instance_offer, volumes)
@@ -181,6 +193,19 @@ class VerdaCompute(
                 )
             )
 
+        # Add additional SSH key from environment for debugging (optional)
+        import os
+        debug_ssh_key = os.environ.get("DSTACK_DEBUG_SSH_PUBLIC_KEY")
+        if debug_ssh_key:
+            logger.info("Adding debug SSH key from DSTACK_DEBUG_SSH_PUBLIC_KEY")
+            ssh_ids.append(
+                _get_or_create_ssh_key(
+                    client=self.client,
+                    name="dstack-debug.key",
+                    public_key=debug_ssh_key,
+                )
+            )
+
         # Generate SFS mount commands for volumes
         sfs_mount_commands = _get_sfs_mount_commands(
             volumes=instance_config.volumes or [],
@@ -188,10 +213,21 @@ class VerdaCompute(
             instance_region=instance_offer.region,
         )
 
+        logger.info(
+            "SFS mount commands for instance %s: %s",
+            instance_name, sfs_mount_commands
+        )
+
         # Build startup script with SFS mounts first, then shim commands
         shim_commands = get_shim_commands()
         all_commands = sfs_mount_commands + shim_commands
         startup_script = " ".join([" && ".join(all_commands)])
+
+        logger.info(
+            "Full startup script for instance %s: %s",
+            instance_name, startup_script[:500] + "..." if len(startup_script) > 500 else startup_script
+        )
+
         script_name = f"dstack-{instance_config.instance_name}.sh"
         startup_script_ids = _get_or_create_startup_scrpit(
             client=self.client,
@@ -577,12 +613,41 @@ def _get_sfs_mount_commands(
     """
     commands = []
 
+    logger.info(
+        "_get_sfs_mount_commands: processing %d volumes, volume_mounts=%s",
+        len(volumes), volume_mounts
+    )
+
+    # Check if we have any volumes to mount - if so, ensure nfs-common is installed
+    has_volumes_to_mount = any(
+        volume.provisioning_data and volume.provisioning_data.backend_data
+        and volume.volume_id and volume.volume_id in volume_mounts
+        for volume in volumes
+    )
+    if has_volumes_to_mount:
+        # Install nfs-common if not already installed (needed for NFS mounts)
+        # Also unmask rpcbind.socket which may be masked on some images
+        commands.append(
+            "(which mount.nfs > /dev/null 2>&1 || "
+            "(systemctl unmask rpcbind.socket 2>/dev/null; "
+            "apt-get update -qq && apt-get install -y -qq nfs-common)) || "
+            "echo 'WARNING: Failed to install nfs-common'"
+        )
+
     for volume in volumes:
         if not volume.provisioning_data or not volume.provisioning_data.backend_data:
+            logger.info(
+                "Skipping volume %s: no provisioning_data or backend_data",
+                volume.name
+            )
             continue
 
         volume_id = volume.volume_id
         if not volume_id or volume_id not in volume_mounts:
+            logger.info(
+                "Skipping volume %s (id=%s): not in volume_mounts",
+                volume.name, volume_id
+            )
             continue
 
         try:
@@ -605,19 +670,22 @@ def _get_sfs_mount_commands(
         # The shim will bind-mount this to the user-specified container path
         host_mount_path = f"/mnt/disks/dstack-volumes/{volume.name}"
 
-        # Generate mount commands
-        # 1. Create mount directory
-        commands.append(f"mkdir -p {host_mount_path}")
-        # 2. Mount the SFS volume via NFS
-        commands.append(
-            f"mount -t nfs -o nconnect=16 nfs.{dc}.datacrunch.io:{pseudo_path} {host_mount_path}"
+        # Generate mount commands with error logging but non-blocking
+        # Use a subshell so failures don't stop the entire startup script
+        mount_cmd = (
+            f"(mkdir -p {host_mount_path} && "
+            f"mount -t nfs -o nconnect=16 nfs.{dc}.datacrunch.io:{pseudo_path} {host_mount_path} && "
+            f"echo 'SFS volume {volume.name} mounted successfully') || "
+            f"echo 'WARNING: Failed to mount SFS volume {volume.name}'"
+        )
+        commands.append(mount_cmd)
+
+        logger.info(
+            "SFS mount for volume %s: nfs.%s.datacrunch.io:%s -> %s",
+            volume.name, dc, pseudo_path, host_mount_path
         )
 
-        logger.debug(
-            f"SFS mount for volume {volume.name}: "
-            f"nfs.{dc}.datacrunch.io:{pseudo_path} -> {host_mount_path}"
-        )
-
+    logger.info("_get_sfs_mount_commands: returning %d commands: %s", len(commands), commands)
     return commands
 
 
