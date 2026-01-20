@@ -34,7 +34,12 @@ from dstack._internal.core.models.instances import (
 from dstack._internal.core.models.placement import PlacementGroup
 from dstack._internal.core.models.resources import Memory, Range
 from dstack._internal.core.models.runs import Job, JobProvisioningData, Requirements, Run
-from dstack._internal.core.models.volumes import Volume, VolumeMountPoint, VolumeProvisioningData
+from dstack._internal.core.models.volumes import (
+    Volume,
+    VolumeAttachmentData,
+    VolumeMountPoint,
+    VolumeProvisioningData,
+)
 from dstack._internal.utils.common import get_or_error
 from dstack._internal.utils.logging import get_logger
 from dstack._internal.utils.ssh import get_public_key_fingerprint
@@ -327,6 +332,39 @@ class VerdaCompute(
             "Deleting SFS volumes via dstack is not supported for Verda/DataCrunch. "
             "Please delete the volume in the Verda dashboard."
         )
+
+    def attach_volume(
+        self, volume: Volume, provisioning_data: JobProvisioningData
+    ) -> VolumeAttachmentData:
+        """
+        SFS volumes are mounted via NFS in the instance startup script.
+        No cloud API attachment is needed. Return empty attachment data.
+        This method exists to handle legacy volumes registered with attachable=True.
+        """
+        logger.debug(
+            f"SFS volume {volume.name} uses NFS mount, no cloud attachment needed"
+        )
+        return VolumeAttachmentData()
+
+    def detach_volume(
+        self, volume: Volume, provisioning_data: JobProvisioningData, force: bool = False
+    ):
+        """
+        SFS volumes are unmounted automatically when the instance terminates.
+        No cloud API detachment is needed.
+        This method exists to handle legacy volumes registered with detachable=True.
+        """
+        logger.debug(
+            f"SFS volume {volume.name} uses NFS mount, no cloud detachment needed"
+        )
+
+    def is_volume_detached(
+        self, volume: Volume, provisioning_data: JobProvisioningData
+    ) -> bool:
+        """
+        SFS volumes don't need explicit detachment. Always return True.
+        """
+        return True
 
 
 def _get_volume_by_id(client: VerdaClient, volume_id: str) -> Optional[Dict]:
