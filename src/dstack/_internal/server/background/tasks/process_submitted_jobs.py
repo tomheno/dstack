@@ -1079,6 +1079,23 @@ async def _attach_volume(
     await session.refresh(volume_model)
     if volume_model.deleted:
         raise ServerClientError("Cannot attach a deleted volume")
+
+    # Check if volume is already attached to this instance
+    existing_attachment = None
+    for va in instance.volume_attachments:
+        if va.volume_id == volume_model.id:
+            existing_attachment = va
+            break
+
+    if existing_attachment is not None:
+        # Volume already attached to this instance, skip re-attachment
+        logger.info(
+            "Volume %s already attached to instance %s, skipping attachment",
+            volume_model.name,
+            instance.name,
+        )
+        return
+
     attachment_data = await common_utils.run_async(
         compute.attach_volume,
         volume=volume,
