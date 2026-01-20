@@ -171,6 +171,9 @@ class ShimVolumeInfo(CoreModel):
     volume_id: str
     init_fs: bool
     device_name: Optional[str] = None
+    # NFS mount details for SFS/network volumes
+    nfs_host: Optional[str] = None    # e.g., "nfs.fin-03.datacrunch.io"
+    nfs_pseudo: Optional[str] = None  # e.g., "/path/to/share"
 
 
 class PortMapping(CoreModel):

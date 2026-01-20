@@ -557,20 +557,41 @@ func unmountVolumes(ctx context.Context, taskConfig TaskConfig) error {
 func formatAndMountVolume(ctx context.Context, volume VolumeInfo) error {
 	mountPoint := getVolumeMountPoint(volume.Name)
 
-	// For NFS/network volumes (no DeviceName), the volume is already mounted by startup script.
-	// Just verify the mount point exists.
+	// For NFS/network volumes (no DeviceName), mount via NFS if details provided
 	if volume.DeviceName == "" {
-		log.Info(ctx, "Volume has no device name (NFS/network volume), checking if already mounted",
-			"volume", volume.Name, "mountpoint", mountPoint)
+		log.Info(ctx, "Volume has no device name (NFS/network volume)",
+			"volume", volume.Name, "mountpoint", mountPoint, "nfs_host", volume.NfsHost, "nfs_pseudo", volume.NfsPseudo)
 
-		// Check if mount point exists and is a mount
+		// Check if already mounted
 		cmd := exec.CommandContext(ctx, "mountpoint", "-q", mountPoint)
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("NFS volume %s not mounted at %s (should be mounted by startup script): %w",
-				volume.Name, mountPoint, err)
+		if err := cmd.Run(); err == nil {
+			log.Info(ctx, "NFS volume already mounted", "volume", volume.Name, "mountpoint", mountPoint)
+			return nil
 		}
-		log.Info(ctx, "NFS volume already mounted", "volume", volume.Name, "mountpoint", mountPoint)
-		return nil
+
+		// Not mounted - try to mount if we have NFS details
+		if volume.NfsHost != "" && volume.NfsPseudo != "" {
+			log.Info(ctx, "Mounting NFS volume", "volume", volume.Name, "host", volume.NfsHost, "pseudo", volume.NfsPseudo)
+
+			// Create mount point directory
+			if err := os.MkdirAll(mountPoint, 0755); err != nil {
+				return fmt.Errorf("create mount point %s: %w", mountPoint, err)
+			}
+
+			// Mount NFS: mount -t nfs -o nconnect=16 <host>:<pseudo> <mountpoint>
+			nfsSource := volume.NfsHost + ":" + volume.NfsPseudo
+			cmd = exec.CommandContext(ctx, "mount", "-t", "nfs", "-o", "nconnect=16", nfsSource, mountPoint)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("mount NFS volume %s from %s to %s: %s: %w",
+					volume.Name, nfsSource, mountPoint, string(output), err)
+			}
+			log.Info(ctx, "NFS volume mounted successfully", "volume", volume.Name, "mountpoint", mountPoint)
+			return nil
+		}
+
+		// No NFS details and not mounted - fail
+		return fmt.Errorf("NFS volume %s not mounted at %s and no NFS mount details provided",
+			volume.Name, mountPoint)
 	}
 
 	backend, err := getBackend(volume.Backend)

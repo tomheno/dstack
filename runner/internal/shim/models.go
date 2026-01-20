@@ -67,6 +67,9 @@ type VolumeInfo struct {
 	VolumeId   string `json:"volume_id"`
 	InitFs     bool   `json:"init_fs"`
 	DeviceName string `json:"device_name"`
+	// NFS mount details for SFS/network volumes
+	NfsHost    string `json:"nfs_host,omitempty"`    // e.g., "nfs.fin-03.datacrunch.io"
+	NfsPseudo  string `json:"nfs_pseudo,omitempty"`  // e.g., "/path/to/share"
 }
 
 type PortMapping struct {

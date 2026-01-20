@@ -598,16 +598,36 @@ def healthcheck_response_to_instance_check(
 
 
 def _volume_to_shim_volume_info(volume: Volume, instance_id: str) -> ShimVolumeInfo:
+    import json as json_module
+
     device_name = None
     attachment_data = volume.get_attachment_data_for_instance(instance_id)
     if attachment_data is not None:
         device_name = attachment_data.device_name
+
+    # Extract NFS mount details for SFS/network volumes
+    nfs_host = None
+    nfs_pseudo = None
+    if volume.provisioning_data and volume.provisioning_data.backend_data:
+        try:
+            backend_data = json_module.loads(volume.provisioning_data.backend_data)
+            pseudo_path = backend_data.get("pseudo_path")
+            location_code = backend_data.get("location_code")
+            if pseudo_path and location_code:
+                # Build NFS host from location code (e.g., "FIN-03" -> "nfs.fin-03.datacrunch.io")
+                nfs_host = f"nfs.{location_code.lower()}.datacrunch.io"
+                nfs_pseudo = pseudo_path
+        except (json_module.JSONDecodeError, TypeError):
+            pass
+
     return ShimVolumeInfo(
         backend=volume.configuration.backend.value,
         name=volume.name,
         volume_id=get_or_error(volume.volume_id),
         init_fs=not volume.external,
         device_name=device_name,
+        nfs_host=nfs_host,
+        nfs_pseudo=nfs_pseudo,
     )
 
 
