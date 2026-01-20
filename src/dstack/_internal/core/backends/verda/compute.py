@@ -117,11 +117,17 @@ class VerdaCompute(
         Override run_job to handle SFS volume mounting.
         SFS volumes are mounted via NFS in the startup script.
         """
+        # Include both user SSH key (if provided) and project SSH key
+        ssh_keys = []
+        if run.run_spec.ssh_key_pub:
+            ssh_keys.append(SSHKey(public=run.run_spec.ssh_key_pub.strip()))
+        ssh_keys.append(SSHKey(public=project_ssh_public_key.strip()))
+
         instance_config = InstanceConfiguration(
             project_name=run.project_name,
             instance_name=get_job_instance_name(run, job),
             user=run.user,
-            ssh_keys=[SSHKey(public=project_ssh_public_key.strip())],
+            ssh_keys=ssh_keys,
             volumes=volumes,
             reservation=run.run_spec.configuration.reservation,
             tags=run.run_spec.merged_profile.tags,
