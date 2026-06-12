@@ -101,11 +101,11 @@ Build the runner and shim, and upload them to S3 automatically using `just` (see
 just upload
 ```
 
-To use the built shim and runner with the dstack server, pass the URLs via `DSTACK_SHIM_DOWNLOAD_URL` and `DSTACK_RUNNER_DOWNLOAD_URL`:
+To use the built shim and runner with the dstack server, pass the URLs via `DSTACK_SHIM_DOWNLOAD_URL` and `DSTACK_RUNNER_DOWNLOAD_URL`. Use the `{arch}` placeholder (and optionally `{version}`) so the server serves the matching binary per target host architecture — a hardcoded `-amd64` URL will push an amd64 shim to aarch64 hosts (e.g. GB10/DGX Spark), which then crash-loop with "Exec format error". Upload both arches first (`just upload-runner-all`):
 
 ```shell
-export DSTACK_SHIM_DOWNLOAD_URL="https://${DSTACK_SHIM_UPLOAD_S3_BUCKET}.s3.amazonaws.com/${DSTACK_SHIM_UPLOAD_VERSION}/binaries/dstack-shim-linux-amd64"
-export DSTACK_RUNNER_DOWNLOAD_URL="https://${DSTACK_SHIM_UPLOAD_S3_BUCKET}.s3.amazonaws.com/${DSTACK_SHIM_UPLOAD_VERSION}/binaries/dstack-runner-linux-amd64"
+export DSTACK_SHIM_DOWNLOAD_URL="https://${DSTACK_SHIM_UPLOAD_S3_BUCKET}.s3.amazonaws.com/${DSTACK_SHIM_UPLOAD_VERSION}/binaries/dstack-shim-linux-{arch}"
+export DSTACK_RUNNER_DOWNLOAD_URL="https://${DSTACK_SHIM_UPLOAD_S3_BUCKET}.s3.amazonaws.com/${DSTACK_SHIM_UPLOAD_VERSION}/binaries/dstack-runner-linux-{arch}"
 
 dstack server --log-level=debug
 ```
