@@ -24,6 +24,7 @@ from dstack._internal.core.backends.base.compute import (
 )
 from dstack._internal.core.backends.base.offers import (
     OfferModifier,
+    catalog_item_to_offer,
     get_catalog_offers,
     get_offers_disk_modifier,
 )
@@ -79,11 +80,16 @@ SUPPORTED_PLATFORMS = [
     "gpu-h100-sxm",
     "gpu-h200-sxm",
     "gpu-b200-sxm",
+    "gpu-rtx6000",
     "gpu-l40s-a",
     "gpu-l40s-d",
     "cpu-d3",
     "cpu-e2",
 ]
+# gpu-rtx6000 (RTX PRO 6000, sm_120, 96GB) has ZERO rows in the offline gpuhunt
+# catalog.zip, so it must be injected live from the Nebius billing API. See
+# NebiusCompute._get_live_extra_offers. (autornd dstack-nebius-patterns skill §6)
+LIVE_EXTRA_PLATFORMS = ["gpu-rtx6000"]
 
 
 class NebiusCompute(
@@ -125,13 +131,74 @@ class NebiusCompute(
             locations=list(self._region_to_project_id),
             extra_filter=_supported_instances,
         )
-        return [
+        result = [
             InstanceOfferWithAvailability(
                 **offer.dict(),
                 availability=InstanceAvailability.UNKNOWN,
             )
             for offer in offers
         ]
+        for offer in self._get_live_extra_offers():
+            result.append(
+                InstanceOfferWithAvailability(
+                    **offer.dict(),
+                    availability=InstanceAvailability.UNKNOWN,
+                )
+            )
+        return result
+
+    def _get_live_extra_offers(self) -> List[InstanceOffer]:
+        # gpu-rtx6000 is absent from the offline catalog; fetch it live from the
+        # Nebius billing API. Failure degrades to the catalog offers, never
+        # breaks the whole backend. (dstack-nebius-patterns skill §6)
+        import gpuhunt
+        from gpuhunt.providers import nebius as gh_nebius
+        from nebius.api.nebius.billing.v1alpha1 import CalculatorServiceClient
+
+        offers: List[InstanceOffer] = []
+        try:
+            calculator = CalculatorServiceClient(self._sdk)
+            for region, project_id in self._region_to_project_id.items():
+                for platform in gh_nebius.list_platforms(self._sdk, project_id).items:
+                    name = platform.metadata.name
+                    if name not in LIVE_EXTRA_PLATFORMS:
+                        continue
+                    gpu = gh_nebius.get_gpu_info(name)
+                    for preset in platform.spec.presets:
+                        for spot in [False] + (
+                            [True] if platform.status.allowed_for_preemptibles else []
+                        ):
+                            price = gh_nebius.get_price(
+                                calculator, project_id, name, preset.name, spot
+                            )
+                            raw = gh_nebius.make_item(name, preset, gpu, region, spot, price)
+                            if raw is None:
+                                continue
+                            item = gpuhunt.CatalogItem(
+                                instance_name=raw.instance_name,
+                                location=raw.location,
+                                price=raw.price,
+                                cpu=raw.cpu,
+                                memory=raw.memory,
+                                gpu_count=raw.gpu_count,
+                                gpu_name=raw.gpu_name,
+                                gpu_memory=raw.gpu_memory,
+                                gpu_vendor=raw.gpu_vendor,
+                                spot=raw.spot,
+                                disk_size=raw.disk_size,
+                                provider="nebius",
+                                flags=raw.flags,
+                                cpu_arch=raw.cpu_arch,
+                                provider_data=raw.provider_data,
+                            )
+                            offer = catalog_item_to_offer(
+                                BackendType.NEBIUS, item, None, CONFIGURABLE_DISK_SIZE
+                            )
+                            if offer is not None:
+                                offers.append(offer)
+        except Exception as e:
+            logger.warning("Failed to fetch live Nebius extra offers: %s", e)
+        return offers
 
     def get_offers_modifiers(self, requirements: Requirements) -> Iterable[OfferModifier]:
         return [get_offers_disk_modifier(CONFIGURABLE_DISK_SIZE, requirements)]
@@ -175,7 +242,9 @@ class NebiusCompute(
             name=instance_name,
             project_id=self._region_to_project_id[instance_offer.region],
             size_mib=instance_offer.instance.resources.disk.size_mib,
-            image_family="ubuntu24.04-cuda12"
+            image_family="ubuntu24.04-cuda13.0"
+            if gpus and gpus[0].name == "RTXPRO6000"
+            else "ubuntu24.04-cuda12"
             if gpus and gpus[0].name == "B200"
             else "ubuntu22.04-cuda12",
             labels=labels,
