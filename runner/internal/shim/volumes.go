@@ -59,6 +59,40 @@ func unmountVolumes(ctx context.Context, taskConfig TaskConfig) error {
 }
 
 func formatAndMountVolume(ctx context.Context, volume VolumeInfo) error {
+	mountPoint := getVolumeMountPoint(volume.Name)
+
+	// Fork (Verda SFS): a network volume has no device name. Mount it over NFS when the
+	// server sends the NFS details, or keep an existing mount (the instance startup
+	// script can mount it first). Runs before the block-device path below.
+	if volume.DeviceName == "" {
+		log.Info(ctx, "Volume has no device name (NFS/network volume)",
+			"volume", volume.Name, "mountpoint", mountPoint, "nfs_host", volume.NfsHost, "nfs_pseudo", volume.NfsPseudo)
+
+		cmd := exec.CommandContext(ctx, "mountpoint", "-q", mountPoint)
+		if err := cmd.Run(); err == nil {
+			log.Info(ctx, "NFS volume already mounted", "volume", volume.Name, "mountpoint", mountPoint)
+			return nil
+		}
+
+		if volume.NfsHost != "" && volume.NfsPseudo != "" {
+			log.Info(ctx, "Mounting NFS volume", "volume", volume.Name, "host", volume.NfsHost, "pseudo", volume.NfsPseudo)
+			if err := os.MkdirAll(mountPoint, 0o755); err != nil {
+				return fmt.Errorf("create mount point %s: %w", mountPoint, err)
+			}
+			nfsSource := volume.NfsHost + ":" + volume.NfsPseudo
+			cmd = exec.CommandContext(ctx, "mount", "-t", "nfs", "-o", "nconnect=16", nfsSource, mountPoint)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("mount NFS volume %s from %s to %s: %s: %w",
+					volume.Name, nfsSource, mountPoint, string(output), err)
+			}
+			log.Info(ctx, "NFS volume mounted successfully", "volume", volume.Name, "mountpoint", mountPoint)
+			return nil
+		}
+
+		return fmt.Errorf("NFS volume %s not mounted at %s and no NFS mount details provided",
+			volume.Name, mountPoint)
+	}
+
 	backend, err := backends.GetBackend(volume.Backend)
 	if err != nil {
 		return fmt.Errorf("get backend: %w", err)
