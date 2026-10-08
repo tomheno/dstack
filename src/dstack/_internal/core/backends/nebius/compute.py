@@ -139,6 +139,7 @@ class NebiusCompute(
             locations=list(self._region_to_project_id),
             extra_filter=_supported_instances,
         )
+        offers = _with_on_demand_price(offers)
         return [
             offer.with_availability(
                 availability=InstanceAvailability.UNKNOWN,
@@ -211,13 +212,25 @@ class NebiusCompute(
                 instance_offer.instance.resources.spot
                 and not offer_backend_data.is_preemptible_flat_rate
             ):
+                max_price = _get_pricing_policy_max_price(instance_offer)
+                logger.info(
+                    "Nebius spot cap for %s (%s, %s): %s per unit, source: %s",
+                    instance_name,
+                    instance_offer.instance.name,
+                    instance_offer.region,
+                    max_price,
+                    "on-demand price"
+                    if offer_backend_data.on_demand_price is not None
+                    else "spot price (no on-demand offer)",
+                )
                 create_pricing_policy_op = resources.create_pricing_policy(
                     sdk=self._sdk,
                     name=instance_name,
                     project_id=self._region_to_project_id[instance_offer.region],
                     platform=platform,
-                    # Prevent the spot price from growing above what dstack shows
-                    max_price=str(_get_pricing_policy_max_price(instance_offer)),
+                    # Prevent the spot price from growing above what dstack shows, which is
+                    # the on-demand price of the same type when the catalog has it (fork).
+                    max_price=str(max_price),
                 )
                 resources.wait_for_operation(
                     create_pricing_policy_op, timeout=WAIT_FOR_PRICING_POLICY_TIMEOUT
@@ -479,9 +492,36 @@ def _get_price_adjusted_for_pricing_policy(offer: InstanceOffer) -> float:
     return float(max_price * _get_pricing_policy_price_units(offer))
 
 
+def _with_on_demand_price(offers: List[InstanceOffer]) -> List[InstanceOffer]:
+    """Fork (operator decision 2026-10-08): store on each spot offer the on-demand price of
+    the same instance type in the same region, so the pricing policy caps the spot price at
+    the on-demand price, not at the current spot price. Nebius then preempts the VM only when
+    the spot price grows above what the same VM costs on demand."""
+    on_demand_prices = {
+        (offer.instance.name, offer.region): offer.price
+        for offer in offers
+        if not offer.instance.resources.spot
+    }
+    result = []
+    for offer in offers:
+        on_demand_price = on_demand_prices.get((offer.instance.name, offer.region))
+        if offer.instance.resources.spot and on_demand_price is not None:
+            offer = offer.model_copy(
+                update={"backend_data": {**offer.backend_data, "on_demand_price": on_demand_price}}
+            )
+        result.append(offer)
+    return result
+
+
 def _get_pricing_policy_max_price(offer: InstanceOffer) -> Decimal:
+    # Fork: the cap is the on-demand price of the same type and region when the catalog has
+    # it (`_with_on_demand_price`), else the offer price (upstream behavior).
+    on_demand_price = validate_extra_ignore(
+        NebiusOfferBackendData, offer.backend_data
+    ).on_demand_price
+    base_price = on_demand_price if on_demand_price is not None else offer.price
     # Pricing policies allow at most 3 decimal places. Round upward.
-    price = Decimal(str(offer.price)) / _get_pricing_policy_price_units(offer)
+    price = Decimal(str(base_price)) / _get_pricing_policy_price_units(offer)
     return price.quantize(Decimal("0.001"), rounding=ROUND_CEILING)
 
 

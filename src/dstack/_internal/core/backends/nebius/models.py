@@ -186,6 +186,12 @@ class NebiusOfferBackendData(CoreModel):
     """
     True if the price of this spot instance does not change and pricing policies are not supported.
     """
+    on_demand_price: Optional[float] = None
+    """
+    Fork: the on-demand price of the same instance type in the same region, set on spot
+    offers only. The pricing policy caps the spot price at it. `None` when the catalog
+    has no on-demand row for that type and region: the cap is then the spot price.
+    """
 
     @field_serializer("fabrics")
     def _serialize_fabrics(self, value: set[str]) -> list[str]:
