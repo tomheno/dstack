@@ -134,6 +134,8 @@ def make_rtx_offer(price: float, spot: bool, region: str = "us-central1") -> Ins
 class TestSpotCapAtOnDemandPrice:
     # Fork (operator decision 2026-10-08): the pricing policy caps a spot VM at the
     # on-demand price of the same instance type and region, not at the current spot price.
+    # Nebius accepts a bid only up to 0.01 USD per GPU-hour below the on-demand price
+    # (OUT_OF_RANGE above it), so the cap is the on-demand price minus 0.01, rounded down.
     @pytest.fixture(autouse=True)
     def _mock_region_to_project_id(self, mocker):
         mocker.patch.object(
@@ -142,7 +144,7 @@ class TestSpotCapAtOnDemandPrice:
             {"us-central1": "project-a", "uk-south2": "project-b"},
         )
 
-    def test_spot_offer_is_capped_at_the_on_demand_price_of_the_same_type(self, mocker):
+    def test_spot_offer_is_capped_just_below_the_on_demand_price_of_the_same_type(self, mocker):
         mocker.patch.object(
             compute_module,
             "get_catalog_offers",
@@ -153,9 +155,31 @@ class TestSpotCapAtOnDemandPrice:
 
         spot = [o for o in offers if o.instance.resources.spot][0]
         on_demand = [o for o in offers if not o.instance.resources.spot][0]
-        assert spot.price == 1.79
+        assert spot.price == 1.78
         assert spot.backend_data["on_demand_price"] == 1.79
+        assert spot.backend_data["spot_price"] == 0.95
         assert on_demand.price == 1.79
+
+    def test_offers_stay_sorted_by_the_shown_price(self, mocker):
+        h100 = make_offer(2.15, spot=True, is_preemptible_flat_rate=False, gpu_count=1)
+        h100_od = make_offer(4.5, spot=False, is_preemptible_flat_rate=False, gpu_count=1)
+        b200 = make_offer(3.95, spot=True, is_preemptible_flat_rate=False, gpu_count=1)
+        b200.instance.name = "gpu-b200-sxm 1gpu-20vcpu-224gb"
+        b200_od = make_offer(8.5, spot=False, is_preemptible_flat_rate=False, gpu_count=1)
+        b200_od.instance.name = "gpu-b200-sxm 1gpu-20vcpu-224gb"
+        mocker.patch.object(
+            compute_module,
+            "get_catalog_offers",
+            return_value=[h100, b200, h100_od, b200_od],
+        )
+        mocker.patch.object(NebiusCompute, "_region_to_project_id", {"eu-north1": "project-id"})
+
+        offers = make_compute().get_all_offers_with_availability(unallocated_resources=False)
+
+        prices = [o.price for o in offers]
+        assert prices == sorted(prices)
+        # At an equal-or-lower price the spot offer stays ahead of the on-demand one.
+        assert offers[0].instance.resources.spot
 
     def test_falls_back_to_the_spot_price_without_an_on_demand_offer(self, mocker):
         mocker.patch.object(
@@ -187,14 +211,119 @@ class TestSpotCapAtOnDemandPrice:
         spot = [o for o in offers if o.instance.resources.spot][0]
         assert spot.price == 0.95
 
-    def test_create_time_cap_is_the_on_demand_price_per_gpu(self):
+    def test_create_time_cap_is_the_on_demand_price_per_gpu_minus_one_cent(self):
         offer = make_offer(9.84, spot=True, is_preemptible_flat_rate=False, gpu_count=8)
         offer.backend_data["on_demand_price"] = 23.6
-        assert str(compute_module._get_pricing_policy_max_price(offer)) == "2.950"
+        offer.backend_data["spot_price"] = 9.84
+        cap, source = compute_module._get_pricing_policy_cap(offer)
+        assert str(cap) == "2.940"
+        assert source == "on-demand price"
 
-    def test_create_time_cap_falls_back_to_the_offer_price(self):
+    def test_create_time_cap_rounds_the_on_demand_price_down(self):
         offer = make_rtx_offer(0.95, spot=True)
-        assert str(compute_module._get_pricing_policy_max_price(offer)) == "0.950"
+        offer.backend_data["on_demand_price"] = 1.7899
+        offer.backend_data["spot_price"] = 0.95
+        cap, _ = compute_module._get_pricing_policy_cap(offer)
+        assert str(cap) == "1.779"
+
+    def test_create_time_cap_uses_the_run_max_price_without_an_on_demand_offer(self):
+        offer = make_rtx_offer(0.95, spot=True)
+        offer.backend_data["spot_price"] = 0.95
+        offer.backend_data["run_max_price"] = 1.5
+        cap, source = compute_module._get_pricing_policy_cap(offer)
+        assert str(cap) == "1.500"
+        assert source == "run max_price"
+
+    def test_create_time_cap_falls_back_to_the_spot_price(self):
+        offer = make_rtx_offer(0.95, spot=True)
+        cap, source = compute_module._get_pricing_policy_cap(offer)
+        assert str(cap) == "0.950"
+        assert source == "spot price"
+
+    def test_spot_cap_uses_the_raw_spot_price_not_the_shown_cap(self):
+        offer = make_rtx_offer(1.78, spot=True)
+        offer.backend_data["on_demand_price"] = 1.79
+        offer.backend_data["spot_price"] = 0.95
+        assert str(compute_module._get_spot_price_cap(offer)) == "0.950"
+
+
+class TestRunMaxPriceModifier:
+    def make_requirements(self, max_price):
+        from dstack._internal.core.models.resources import ResourcesSpec
+        from dstack._internal.core.models.runs import Requirements
+
+        return Requirements(resources=ResourcesSpec(), max_price=max_price, spot=True)
+
+    def test_sets_the_run_max_price_on_a_spot_offer_without_an_on_demand_price(self):
+        offer = make_rtx_offer(0.95, spot=True).with_availability(
+            availability=InstanceAvailability.UNKNOWN
+        )
+        offer.backend_data["spot_price"] = 0.95
+        modified = compute_module._get_run_max_price_modifier(self.make_requirements(1.5))(offer)
+        assert modified.backend_data["run_max_price"] == 1.5
+        assert modified.price == 0.95
+        assert "run_max_price" not in offer.backend_data
+
+    def test_leaves_an_offer_with_an_on_demand_price_alone(self):
+        offer = make_rtx_offer(1.78, spot=True).with_availability(
+            availability=InstanceAvailability.UNKNOWN
+        )
+        offer.backend_data["on_demand_price"] = 1.79
+        modified = compute_module._get_run_max_price_modifier(self.make_requirements(1.9))(offer)
+        assert "run_max_price" not in modified.backend_data
+
+    def test_leaves_the_offer_alone_without_a_run_max_price(self):
+        offer = make_rtx_offer(0.95, spot=True).with_availability(
+            availability=InstanceAvailability.UNKNOWN
+        )
+        modified = compute_module._get_run_max_price_modifier(self.make_requirements(None))(offer)
+        assert "run_max_price" not in modified.backend_data
+
+
+class TestCreatePricingPolicyOutOfRangeRetry:
+    def test_retries_once_with_the_spot_cap_on_out_of_range(self, mocker):
+        from nebius.aio.service_error import RequestError, StatusCode
+
+        calls = []
+
+        def fake_create(sdk, name, project_id, platform, max_price):
+            calls.append(max_price)
+            if len(calls) == 1:
+                err = RequestError.__new__(RequestError)
+                err.status = SimpleNamespace(code=StatusCode.OUT_OF_RANGE)
+                raise err
+            return SimpleNamespace(resource_id="pp-1", successful=lambda: True)
+
+        mocker.patch.object(compute_module.resources, "create_pricing_policy", fake_create)
+        mocker.patch.object(
+            compute_module.resources, "wait_for_operation", lambda op, timeout: None
+        )
+        offer = make_rtx_offer(1.78, spot=True)
+        offer.backend_data["on_demand_price"] = 1.79
+        offer.backend_data["spot_price"] = 0.95
+
+        op = compute_module._create_pricing_policy_with_fallback(
+            sdk=None, name="n", project_id="p", platform="gpu-rtx6000", offer=offer
+        )
+
+        assert calls == ["1.780", "0.950"]
+        assert op.resource_id == "pp-1"
+
+    def test_does_not_retry_when_the_cap_already_is_the_spot_cap(self, mocker):
+        from nebius.aio.service_error import RequestError, StatusCode
+
+        def fake_create(sdk, name, project_id, platform, max_price):
+            err = RequestError.__new__(RequestError)
+            err.status = SimpleNamespace(code=StatusCode.OUT_OF_RANGE)
+            raise err
+
+        mocker.patch.object(compute_module.resources, "create_pricing_policy", fake_create)
+        offer = make_rtx_offer(0.95, spot=True)
+
+        with pytest.raises(RequestError):
+            compute_module._create_pricing_policy_with_fallback(
+                sdk=None, name="n", project_id="p", platform="gpu-rtx6000", offer=offer
+            )
 
 
 class TestSupportedInstances:

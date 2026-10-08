@@ -3,7 +3,7 @@ import random
 import shlex
 import time
 from collections.abc import Iterable
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from functools import cached_property
 from typing import List, Optional
 
@@ -140,18 +140,27 @@ class NebiusCompute(
             extra_filter=_supported_instances,
         )
         offers = _with_on_demand_price(offers)
-        return [
-            offer.with_availability(
-                availability=InstanceAvailability.UNKNOWN,
-                price=_get_price_adjusted_for_pricing_policy(offer),
-            )
-            for offer in offers
-        ]
+        # Fork: the shown spot price becomes the cap, so the catalog order (by spot price)
+        # no longer holds. The server merges the per-backend lists and expects each one
+        # sorted by price. The sort is stable, so spot stays ahead of on-demand on a tie.
+        return sorted(
+            (
+                offer.with_availability(
+                    availability=InstanceAvailability.UNKNOWN,
+                    price=_get_price_adjusted_for_pricing_policy(offer),
+                )
+                for offer in offers
+            ),
+            key=lambda offer: offer.price,
+        )
 
     def get_offers_modifiers(
         self, requirements: Requirements, full_offers: bool
     ) -> Iterable[OfferModifier]:
-        return [get_offers_disk_modifier(CONFIGURABLE_DISK_SIZE, requirements)]
+        return [
+            get_offers_disk_modifier(CONFIGURABLE_DISK_SIZE, requirements),
+            _get_run_max_price_modifier(requirements),
+        ]
 
     def create_instance(
         self,
@@ -212,35 +221,15 @@ class NebiusCompute(
                 instance_offer.instance.resources.spot
                 and not offer_backend_data.is_preemptible_flat_rate
             ):
-                max_price = _get_pricing_policy_max_price(instance_offer)
-                logger.info(
-                    "Nebius spot cap for %s (%s, %s): %s per unit, source: %s",
-                    instance_name,
-                    instance_offer.instance.name,
-                    instance_offer.region,
-                    max_price,
-                    "on-demand price"
-                    if offer_backend_data.on_demand_price is not None
-                    else "spot price (no on-demand offer)",
-                )
-                create_pricing_policy_op = resources.create_pricing_policy(
+                # Prevent the spot price from growing above the cap. Fork: the cap sits just
+                # below the on-demand price of the same type when the catalog has it.
+                create_pricing_policy_op = _create_pricing_policy_with_fallback(
                     sdk=self._sdk,
                     name=instance_name,
                     project_id=self._region_to_project_id[instance_offer.region],
                     platform=platform,
-                    # Prevent the spot price from growing above what dstack shows, which is
-                    # the on-demand price of the same type when the catalog has it (fork).
-                    max_price=str(max_price),
+                    offer=instance_offer,
                 )
-                resources.wait_for_operation(
-                    create_pricing_policy_op, timeout=WAIT_FOR_PRICING_POLICY_TIMEOUT
-                )
-                if not create_pricing_policy_op.successful():
-                    raw_op = create_pricing_policy_op.raw()
-                    raise ProvisioningError(
-                        f"Create pricing policy operation failed. Message: {raw_op.status.message}."
-                        f" Details: {raw_op.status.details}"
-                    )
             create_instance_op = resources.create_instance(
                 sdk=self._sdk,
                 name=instance_name,
@@ -488,15 +477,20 @@ def _get_price_adjusted_for_pricing_policy(offer: InstanceOffer) -> float:
         ).is_preemptible_flat_rate
     ):
         return offer.price
-    max_price = _get_pricing_policy_max_price(offer)
-    return float(max_price * _get_pricing_policy_price_units(offer))
+    cap, _ = _get_pricing_policy_cap(offer)
+    return float(cap * _get_pricing_policy_price_units(offer))
+
+
+# Nebius accepts a pricing policy bid up to this much (USD per GPU-hour) below the current
+# on-demand price, and answers OUT_OF_RANGE above it.
+NEBIUS_MAX_BID_BELOW_ON_DEMAND = Decimal("0.010")
 
 
 def _with_on_demand_price(offers: List[InstanceOffer]) -> List[InstanceOffer]:
-    """Fork (operator decision 2026-10-08): store on each spot offer the on-demand price of
-    the same instance type in the same region, so the pricing policy caps the spot price at
-    the on-demand price, not at the current spot price. Nebius then preempts the VM only when
-    the spot price grows above what the same VM costs on demand."""
+    """Fork (operator decision 2026-10-08): store on each spot offer its catalog spot price
+    and the on-demand price of the same instance type in the same region. The pricing policy
+    then caps the spot price just below the on-demand price, not at the current spot price,
+    so Nebius does not preempt the VM for price while spot stays below on-demand."""
     on_demand_prices = {
         (offer.instance.name, offer.region): offer.price
         for offer in offers
@@ -504,25 +498,124 @@ def _with_on_demand_price(offers: List[InstanceOffer]) -> List[InstanceOffer]:
     }
     result = []
     for offer in offers:
-        on_demand_price = on_demand_prices.get((offer.instance.name, offer.region))
-        if offer.instance.resources.spot and on_demand_price is not None:
-            offer = offer.model_copy(
-                update={"backend_data": {**offer.backend_data, "on_demand_price": on_demand_price}}
-            )
+        if offer.instance.resources.spot:
+            extra = {"spot_price": offer.price}
+            on_demand_price = on_demand_prices.get((offer.instance.name, offer.region))
+            if on_demand_price is not None:
+                extra["on_demand_price"] = on_demand_price
+            offer = offer.model_copy(update={"backend_data": {**offer.backend_data, **extra}})
         result.append(offer)
     return result
 
 
-def _get_pricing_policy_max_price(offer: InstanceOffer) -> Decimal:
-    # Fork: the cap is the on-demand price of the same type and region when the catalog has
-    # it (`_with_on_demand_price`), else the offer price (upstream behavior).
-    on_demand_price = validate_extra_ignore(
-        NebiusOfferBackendData, offer.backend_data
-    ).on_demand_price
-    base_price = on_demand_price if on_demand_price is not None else offer.price
-    # Pricing policies allow at most 3 decimal places. Round upward.
-    price = Decimal(str(base_price)) / _get_pricing_policy_price_units(offer)
+def _get_run_max_price_modifier(requirements: Requirements) -> OfferModifier:
+    """Fork: on a spot offer that has no on-demand price, record the run's `max_price` so
+    the pricing policy caps the spot price at it. The shown price does not change, so the
+    offer order and the `max_price` filter stay as they are."""
+
+    def modifier(offer: InstanceOfferWithAvailability) -> Optional[InstanceOfferWithAvailability]:
+        if not offer.instance.resources.spot or requirements.max_price is None:
+            return offer
+        data = validate_extra_ignore(NebiusOfferBackendData, offer.backend_data)
+        if data.is_preemptible_flat_rate or data.on_demand_price is not None:
+            return offer
+        return offer.model_copy(
+            update={
+                "backend_data": {**offer.backend_data, "run_max_price": requirements.max_price}
+            }
+        )
+
+    return modifier
+
+
+def _get_spot_price_cap(offer: InstanceOffer) -> Decimal:
+    # Upstream behavior: the cap is the catalog spot price. Pricing policies allow at most
+    # 3 decimal places. Round upward.
+    spot_price = validate_extra_ignore(NebiusOfferBackendData, offer.backend_data).spot_price
+    price = Decimal(str(spot_price if spot_price is not None else offer.price))
+    price = price / _get_pricing_policy_price_units(offer)
     return price.quantize(Decimal("0.001"), rounding=ROUND_CEILING)
+
+
+def _get_pricing_policy_cap(offer: InstanceOffer) -> tuple[Decimal, str]:
+    """Return the per-GPU pricing policy cap of a spot offer and its source. Fork order: just
+    below the on-demand price of the same type and region, else the run's `max_price`, else
+    the spot price (upstream). A cap is never below the spot price cap."""
+    data = validate_extra_ignore(NebiusOfferBackendData, offer.backend_data)
+    units = _get_pricing_policy_price_units(offer)
+    spot_cap = _get_spot_price_cap(offer)
+    if data.on_demand_price is not None:
+        cap = (
+            Decimal(str(data.on_demand_price)) / units - NEBIUS_MAX_BID_BELOW_ON_DEMAND
+        ).quantize(Decimal("0.001"), rounding=ROUND_FLOOR)
+        if cap >= spot_cap:
+            return cap, "on-demand price"
+    if data.run_max_price is not None:
+        cap = (Decimal(str(data.run_max_price)) / units).quantize(
+            Decimal("0.001"), rounding=ROUND_FLOOR
+        )
+        if cap >= spot_cap:
+            return cap, "run max_price"
+    return spot_cap, "spot price"
+
+
+def _is_out_of_range(code: object) -> bool:
+    if code == StatusCode.OUT_OF_RANGE:
+        return True
+    value = getattr(code, "value", code)
+    if isinstance(value, tuple):
+        value = value[0]
+    return value == StatusCode.OUT_OF_RANGE.value[0]
+
+
+def _create_pricing_policy_with_fallback(
+    sdk: SDK, name: str, project_id: str, platform: str, offer: InstanceOffer
+) -> SDKOperation[Operation]:
+    """Create the pricing policy of a spot VM at its cap. If Nebius refuses the cap as out of
+    range (for example after an on-demand price change that the catalog does not show yet),
+    retry once with the spot price cap, the upstream behavior."""
+    cap, source = _get_pricing_policy_cap(offer)
+    attempts = [(name, cap, source)]
+    spot_cap = _get_spot_price_cap(offer)
+    if cap != spot_cap:
+        attempts.append((f"{name}-spot", spot_cap, "spot price, after OUT_OF_RANGE"))
+    for index, (policy_name, max_price, cap_source) in enumerate(attempts):
+        is_last = index == len(attempts) - 1
+        logger.info(
+            "Nebius spot cap for %s (%s, %s): %s per GPU-hour, source: %s",
+            name,
+            offer.instance.name,
+            offer.region,
+            max_price,
+            cap_source,
+        )
+        try:
+            op = resources.create_pricing_policy(
+                sdk=sdk,
+                name=policy_name,
+                project_id=project_id,
+                platform=platform,
+                max_price=str(max_price),
+            )
+        except RequestError as e:
+            if not is_last and _is_out_of_range(e.status.code):
+                logger.warning("Nebius refused the cap %s as out of range: %s", max_price, e)
+                continue
+            raise
+        resources.wait_for_operation(op, timeout=WAIT_FOR_PRICING_POLICY_TIMEOUT)
+        if op.successful():
+            return op
+        raw_op = op.raw()
+        if not is_last and _is_out_of_range(raw_op.status.code):
+            logger.warning(
+                "Nebius refused the cap %s as out of range: %s", max_price, raw_op.status.message
+            )
+            continue
+        raise ProvisioningError(
+            f"Create pricing policy operation failed. Message: {raw_op.status.message}."
+            f" Details: {raw_op.status.details}"
+        )
+    raise ProvisioningError("Create pricing policy: no cap left to try")
 
 
 def _get_pricing_policy_price_units(offer: InstanceOffer) -> int:

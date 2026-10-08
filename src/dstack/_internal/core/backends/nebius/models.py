@@ -189,8 +189,19 @@ class NebiusOfferBackendData(CoreModel):
     on_demand_price: Optional[float] = None
     """
     Fork: the on-demand price of the same instance type in the same region, set on spot
-    offers only. The pricing policy caps the spot price at it. `None` when the catalog
-    has no on-demand row for that type and region: the cap is then the spot price.
+    offers only. The pricing policy caps the spot price just below it (Nebius accepts a
+    bid up to 0.01 USD per GPU-hour below the on-demand price). `None` when the catalog
+    has no on-demand row for that type and region.
+    """
+    spot_price: Optional[float] = None
+    """
+    Fork: the catalog spot price of a spot offer, kept because the shown offer price
+    becomes the cap. Used for the fallback cap when Nebius refuses the on-demand cap.
+    """
+    run_max_price: Optional[float] = None
+    """
+    Fork: the run's `max_price`, set by an offer modifier on a spot offer that has no
+    on-demand price. The pricing policy then caps the spot price at it.
     """
 
     @field_serializer("fabrics")
