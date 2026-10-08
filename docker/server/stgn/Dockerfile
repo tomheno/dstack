@@ -33,6 +33,8 @@ ENV PATH="/root/.local/bin/:$PATH"
 COPY pyproject.toml uv.lock README.md ./
 COPY src src
 COPY examples examples
+# pyproject force-includes skills/*/SKILL.md into the wheel, so uv sync needs them.
+COPY skills skills
 
 # Copy built frontend to statics directory
 COPY --from=frontend-builder /frontend/build src/dstack/_internal/server/statics
