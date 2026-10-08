@@ -1,0 +1,150 @@
+from datetime import datetime
+from typing import Optional, TypeVar
+
+import gpuhunt
+
+from dstack._internal.cli.models.presets import VerifiedPreset
+from dstack._internal.core.models.configurations import PresetConfiguration, ServiceConfiguration
+from dstack._internal.core.models.envs import Env
+from dstack._internal.core.models.instances import Resources
+from dstack._internal.core.models.presets import (
+    PRESET_EXCLUDED_FIELDS,
+    PresetBenchmark,
+    PresetVerificationReplicaGroup,
+)
+from dstack._internal.core.models.resources import (
+    CPUSpec,
+    DiskSpec,
+    GPUSpec,
+    Memory,
+    Range,
+    ResourcesSpec,
+)
+from dstack._internal.utils.gpu import detect_gpu_vendors_by_gpu_name
+
+ConfigurationT = TypeVar("ConfigurationT", ServiceConfiguration, PresetConfiguration)
+
+
+def build_preset(
+    *,
+    service: ServiceConfiguration,
+    verification_replica_groups: list[PresetVerificationReplicaGroup],
+    base_model: str,
+    repo: str,
+    context_length: int,
+    benchmark: PresetBenchmark,
+    configuration: PresetConfiguration,
+    best_trial: int,
+    preset_id: str,
+    name: Optional[str],
+    created_at: datetime,
+) -> VerifiedPreset:
+    service = _without_excluded_fields(service)
+    configuration = _without_excluded_fields(configuration)
+    configuration.env = Env()
+    set_service_gpu_vendor_from_verification(service, verification_replica_groups)
+    return VerifiedPreset(
+        name=name,
+        base=base_model,
+        id=preset_id,
+        repo=repo,
+        context_length=context_length,
+        best_trial=best_trial,
+        configuration=configuration,
+        created_at=created_at,
+        service=service,
+        benchmark=benchmark,
+        verified_on=verification_replica_groups,
+    )
+
+
+def resources_spec_from_instance_resources(resources: Resources) -> ResourcesSpec:
+    gpu = GPUSpec(count=Range[int](min=0, max=0))
+    if resources.gpus:
+        first = resources.gpus[0]
+        if any(
+            (g.name, g.memory_mib, g.vendor) != (first.name, first.memory_mib, first.vendor)
+            for g in resources.gpus
+        ):
+            raise ValueError("preset cannot be built from mixed-GPU instances")
+        gpu = GPUSpec(
+            vendor=first.vendor,
+            name=[first.name],
+            count=_exact(len(resources.gpus)),
+            memory=_exact_memory(first.memory_mib),
+        )
+    return ResourcesSpec(
+        cpu=CPUSpec(arch=resources.cpu_arch, count=_exact(resources.cpus)),
+        memory=_exact_memory(resources.memory_mib),
+        disk=DiskSpec(size=_exact_memory(resources.disk.size_mib)),
+        gpu=gpu,
+    )
+
+
+def _exact(value: int) -> Range[int]:
+    return Range[int](min=value, max=value)
+
+
+def _exact_memory(mib: int) -> Range[Memory]:
+    # Rounded to what a user would write in `resources`: 128887MiB is 125.9GB.
+    size = Memory(round(mib / 1024, 1))
+    return Range[Memory](min=size, max=size)
+
+
+def set_service_gpu_vendor_from_verification(
+    service: ServiceConfiguration,
+    verified_on: list[PresetVerificationReplicaGroup],
+) -> None:
+    for group in service.replica_groups:
+        resources = group.resources
+        if resources is None or not _requires_gpu(resources):
+            continue
+        verification_vendor = _get_verification_group_gpu_vendor(verified_on, group.name)
+        if verification_vendor is None or resources.gpu is None:
+            continue
+        if resources.gpu.vendor is not None and resources.gpu.vendor != verification_vendor:
+            raise ValueError("preset service GPU vendor does not match verification")
+        resources.gpu.vendor = verification_vendor
+
+
+def _without_excluded_fields(configuration: ConfigurationT) -> ConfigurationT:
+    return configuration.model_copy(deep=True, update=dict.fromkeys(PRESET_EXCLUDED_FIELDS))
+
+
+def _get_verification_group_gpu_vendor(
+    verified_on: list[PresetVerificationReplicaGroup],
+    group_name: str,
+) -> gpuhunt.AcceleratorVendor | None:
+    vendors = {
+        vendor
+        for group in verified_on
+        if group.name == group_name
+        for resources in group.replicas
+        if (vendor := _get_resources_gpu_vendor(resources)) is not None
+    }
+    if len(vendors) > 1:
+        raise ValueError("preset verification must not mix GPU vendors in a replica group")
+    return next(iter(vendors), None)
+
+
+def _get_resources_gpu_vendor(resources: ResourcesSpec) -> gpuhunt.AcceleratorVendor | None:
+    gpu = resources.gpu
+    if gpu is None or gpu.count.min == 0:
+        return None
+    if gpu.vendor is not None:
+        return gpu.vendor
+    if not gpu.name:
+        return None
+    vendors: set[gpuhunt.AcceleratorVendor] = set()
+    for name in gpu.name:
+        vendors.update(detect_gpu_vendors_by_gpu_name(name))
+    if len(vendors) > 1:
+        raise ValueError("preset verification must not mix GPU vendors in a replica group")
+    return next(iter(vendors), None)
+
+
+def _requires_gpu(resources: ResourcesSpec) -> bool:
+    gpu = resources.gpu
+    if gpu is None or gpu.count.max == 0:
+        return False
+    return gpu.count.min != 0 or gpu.count.max is not None

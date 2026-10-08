@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 from azure.core.credentials import TokenCredential
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceNotFoundError
 from azure.mgmt import compute as compute_mgmt
 from azure.mgmt import network as network_mgmt
 from azure.mgmt.compute.models import (
@@ -33,7 +33,6 @@ from azure.mgmt.compute.models import (
     VirtualMachinePublicIPAddressConfiguration,
 )
 
-from dstack import version
 from dstack._internal import settings
 from dstack._internal.core.backends.azure import resources as azure_resources
 from dstack._internal.core.backends.azure import utils as azure_utils
@@ -43,6 +42,7 @@ from dstack._internal.core.backends.base.compute import (
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
     ComputeWithGatewaySupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     ComputeWithPrivilegedSupport,
     generate_unique_gateway_instance_name,
@@ -61,8 +61,8 @@ from dstack._internal.core.consts import DSTACK_OS_IMAGE_WITH_PROPRIETARY_NVIDIA
 from dstack._internal.core.errors import ComputeError, NoCapacityError
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.gateways import (
-    GatewayComputeConfiguration,
-    GatewayProvisioningData,
+    GatewayReplicaConfiguration,
+    GatewayReplicaProvisioningData,
 )
 from dstack._internal.core.models.instances import (
     InstanceAvailability,
@@ -86,6 +86,7 @@ class AzureCompute(
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
     ComputeWithPrivilegedSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     ComputeWithGatewaySupport,
     Compute,
@@ -101,7 +102,9 @@ class AzureCompute(
             credential=credential, subscription_id=config.subscription_id
         )
 
-    def get_all_offers_with_availability(self) -> List[InstanceOfferWithAvailability]:
+    def get_all_offers_with_availability(
+        self, unallocated_resources: bool
+    ) -> List[InstanceOfferWithAvailability]:
         offers = get_catalog_offers(
             backend=BackendType.AZURE,
             locations=self.config.regions,
@@ -114,7 +117,9 @@ class AzureCompute(
         )
         return offers_with_availability
 
-    def get_offers_modifiers(self, requirements: Requirements) -> Iterable[OfferModifier]:
+    def get_offers_modifiers(
+        self, requirements: Requirements, full_offers: bool
+    ) -> Iterable[OfferModifier]:
         return [get_offers_disk_modifier(CONFIGURABLE_DISK_SIZE, requirements)]
 
     def create_instance(
@@ -141,6 +146,7 @@ class AzureCompute(
             network_client=self._network_client,
             resource_group=self.config.resource_group,
             vpc_ids=self.config.vpc_ids,
+            subnet_ids=self.config.subnet_ids,
             location=location,
             allocate_public_ip=allocate_public_ip,
         )
@@ -168,7 +174,7 @@ class AzureCompute(
 
         # TODO: Support custom availability_zones.
         # Currently, VMs are regional, which means they don't have zone info.
-        vm = _launch_instance(
+        vm = _create_instance_and_wait(
             compute_client=self._compute_client,
             subscription_id=self.config.subscription_id,
             location=location,
@@ -227,10 +233,11 @@ class AzureCompute(
             instance_name=instance_id,
         )
 
-    def create_gateway(
+    def create_gateway_replica(
         self,
-        configuration: GatewayComputeConfiguration,
-    ) -> GatewayProvisioningData:
+        configuration: GatewayReplicaConfiguration,
+        gateway_backend_data: Optional[str] = None,
+    ) -> GatewayReplicaProvisioningData:
         if configuration.instance_type is not None:
             # TODO: support instance_type. Requires selecting a VM image to avoid errors like this:
             # > The selected VM size 'Standard_E4s_v6' cannot boot Hypervisor Generation '1'
@@ -250,6 +257,7 @@ class AzureCompute(
             network_client=self._network_client,
             resource_group=self.config.resource_group,
             vpc_ids=self.config.vpc_ids,
+            subnet_ids=self.config.subnet_ids,
             location=configuration.region,
             allocate_public_ip=True,
         )
@@ -272,7 +280,7 @@ class AzureCompute(
         )
         tags = azure_resources.filter_invalid_tags(tags)
 
-        vm = _launch_instance(
+        vm = _create_instance_and_wait(
             compute_client=self._compute_client,
             subscription_id=self.config.subscription_id,
             location=configuration.region,
@@ -285,9 +293,7 @@ class AzureCompute(
             image_reference=_get_gateway_image_ref(),
             vm_size=DEFAULT_GATEWAY_INSTANCE_TYPE,
             instance_name=instance_name,
-            user_data=get_gateway_user_data(
-                configuration.ssh_key_pub, router=configuration.router
-            ),
+            user_data=get_gateway_user_data(configuration.ssh_key_pub),
             ssh_pub_keys=[configuration.ssh_key_pub],
             spot=False,
             disk_size=30,
@@ -301,16 +307,16 @@ class AzureCompute(
             resource_group=self.config.resource_group,
             vm=vm,
         )
-        return GatewayProvisioningData(
+        return GatewayReplicaProvisioningData(
             instance_id=vm.name,
             ip_address=public_ip,
             region=configuration.region,
         )
 
-    def terminate_gateway(
+    def terminate_gateway_replica(
         self,
         instance_id: str,
-        configuration: GatewayComputeConfiguration,
+        configuration: GatewayReplicaConfiguration,
         backend_data: Optional[str] = None,
     ):
         self.terminate_instance(
@@ -324,9 +330,38 @@ def get_resource_group_network_subnet_or_error(
     network_client: network_mgmt.NetworkManagementClient,
     resource_group: Optional[str],
     vpc_ids: Optional[Dict[str, str]],
+    subnet_ids: Optional[Dict[str, str]],
     location: str,
     allocate_public_ip: bool,
 ) -> Tuple[str, str, str]:
+    if subnet_ids is not None and location in subnet_ids:
+        subnet_id = subnet_ids[location]
+        try:
+            net_resource_group, network_name, subnet_name = _parse_config_subnet_id(subnet_id)
+        except Exception:
+            raise ComputeError(
+                "Subnet specified in incorrect format."
+                " Supported format for `subnet_ids` values: 'networkResourceGroupName/networkName/subnetName'"
+            )
+        try:
+            subnet = network_client.subnets.get(net_resource_group, network_name, subnet_name)
+        except ResourceNotFoundError:
+            raise ComputeError(
+                f"Subnet {subnet_name} not found in network {network_name}"
+                f" in resource group {net_resource_group}"
+            )
+        if not allocate_public_ip and not azure_resources.is_eligible_private_subnet(
+            network_client=network_client,
+            resource_group=net_resource_group,
+            network_name=network_name,
+            subnet=subnet,
+        ):
+            raise ComputeError(
+                f"Subnet {subnet_name} in network {network_name} does not have outbound internet connectivity."
+                " Ensure a NAT Gateway is attached or VNet peering is configured."
+            )
+        return net_resource_group, network_name, subnet_name
+
     if vpc_ids is not None:
         vpc_id = vpc_ids.get(location)
         if vpc_id is None:
@@ -386,6 +421,11 @@ def _parse_config_vpc_id(vpc_id: str) -> Tuple[str, str]:
     return resource_group, network_name
 
 
+def _parse_config_subnet_id(subnet_id: str) -> Tuple[str, str, str]:
+    resource_group, network_name, subnet_name = subnet_id.split("/")
+    return resource_group, network_name, subnet_name
+
+
 class VMImageVariant(enum.Enum):
     GRID = enum.auto()
     CUDA = enum.auto()
@@ -405,14 +445,15 @@ class VMImageVariant(enum.Enum):
             return cls.STANDARD
 
     def get_image_name(self) -> str:
+        prefix = settings.DSTACK_VM_BASE_IMAGE_PREFIX
         if self is self.GRID:
-            return f"dstack-grid-{version.base_image}"
+            return f"{prefix}dstack-grid-{settings.DSTACK_VM_BASE_IMAGE_VERSION}"
         elif self is self.CUDA:
-            return f"dstack-cuda-{version.base_image}"
+            return f"{prefix}dstack-cuda-{settings.DSTACK_VM_BASE_IMAGE_VERSION}"
         elif self is self.CUDA_WITH_PROPRIETARY_KERNEL_MODULES:
             return f"dstack-cuda-{DSTACK_OS_IMAGE_WITH_PROPRIETARY_NVIDIA_KERNEL_MODULES}"
         elif self is self.STANDARD:
-            return f"dstack-{version.base_image}"
+            return f"{prefix}dstack-{settings.DSTACK_VM_BASE_IMAGE_VERSION}"
         else:
             raise ValueError(f"Unexpected image variant {self!r}")
 
@@ -426,8 +467,10 @@ _SUPPORTED_VM_SERIES_PATTERNS = [
     r"ND(\d+)rs_v2",  # NDv2-series [8xV100 32GB]
     r"NV(\d+)adm?s_A10_v5",  # NVadsA10 v5-series [A10]
     r"NC(\d+)ads_A100_v4",  # NC A100 v4-series [A100 80GB]
+    r"NC(\d+)adi?s_H100_v5",  # NC H100 v5-series [H100 NVL 94GB]
     r"ND(\d+)asr_v4",  # ND A100 v4-series [8xA100 40GB]
     r"ND(\d+)amsr_A100_v4",  # NDm A100 v4-series [8xA100 80GB]
+    r"ND(\d+)isr_H200_v5",  # ND H200 v5-series [8xH200 141GB]
 ]
 _SUPPORTED_VM_SERIES_PATTERN = (
     "^Standard_(" + "|".join(f"({s})" for s in _SUPPORTED_VM_SERIES_PATTERNS) + ")$"
@@ -469,9 +512,7 @@ def _get_offers_with_availability(
         availability = InstanceAvailability.NO_QUOTA
         if (offer.instance.name, offer.region) in has_quota:
             availability = InstanceAvailability.UNKNOWN
-        offers_with_availability.append(
-            InstanceOfferWithAvailability(**offer.dict(), availability=availability)
-        )
+        offers_with_availability.append(offer.with_availability(availability=availability))
 
     return offers_with_availability
 
@@ -491,6 +532,13 @@ def _get_image_ref(
     location: str,
     variant: VMImageVariant,
 ) -> ImageReference:
+    if settings.DSTACK_VM_BASE_IMAGE_PREFIX:
+        # Staging images are not published to the community gallery, so reference directly.
+        image = compute_client.images.get(
+            resource_group_name="dstack-resources-westeurope",
+            image_name=variant.get_image_name(),
+        )
+        return ImageReference(id=image.id)
     image = compute_client.community_gallery_images.get(
         location=location,
         public_gallery_name="dstack-ebac134d-04b9-4c2b-8b6c-ad3e73904aa7",  # Gen2
@@ -508,7 +556,7 @@ def _get_gateway_image_ref() -> ImageReference:
     )
 
 
-def _launch_instance(
+def _begin_create_instance(
     compute_client: compute_mgmt.ComputeManagementClient,
     subscription_id: str,
     location: str,
@@ -529,7 +577,8 @@ def _launch_instance(
     allocate_public_ip: bool = True,
     network_resource_group: Optional[str] = None,
     tags: Optional[Dict[str, str]] = None,
-) -> VirtualMachine:
+):
+    """Starts VM creation and returns immediately. The VM is created asynchronously."""
     if tags is None:
         tags = {}
     if network_resource_group is None:
@@ -628,11 +677,79 @@ def _launch_instance(
             message = e.error.message if e.error.message is not None else ""
             raise NoCapacityError(message)
         raise e
-    vm = poller.result(timeout=600)
+    return poller
+
+
+def _create_instance_and_wait(
+    compute_client: compute_mgmt.ComputeManagementClient,
+    subscription_id: str,
+    location: str,
+    resource_group: str,
+    network_security_group: str,
+    network: str,
+    subnet: str,
+    managed_identity_name: Optional[str],
+    managed_identity_resource_group: Optional[str],
+    image_reference: ImageReference,
+    vm_size: str,
+    instance_name: str,
+    user_data: str,
+    ssh_pub_keys: List[str],
+    spot: bool,
+    disk_size: int,
+    computer_name: str,
+    allocate_public_ip: bool = True,
+    network_resource_group: Optional[str] = None,
+    tags: Optional[Dict[str, str]] = None,
+) -> VirtualMachine:
+    """Blocking version used for gateway provisioning where IP is needed immediately."""
+    poller = _begin_create_instance(
+        compute_client=compute_client,
+        subscription_id=subscription_id,
+        location=location,
+        resource_group=resource_group,
+        network_security_group=network_security_group,
+        network=network,
+        subnet=subnet,
+        managed_identity_name=managed_identity_name,
+        managed_identity_resource_group=managed_identity_resource_group,
+        image_reference=image_reference,
+        vm_size=vm_size,
+        instance_name=instance_name,
+        user_data=user_data,
+        ssh_pub_keys=ssh_pub_keys,
+        spot=spot,
+        disk_size=disk_size,
+        computer_name=computer_name,
+        allocate_public_ip=allocate_public_ip,
+        network_resource_group=network_resource_group,
+        tags=tags,
+    )
+    try:
+        vm = poller.result(timeout=600)
+    except HttpResponseError as e:
+        # Azure may create a VM resource even when provisioning fails (e.g., AllocationFailed).
+        # Clean it up to avoid orphan VMs.
+        logger.warning(
+            "Instance %s provisioning failed: %s. Cleaning up.",
+            instance_name,
+            repr(e),
+        )
+        _terminate_instance(
+            compute_client=compute_client,
+            resource_group=resource_group,
+            instance_name=instance_name,
+        )
+        if e.error is not None and e.error.code in (
+            "AllocationFailed",
+            "OverconstrainedAllocationRequest",
+        ):
+            raise NoCapacityError(e.error.message or str(e))
+        raise
     if not poller.done():
         logger.error(
-            "Timed out waiting for instance {instance_name} launch. "
-            "The instance will be terminated."
+            "Timed out waiting for instance %s launch. The instance will be terminated.",
+            instance_name,
         )
         _terminate_instance(
             compute_client=compute_client,
@@ -640,6 +757,13 @@ def _launch_instance(
             instance_name=instance_name,
         )
         raise ComputeError(f"Timed out waiting for instance {instance_name} launch")
+    if (vm.provisioning_state or "").lower() == "failed":
+        _terminate_instance(
+            compute_client=compute_client,
+            resource_group=resource_group,
+            instance_name=instance_name,
+        )
+        raise NoCapacityError(f"VM {instance_name} provisioning failed")
     return vm
 
 

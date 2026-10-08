@@ -14,7 +14,7 @@ declare type TGPUResources = IGPUSpecRequest & {
     name?: string | string[];
 };
 
-declare type TIde = 'cursor' | 'vscode' | 'windsurf';
+declare type TIde = 'cursor' | 'vscode' | 'windsurf' | 'zed';
 
 declare type TVolumeMountPointRequest = {
     name: string | string[];
@@ -45,13 +45,22 @@ declare type ProfileRetryRequest = {
     duration?: string | number;
 };
 
-declare type TDevEnvironmentConfiguration = {
-    type?: 'dev-environment';
-    ide: TIde;
-    version?: string;
-    init?: string[];
-    inactivity_duration?: string | number | boolean | 'off';
-    ports?: number[] | string[];
+declare type TRange = { min?: number; max?: number };
+
+declare type TResourceRequest = {
+    gpu?: TGPUResources | string | number;
+    cpu?: string | number | ICPUSpecRequest;
+    memory?: string | number | TRange;
+    shm_size?: string | number;
+    disk?:
+        | string
+        | number
+        | {
+              size?: string | number | TRange;
+          };
+};
+
+declare type TBaseConfiguration = {
     name?: string;
     image?: string;
     user?: string;
@@ -68,22 +77,11 @@ declare type TDevEnvironmentConfiguration = {
     single_branch?: boolean;
     env?: string[];
     shell?: string;
-    resources?: {
-        gpu?: TGPUResources | string | number;
-        cpu?: string | number | { min?: number; max?: number };
-        memory?: string | number | { min?: number; max?: number };
-        shm_size?: string | number;
-        disk?:
-            | string
-            | number
-            | {
-                  size?: string | number | { min?: number; max?: number };
-              };
-    };
+    resources?: TResourceRequest;
     priority?: number;
     volumes?: Array<string | TVolumeMountPointRequest | TInstanceMountPointRequest>;
     docker?: boolean;
-    repos?: TEnvironmentConfigurationRepo[];
+    repos?: TEnvironmentConfigurationRepo[] | string[];
     files?: Array<TFilePathMappingRequest | string>;
     setup?: string[];
     backends?: string[];
@@ -109,11 +107,71 @@ declare type TDevEnvironmentConfiguration = {
     tags?: object;
 };
 
+declare type TRateLimitRequest = {
+    prefix?: string;
+    // key?: IPAddressPartitioningKeyRequest | HeaderPartitioningKeyRequest;
+    rps: number;
+    burst?: number;
+};
+
+declare type TProbeConfigRequest = {
+    type: 'http';
+    url?: string;
+    method?: 'get' | 'post' | 'put' | 'delete' | 'patch' | 'head';
+    headers?: {
+        name: string;
+        value: string;
+    }[];
+    body?: string;
+    timeout?: number | string;
+    interval?: number | string;
+    ready_after?: number;
+};
+
+declare type TScalingSpecRequest = {
+    metric: string;
+    threshold: number;
+};
+
+declare type TReplicaGroupRequest = {
+    name?: string;
+    count: TRange | number;
+    scaling?: TScalingSpecRequest;
+    resources?: TResourceRequest;
+    commands?: string[];
+};
+
+declare type TServiceConfiguration = TBaseConfiguration & {
+    type?: 'service';
+    port: number | string;
+    gateway?: boolean | string;
+    strip_prefix?: boolean;
+    model: string;
+    https?: boolean;
+    auth?: string;
+    commands?: string[];
+    rate_limits?: TRateLimitRequest[];
+    probes?: TProbeConfigRequest[];
+    replicas?: TRange | number | string;
+    scaling?: TScalingSpecRequest;
+    replica_groups?: TReplicaGroupRequest[];
+};
+
+declare type TDevEnvironmentConfiguration = TBaseConfiguration & {
+    type?: 'dev-environment';
+    ide?: TIde | null;
+    version?: string;
+    init?: string[];
+    inactivity_duration?: string | number | boolean | 'off';
+    ports?: number[] | string[];
+};
+
 declare type TRunSpec = {
     run_name: string;
-    configuration: TDevEnvironmentConfiguration;
+    configuration: TDevEnvironmentConfiguration | TServiceConfiguration;
     ssh_key_pub?: string;
 };
+
 declare type TRunApplyRequestParams = {
     project_name: string;
     plan: {
@@ -171,16 +229,29 @@ declare interface IAppSpec {
     url_query_params?: { [key: string]: string };
 }
 
+declare interface IJobProbe {
+    type: 'http';
+    url: string;
+    method?: 'head' | 'post' | 'put' | 'patch' | 'delete' | 'get';
+    headers?: Array<{ name: string; value: string }>;
+    body?: string;
+    timeout: number;
+    interval: number;
+    ready_after: number;
+}
+
 declare interface IJobSpec {
-    app_specs?: IAppSpec;
+    app_specs?: IAppSpec[];
     commands: string[];
     env?: { [key: string]: string };
     home_dir?: string;
     image_name: string;
     job_name: string;
     job_num: number;
+    replica_num: number;
     max_duration?: number;
     working_dir: string;
+    probes?: IJobProbe[];
 }
 
 declare interface IGpu {
@@ -199,8 +270,7 @@ declare interface IResources {
     spot: boolean;
 
     disk?: IDisk;
-
-    description?: string;
+    cpu_arch?: string | null;
 }
 
 declare interface InstanceType {
@@ -221,9 +291,15 @@ declare interface IJobProvisioningData {
     backend_data?: string;
 }
 
+declare interface IJobRuntimeData {
+    working_dir?: string | null;
+    username?: string | null;
+}
+
 declare interface IJobSubmission {
     id: string;
     job_provisioning_data?: IJobProvisioningData | null;
+    job_runtime_data?: IJobRuntimeData | null;
     error_code?: TJobErrorCode | null;
     submission_num: number;
     status: TJobStatus;
@@ -234,11 +310,24 @@ declare interface IJobSubmission {
     exit_status?: number | null;
     status_message?: string | null;
     error?: string | null;
+    probes?: Array<{ success_streak: number }>;
+}
+
+declare interface IJobConnectionInfo {
+    ide_name?: string | null;
+    attached_ide_url?: string | null;
+    proxied_ide_url?: string | null;
+    attached_ssh_command?: string[] | null;
+    proxied_ssh_command?: string[] | null;
+    sshproxy_hostname?: string | null;
+    sshproxy_port?: number | null;
+    sshproxy_upstream_id?: string | null;
 }
 
 declare interface IJob {
     job_spec: IJobSpec;
     job_submissions: IJobSubmission[];
+    job_connection_info?: IJobConnectionInfo | null;
 }
 
 declare interface ISchedule {

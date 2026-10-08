@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
+import { product } from 'product';
 
 import {
     DISCORD_URL,
@@ -44,9 +45,10 @@ export const useTutorials = () => {
     } = useAppSelector(selectTutorialPanel);
 
     const { data: userBillingData } = useGetUserBillingInfoQuery({ username: useName ?? '' }, { skip: !useName });
-    const { data: projectData } = useGetProjectsQuery();
+    const { data: projectData } = useGetProjectsQuery({});
     const { data: runsData } = useGetRunsQuery({
         limit: 1,
+        job_submissions_limit: 1,
     });
 
     const completeIsChecked = useRef<boolean>(false);
@@ -54,14 +56,14 @@ export const useTutorials = () => {
     useEffect(() => {
         if (
             userBillingData &&
-            projectData &&
+            projectData?.data &&
             runsData &&
             !completeIsChecked.current &&
             location.pathname !== ROUTES.PROJECT.ADD
         ) {
             const billingCompleted = userBillingData.balance > 0;
             const configureCLICompleted = runsData.length > 0;
-            const createProjectCompleted = projectData.length > 0;
+            const createProjectCompleted = projectData.data.length > 0;
 
             let tempHideStartUp = hideStartUp;
 
@@ -79,7 +81,7 @@ export const useTutorials = () => {
                 }),
             );
 
-            if (!tempHideStartUp && process.env.UI_VERSION === 'sky') {
+            if (!tempHideStartUp && product.isSky) {
                 dispatch(openTutorialPanel());
             }
 
@@ -88,7 +90,7 @@ export const useTutorials = () => {
     }, [userBillingData, runsData, projectData, location.pathname]);
 
     useEffect(() => {
-        if (projectData && projectData.length > 0 && !createProjectCompleted) {
+        if (projectData?.data && projectData.data.length > 0 && !createProjectCompleted) {
             dispatch(
                 updateTutorialPanelState({
                     createProjectCompleted: true,
@@ -114,8 +116,8 @@ export const useTutorials = () => {
     }, []);
 
     const startConfigCliTutorial = useCallback(() => {
-        if (projectData?.length) {
-            navigate(ROUTES.PROJECT.DETAILS.SETTINGS.FORMAT(projectData[0].project_name));
+        if (projectData?.data?.length) {
+            navigate(ROUTES.PROJECT.DETAILS.SETTINGS.FORMAT(projectData.data[0].project_name));
         }
     }, [projectData]);
 
@@ -168,14 +170,6 @@ export const useTutorials = () => {
             },
 
             {
-                ...BILLING_TUTORIAL,
-                id: 4,
-                completed: billingCompleted,
-                startCallback: startBillingTutorial,
-                finishCallback: finishBillingTutorial,
-            },
-
-            {
                 ...QUICKSTART_TUTORIAL,
                 id: 5,
                 startWithoutActivation: true,
@@ -189,6 +183,14 @@ export const useTutorials = () => {
                 startWithoutActivation: true,
                 completed: discordCompleted,
                 startCallback: startDiscordTutorial,
+            },
+
+            {
+                ...BILLING_TUTORIAL,
+                id: 4,
+                completed: billingCompleted,
+                startCallback: startBillingTutorial,
+                finishCallback: finishBillingTutorial,
             },
         ];
     }, [

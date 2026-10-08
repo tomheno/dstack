@@ -5,8 +5,8 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/dstackai/dstack/runner/internal/api"
-	"github.com/dstackai/dstack/runner/internal/log"
+	"github.com/dstackai/dstack/runner/internal/common/api"
+	"github.com/dstackai/dstack/runner/internal/common/log"
 	"github.com/dstackai/dstack/runner/internal/shim"
 	"github.com/dstackai/dstack/runner/internal/shim/components"
 	"github.com/dstackai/dstack/runner/internal/shim/dcgm"
@@ -46,6 +46,18 @@ func (s *ShimServer) InstanceHealthHandler(w http.ResponseWriter, r *http.Reques
 		} else {
 			response.DCGM = &dcgmHealth
 		}
+	}
+
+	return &response, nil
+}
+
+func (s *ShimServer) InstanceInfoHandler(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	response := InstanceInfoResponse{}
+	// GPUs are detected once on startup, so this is not an expensive call.
+	// The driver is a host-wide property, hence any GPU can be used as the source.
+	if gpus := s.runner.Gpus(r.Context()); len(gpus) > 0 {
+		response.GpuVendor = string(gpus[0].Vendor)
+		response.GpuDriverVersion = gpus[0].DriverVersion
 	}
 
 	return &response, nil
@@ -99,8 +111,8 @@ func (s *ShimServer) TaskSubmitHandler(w http.ResponseWriter, r *http.Request) (
 
 	ctx = log.WithLogger(context.Background(), log.GetLogger(ctx))
 	go func() {
-		if err := s.runner.Run(ctx, taskConfig.ID); err != nil {
-			log.Error(ctx, "failed to run", "task", taskConfig.ID, "err", err)
+		if err := s.runner.Start(ctx, taskConfig.ID); err != nil {
+			log.Error(ctx, "failed to start", "task", taskConfig.ID, "err", err)
 		}
 	}()
 

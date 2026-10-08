@@ -2,8 +2,8 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
-from pydantic import parse_obj_as
-
+from dstack._internal.core.compatibility.events import get_list_events_excludes
+from dstack._internal.core.models.common import validate_extra_ignore
 from dstack._internal.core.models.events import Event, EventTargetType
 from dstack._internal.server.schemas.events import LIST_EVENTS_DEFAULT_LIMIT, ListEventsRequest
 from dstack.api.server._group import APIClientGroup
@@ -27,6 +27,14 @@ class EventsAPIClient(APIClientGroup):
         prev_id: Optional[UUID] = None,
         limit: int = LIST_EVENTS_DEFAULT_LIMIT,
         ascending: bool = False,
+        *,
+        # NOTE: New parameters go here. Avoid positional parameters, they can break compatibility.
+        target_volumes: Optional[list[UUID]] = None,
+        target_gateways: Optional[list[UUID]] = None,
+        target_gateway_replicas: Optional[list[UUID]] = None,
+        target_secrets: Optional[list[UUID]] = None,
+        target_presets: Optional[list[UUID]] = None,
+        within_gateways: Optional[list[UUID]] = None,
     ) -> list[Event]:
         if prev_recorded_at is not None:
             # Time zones other than UTC are misinterpreted by the server:
@@ -39,9 +47,15 @@ class EventsAPIClient(APIClientGroup):
             target_instances=target_instances,
             target_runs=target_runs,
             target_jobs=target_jobs,
+            target_volumes=target_volumes,
+            target_gateways=target_gateways,
+            target_gateway_replicas=target_gateway_replicas,
+            target_secrets=target_secrets,
+            target_presets=target_presets,
             within_projects=within_projects,
             within_fleets=within_fleets,
             within_runs=within_runs,
+            within_gateways=within_gateways,
             include_target_types=include_target_types,
             actors=actors,
             prev_recorded_at=prev_recorded_at,
@@ -49,5 +63,7 @@ class EventsAPIClient(APIClientGroup):
             limit=limit,
             ascending=ascending,
         )
-        resp = self._request("/api/events/list", body=req.json())
-        return parse_obj_as(list[Event.__response__], resp.json())
+        resp = self._request(
+            "/api/events/list", body=req.model_dump_json(exclude=get_list_events_excludes(req))
+        )
+        return validate_extra_ignore(list[Event], resp.json())

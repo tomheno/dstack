@@ -10,11 +10,12 @@ from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased, joinedload
+from sqlalchemy.orm import aliased, joinedload, load_only
 
 from dstack._internal.core.models.instances import InstanceStatus
-from dstack._internal.core.models.runs import JobStatus, RunSpec, RunStatus
+from dstack._internal.core.models.runs import JobStatus, RunStatus
 from dstack._internal.server.models import (
+    FleetModel,
     InstanceModel,
     JobMetricsPoint,
     JobModel,
@@ -25,6 +26,7 @@ from dstack._internal.server.models import (
 )
 from dstack._internal.server.services.instances import get_instance_offer
 from dstack._internal.server.services.jobs import get_job_provisioning_data, get_job_runtime_data
+from dstack._internal.server.services.runs import get_run_spec
 from dstack._internal.utils.common import get_current_datetime
 
 
@@ -54,8 +56,15 @@ async def get_instance_metrics(session: AsyncSession) -> Iterable[Metric]:
         )
         .order_by(ProjectModel.name, InstanceModel.name)
         .options(
-            joinedload(InstanceModel.project),
-            joinedload(InstanceModel.fleet),
+            load_only(
+                InstanceModel.name,
+                InstanceModel.created_at,
+                InstanceModel.price,
+                InstanceModel.backend,
+                InstanceModel.offer,
+            ),
+            joinedload(InstanceModel.project).load_only(ProjectModel.name),
+            joinedload(InstanceModel.fleet).load_only(FleetModel.name),
         )
     )
     instances = res.unique().scalars().all()
@@ -152,7 +161,7 @@ async def get_job_metrics(session: AsyncSession) -> Iterable[Metric]:
             price = jrd.offer.price
         gpus = resources.gpus
         cpus = resources.cpus
-        run_spec = RunSpec.__response__.parse_raw(job.run.run_spec)
+        run_spec = get_run_spec(job.run)
         labels = {
             "dstack_project_name": job.project.name,
             "dstack_user_name": job.run.user.name,
@@ -186,7 +195,7 @@ async def get_job_metrics(session: AsyncSession) -> Iterable[Metric]:
                     )
                 ):
                     gpu_labels = labels.copy()
-                    gpu_labels["dstack_gpu_num"] = gpu_num
+                    gpu_labels["dstack_gpu_num"] = str(gpu_num)
                     metrics.add_sample(_JOB_GPU_USAGE_RATIO, gpu_labels, gpu_util / 100)
                     metrics.add_sample(_JOB_GPU_MEMORY_TOTAL, gpu_labels, gpu_memory_total)
                     metrics.add_sample(_JOB_GPU_MEMORY_USAGE, gpu_labels, gpu_memory_usage)

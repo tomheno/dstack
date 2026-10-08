@@ -1,6 +1,7 @@
 from typing import Annotated, Dict, List, Literal, Optional, Union
 
-from pydantic import Field, root_validator
+from pydantic import Field, RootModel, model_validator
+from typing_extensions import Self
 
 from dstack._internal.core.backends.base.models import fill_data
 from dstack._internal.core.models.common import CoreModel
@@ -23,8 +24,8 @@ class GCPDefaultCreds(CoreModel):
 AnyGCPCreds = Union[GCPServiceAccountCreds, GCPDefaultCreds]
 
 
-class GCPCreds(CoreModel):
-    __root__: AnyGCPCreds = Field(..., discriminator="type")
+class GCPCreds(RootModel[Annotated[AnyGCPCreds, Field(discriminator="type")]]):
+    pass
 
 
 class GCPBackendConfig(CoreModel):
@@ -36,6 +37,17 @@ class GCPBackendConfig(CoreModel):
     vpc_name: Annotated[
         Optional[str],
         Field(description="The name of a custom VPC. If not specified, the default VPC is used"),
+    ] = None
+    subnetworks: Annotated[
+        Optional[Dict[str, str]],
+        Field(
+            description=(
+                "The mapping from regions to names of subnetworks in the VPC specified by `vpc_name`."
+                " `dstack` provisions instances in the specified subnetwork in mapped regions"
+                " and in any usable subnetwork of the VPC in other regions."
+                " Requires `vpc_name` to be set"
+            )
+        ),
     ] = None
     extra_vpcs: Annotated[
         Optional[List[str]],
@@ -56,7 +68,7 @@ class GCPBackendConfig(CoreModel):
                 " A VPC should have eight subnets to maximize the bandwidth in clusters"
                 " with eight-GPU instances."
             ),
-            max_items=1,  # The currently supported instance types only need one VPC with eight subnets.
+            max_length=1,  # The currently supported instance types only need one VPC with eight subnets.
         ),
     ] = None
     vpc_project_id: Annotated[
@@ -96,7 +108,7 @@ class GCPBackendConfig(CoreModel):
                 "The list of preview GCP features to enable."
                 " There are currently no preview features"
             ),
-            max_items=1,
+            max_length=1,
         ),
     ] = None
 
@@ -121,9 +133,9 @@ class GCPServiceAccountFileCreds(CoreModel):
         ),
     ] = None
 
-    @root_validator
-    def fill_data(cls, values):
-        return fill_data(values)
+    @model_validator(mode="after")
+    def fill_data(self) -> Self:
+        return fill_data(self)
 
 
 AnyGCPFileCreds = Union[GCPServiceAccountFileCreds, GCPDefaultCreds]
@@ -141,7 +153,7 @@ class GCPStoredConfig(GCPBackendConfig):
 
 
 class GCPConfig(GCPStoredConfig):
-    creds: AnyGCPCreds
+    creds: Annotated[AnyGCPCreds, Field(discriminator="type")]
 
     @property
     def allocate_public_ips(self) -> bool:

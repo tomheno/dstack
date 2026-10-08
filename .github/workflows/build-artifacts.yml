@@ -64,7 +64,7 @@ jobs:
     strategy:
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
@@ -74,7 +74,7 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras
       - name: Run pyright
-        uses: jakebailey/pyright-action@v2
+        uses: jakebailey/pyright-action@v3
         with:
           pylance-version: latest-release
       - name: Download frontend build
@@ -100,10 +100,7 @@ jobs:
     defaults:
       run:
         working-directory: runner
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Set up Go
@@ -125,11 +122,6 @@ jobs:
           SHORT="-short"
           if [[ "${{ inputs.go-integration-tests }}" == "true" ]]; then
             SHORT=""
-          fi
-          # Skip failing integration tests on macOS for release builds.
-          # TODO: https://github.com/dstackai/dstack/issues/3005
-          if [[ "${{ inputs.staging }}" == "false" && "${{ startsWith(matrix.os, 'macos') }}" == "true" ]]; then
-            SHORT="-short"
           fi
           go version
           go fmt $(go list ./... | grep -v /vendor/)
@@ -171,33 +163,6 @@ jobs:
             runner/dstack-shim-${{ matrix.goos }}-${{ matrix.goarch }}
           retention-days: 1
 
-  gateway-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: 3.11
-      - name: Build package
-        working-directory: gateway
-        run: |
-          echo "__version__ = \"${{ inputs.version }}\"" > src/dstack/gateway/version.py
-          # TODO: depend on a specific dstackai/dstack commit for staging builds?
-          if [[ "${{ inputs.staging }}" == "false" ]]; then
-            sed \
-              -i.old \
-              "s|@ https://github.com/dstackai/dstack/archive/refs/heads/master.tar.gz|== ${{ inputs.version }}|" \
-              pyproject.toml
-            diff pyproject.toml pyproject.toml.old > /dev/null && echo "Could not set version" && exit 1
-          fi
-          uv build
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dstack-gateway
-          path: gateway/dist/dstack_gateway-${{ inputs.version }}-py3-none-any.whl
-          retention-days: 1
-
   python-build:
     needs: [code-lint, frontend-build]
     runs-on: ubuntu-latest
@@ -224,12 +189,14 @@ jobs:
             VERSION=${{ inputs.version }}
             IS_RELEASE=True
           fi
-          BASE_IMAGE=$(cat src/dstack/version.py | grep "base_image = ")
-          BASE_IMAGE_UBUNTU_VERSION=$(cat src/dstack/version.py | grep "base_image_ubuntu_version = ")
+          DOCKER_BASE_IMAGE=$(cat src/dstack/version.py | grep "docker_base_image = ")
+          DOCKER_BASE_IMAGE_UBUNTU_VERSION=$(cat src/dstack/version.py | grep "docker_base_image_ubuntu_version = ")
+          VM_BASE_IMAGE=$(cat src/dstack/version.py | grep "vm_base_image = ")
           echo "__version__ = \"$VERSION\"" > src/dstack/version.py
           echo "__is_release__ = $IS_RELEASE" >> src/dstack/version.py
-          echo $BASE_IMAGE >> src/dstack/version.py
-          echo $BASE_IMAGE_UBUNTU_VERSION >> src/dstack/version.py
+          echo $DOCKER_BASE_IMAGE >> src/dstack/version.py
+          echo $DOCKER_BASE_IMAGE_UBUNTU_VERSION >> src/dstack/version.py
+          echo $VM_BASE_IMAGE >> src/dstack/version.py
           cp README.md src
           uv build
       - uses: actions/upload-artifact@v4
@@ -251,8 +218,8 @@ jobs:
       - name: Generate json schema
         run: |
           mkdir /tmp/json-schemas
-          uv run python -c "from dstack._internal.core.models.configurations import DstackConfiguration; print(DstackConfiguration.schema_json())" > /tmp/json-schemas/configuration.json
-          uv run python -c "from dstack._internal.core.models.profiles import ProfilesConfig; print(ProfilesConfig.schema_json())" > /tmp/json-schemas/profiles.json
+          uv run python -c "from dstack._internal.core.models.configurations import DstackConfiguration; import json; print(json.dumps(DstackConfiguration.model_json_schema()))" > /tmp/json-schemas/configuration.json
+          uv run python -c "from dstack._internal.core.models.profiles import ProfilesConfig; import json; print(json.dumps(ProfilesConfig.model_json_schema()))" > /tmp/json-schemas/profiles.json
       - uses: actions/upload-artifact@v4
         with:
           name: json-schemas

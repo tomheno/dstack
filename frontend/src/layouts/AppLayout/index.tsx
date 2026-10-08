@@ -3,6 +3,7 @@ import Avatar from 'react-avatar';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
+import { product } from 'product';
 import { SideNavigationProps } from '@cloudscape-design/components/side-navigation';
 import { Mode } from '@cloudscape-design/global-styles';
 
@@ -10,6 +11,7 @@ import {
     AppLayout as GenericAppLayout,
     AppLayoutProps as GenericAppLayoutProps,
     BreadcrumbGroup,
+    ConfirmationDialog,
     HelpPanel,
     Notifications,
     SideNavigation,
@@ -35,6 +37,7 @@ import {
     setToolsTab,
 } from 'App/slice';
 
+import { selectConfirmationDialogs } from '../../components/ConfirmationDialog/slice';
 import { AnnotationContext } from './AnnotationContext';
 import { useSideNavigation } from './hooks';
 import { TallyComponent } from './Tally';
@@ -71,6 +74,7 @@ const AppLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const helpPanelContent = useAppSelector(selectHelpPanelContent);
     const dispatch = useAppDispatch();
     const { navLinks, activeHref } = useSideNavigation();
+    const confirmationDialogs = useAppSelector(selectConfirmationDialogs);
 
     const onFollowHandler: SideNavigationProps['onFollow'] = (event) => {
         event.preventDefault();
@@ -107,7 +111,7 @@ const AppLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     };
 
     const toggleTutorialPanel = () => {
-        if (process.env.UI_VERSION !== 'sky') {
+        if (!product.isSky) {
             return;
         }
 
@@ -121,7 +125,7 @@ const AppLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 
     const isVisibleInfoTab = helpPanelContent.header || helpPanelContent.footer || helpPanelContent.body;
 
-    const avatarProps = process.env.UI_VERSION === 'enterprise' ? { name: userName } : { githubHandle: userName };
+    const avatarProps = product.isSky ? { githubHandle: userName } : { name: userName };
 
     const onChangeSystemModeToggle: SideNavigationProps['onFollow'] = (event) => {
         event.preventDefault();
@@ -171,16 +175,16 @@ const AppLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
                                 iconSvg: <ThemeIcon />,
                                 onClick: onChangeSystemModeToggle,
                             },
-                            process.env.UI_VERSION === 'sky' && {
+                            product.isSky && {
                                 type: 'button',
                                 iconName: 'gen-ai',
                                 text: t('common.ask_ai'),
                                 title: t('common.ask_ai'),
                                 onClick: askAi,
                             },
-                            process.env.UI_VERSION === 'sky' && {
+                            product.isSky && {
                                 type: 'button',
-                                iconName: 'suggestions',
+                                iconName: 'support',
                                 title: t('common.tutorial_other'),
                                 onClick: toggleTutorialPanel,
                             },
@@ -232,7 +236,7 @@ const AppLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
                                         </HelpPanel>
                                     ),
                                 },
-                                process.env.UI_VERSION === 'sky' && {
+                                product.isSky && {
                                     id: ToolsTabs.TUTORIAL,
                                     label: t('common.tutorial_other'),
                                     content: (
@@ -253,7 +257,11 @@ const AppLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
                 onToolsChange={onChangeToolHandler}
             />
 
-            <TallyComponent />
+            {product.isSky && <TallyComponent />}
+
+            {confirmationDialogs.map(({ uuid, ...props }) => (
+                <ConfirmationDialog key={uuid} {...props} visible />
+            ))}
         </AnnotationContext>
     );
 };

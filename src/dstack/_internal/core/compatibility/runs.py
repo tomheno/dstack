@@ -1,7 +1,21 @@
 from typing import Optional
 
-from dstack._internal.core.models.common import IncludeExcludeDictType, IncludeExcludeSetType
-from dstack._internal.core.models.runs import ApplyRunPlanInput, JobSpec, RunSpec
+from dstack._internal.core.compatibility.common import get_profile_excludes
+from dstack._internal.core.models.common import (
+    IncludeExcludeDictType,
+    IncludeExcludeSetType,
+)
+from dstack._internal.core.models.configurations import (
+    ServiceConfiguration,
+    TaskConfiguration,
+)
+from dstack._internal.core.models.runs import (
+    DEFAULT_REPLICA_GROUP_NAME,
+    ApplyRunPlanInput,
+    JobSpec,
+    JobSubmission,
+    RunSpec,
+)
 from dstack._internal.server.schemas.runs import GetRunPlanRequest, ListRunsRequest
 
 
@@ -23,7 +37,28 @@ def get_apply_plan_excludes(plan: ApplyRunPlanInput) -> Optional[IncludeExcludeD
     current_resource = plan.current_resource
     if current_resource is not None:
         current_resource_excludes: IncludeExcludeDictType = {}
+        apply_plan_excludes["current_resource"] = current_resource_excludes
         current_resource_excludes["run_spec"] = get_run_spec_excludes(current_resource.run_spec)
+        current_resource_excludes["jobs"] = {
+            "__all__": {
+                "job_spec": get_job_spec_excludes([job.job_spec for job in current_resource.jobs]),
+                "job_submissions": {
+                    "__all__": get_job_submission_excludes(
+                        [
+                            submission
+                            for job in current_resource.jobs
+                            for submission in job.job_submissions
+                        ]
+                    ),
+                },
+                # Contains only informational computed fields, safe to exclude unconditionally
+                "job_connection_info": True,
+            }
+        }
+        if current_resource.latest_job_submission is not None:
+            current_resource_excludes["latest_job_submission"] = get_job_submission_excludes(
+                [current_resource.latest_job_submission]
+            )
     return {"plan": apply_plan_excludes}
 
 
@@ -47,14 +82,20 @@ def get_run_spec_excludes(run_spec: RunSpec) -> IncludeExcludeDictType:
     """
     spec_excludes: IncludeExcludeDictType = {}
     configuration_excludes: IncludeExcludeDictType = {}
-    profile_excludes: IncludeExcludeSetType = set()
+    profile_excludes = get_profile_excludes(run_spec.profile)
+    for field in get_profile_excludes(run_spec.configuration):
+        configuration_excludes[field] = True
 
-    # Add excludes like this:
-    #
-    # if run_spec.configuration.tags is None:
-    #     configuration_excludes["tags"] = True
-    # if run_spec.profile is not None and run_spec.profile.tags is None:
-    #     profile_excludes.add("tags")
+    if isinstance(run_spec.configuration, TaskConfiguration):
+        if run_spec.configuration.groups is None:
+            configuration_excludes["groups"] = True
+        if run_spec.configuration.nodes is None:
+            # Omit nodes when unset so old servers never see null (pre-hetero nodes was int=1).
+            configuration_excludes["nodes"] = True
+    elif isinstance(run_spec.configuration, ServiceConfiguration):
+        if run_spec.configuration.groups is None:
+            # Servers before 0.21.3 have no service `groups` and reject it as an extra field.
+            configuration_excludes["groups"] = True
 
     if configuration_excludes:
         spec_excludes["configuration"] = configuration_excludes
@@ -70,4 +111,20 @@ def get_job_spec_excludes(job_specs: list[JobSpec]) -> IncludeExcludeDictType:
     clients backward-compatibility with older servers.
     """
     spec_excludes: IncludeExcludeDictType = {}
+    if all(s.node_group_index == 0 for s in job_specs):
+        spec_excludes["node_group_index"] = True
+    if all(s.node_group_name == DEFAULT_REPLICA_GROUP_NAME for s in job_specs):
+        spec_excludes["node_group_name"] = True
+    if all(s.node_group_job_index == 0 for s in job_specs):
+        spec_excludes["node_group_job_index"] = True
     return spec_excludes
+
+
+def get_job_submission_excludes(job_submissions: list[JobSubmission]) -> IncludeExcludeDictType:
+    submission_excludes: IncludeExcludeDictType = {}
+    # `Resources.description` is deprecated and never set since 0.21. Not sending it lets 0.22
+    # drop the field without breaking 0.21 clients.
+    submission_excludes["job_provisioning_data"] = {
+        "instance_type": {"resources": {"description": True}}
+    }
+    return submission_excludes

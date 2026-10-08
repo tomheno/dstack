@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Optional
 
 import requests
 from rich.console import Console
@@ -12,6 +12,7 @@ from rich.theme import Theme
 from dstack._internal import settings
 from dstack._internal.cli.utils.rich import DstackRichHandler
 from dstack._internal.core.errors import CLIError, DstackError
+from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.instances import InstanceAvailability
 from dstack._internal.utils.common import get_dstack_dir, parse_since
 
@@ -23,10 +24,9 @@ _colors = {
     "code": "bold sea_green3",
 }
 
-console = Console(
-    theme=Theme(_colors),
-    force_terminal=settings.CLI_RICH_FORCE_TERMINAL,
-)
+console = Console(theme=Theme(_colors))
+
+error_console = Console(theme=Theme(_colors), stderr=True)
 
 
 LIVE_TABLE_REFRESH_RATE_PER_SEC = 1
@@ -77,21 +77,25 @@ def configure_logging():
     dstack_logger = logging.getLogger("dstack")
     dstack_logger.handlers.clear()
 
-    log_file = _get_cli_log_file()
-
     stdout_handler = DstackRichHandler(console=console)
     stdout_handler.setFormatter(logging.Formatter(fmt="%(message)s", datefmt="[%X]"))
     stdout_handler.setLevel(settings.CLI_LOG_LEVEL)
     dstack_logger.addHandler(stdout_handler)
 
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(
-        logging.Formatter(
-            fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    log_file = get_dstack_dir() / "logs" / "cli" / "latest.log"
+    try:
+        log_file = _get_cli_log_file()
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(
+            logging.Formatter(
+                fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
         )
-    )
-    file_handler.setLevel(settings.CLI_FILE_LOG_LEVEL)
-    dstack_logger.addHandler(file_handler)
+        file_handler.setLevel(settings.CLI_FILE_LOG_LEVEL)
+        dstack_logger.addHandler(file_handler)
+    except PermissionError:
+        console.print(f"[warning]Couldn't write to {log_file} due to a permissions problem.[/]")
 
     # the logger allows all messages, filtering is done by the handlers
     dstack_logger.setLevel(logging.DEBUG)
@@ -99,28 +103,27 @@ def configure_logging():
 
 def confirm_ask(prompt, **kwargs) -> bool:
     kwargs["console"] = console
-    return Confirm.ask(prompt=prompt, **kwargs)
+    try:
+        return Confirm.ask(prompt=prompt, **kwargs)
+    except KeyboardInterrupt:
+        console.print("\nCancelled by user")
+        raise SystemExit(1)
 
 
-def add_row_from_dict(table: Table, data: Dict[Union[str, int], Any], **kwargs):
-    """Maps dict keys to a table columns. `data` key is a column name or index. Missing keys are ignored."""
+def add_row_from_dict(table: Table, data: dict[str, Any], **kwargs):
+    """Maps dict keys to table columns. `data` key is the column name. Missing keys are ignored."""
     row = []
-    for i, col in enumerate(table.columns):
-        # TODO(egor-s): clear header style
-        if col.header in data:
-            row.append(data[col.header])
-        elif i in data:
-            row.append(data[i])
-        else:
-            row.append("")
+    for col in table.columns:
+        row.append(data.get(str(col.header), ""))
     table.add_row(*row, **kwargs)
 
 
-def warn(message: str):
+def warn(message: str, stderr: bool = False):
+    """`stderr=True` keeps the warning off stdout, so `--json` output stays parseable."""
     if not message.endswith("\n"):
         # Additional blank line for better visibility if there are more than one warning
         message = f"{message}\n"
-    console.print(f"[warning][bold]{message}[/]")
+    (error_console if stderr else console).print(f"[warning][bold]{message}[/]")
 
 
 def get_start_time(since: Optional[str]) -> Optional[datetime]:
@@ -149,7 +152,25 @@ def resolve_url(url: str, timeout: float = 5.0) -> str:
     return response.url
 
 
+def format_entity_reference(name: str, project: str, current_project: str) -> str:
+    if current_project == project:
+        return name
+    else:
+        return f"{project}/{name}"
+
+
 def format_instance_availability(v: InstanceAvailability) -> str:
     if v in (InstanceAvailability.UNKNOWN, InstanceAvailability.AVAILABLE):
         return ""
     return v.value.replace("_", " ").lower()
+
+
+def format_backend(backend: Optional[BackendType], region: Optional[str]) -> str:
+    if backend is None:
+        return "-"
+    backend_str = backend.value
+    if backend == BackendType.REMOTE:
+        backend_str = "ssh"
+    if region:
+        backend_str += f" ({region})"
+    return backend_str

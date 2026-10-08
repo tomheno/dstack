@@ -1,14 +1,20 @@
 import uuid
 from collections.abc import Generator
+from datetime import datetime, timezone
 from typing import Optional
 
 import pytest
+import requests
 import requests_mock
+from gpuhunt import AcceleratorVendor
 
-from dstack._internal.core.consts import DSTACK_SHIM_HTTP_PORT
+from dstack._internal.core.consts import DSTACK_RUNNER_HTTP_PORT, DSTACK_SHIM_HTTP_PORT
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.common import NetworkMode
+from dstack._internal.core.models.configurations import TaskConfiguration
+from dstack._internal.core.models.instances import GpuDriverInfo
 from dstack._internal.core.models.resources import Memory
+from dstack._internal.core.models.runs import ClusterInfo, Job, JobSpec, JobSubmission, Run
 from dstack._internal.core.models.volumes import (
     InstanceMountPoint,
     VolumeAttachment,
@@ -18,6 +24,7 @@ from dstack._internal.core.models.volumes import (
 )
 from dstack._internal.server.schemas.runner import (
     HealthcheckResponse,
+    InstanceInfoResponse,
     JobResult,
     LegacyPullResponse,
     PortMapping,
@@ -25,11 +32,21 @@ from dstack._internal.server.schemas.runner import (
     TaskStatus,
 )
 from dstack._internal.server.services.runner.client import (
+    RunnerClient,
+    RunnerResponseBodyError,
+    RunnerResponseStatusError,
     ShimClient,
-    ShimHTTPError,
+    ShimResponseBodyError,
+    ShimResponseStatusError,
     _parse_version,
+    healthcheck_response_to_instance_check,
+    instance_info_response_to_gpu_driver,
 )
-from dstack._internal.server.testing.common import get_volume, get_volume_configuration
+from dstack._internal.server.testing.common import (
+    get_run_spec,
+    get_volume,
+    get_volume_configuration,
+)
 
 
 class BaseShimClientTest:
@@ -65,6 +82,149 @@ class BaseShimClientTest:
             assert req.json() == json
 
 
+class TestRunnerClientSubmitJob(BaseShimClientTest):
+    def test_adds_default_project_for_server_access(self, adapter: requests_mock.Adapter):
+        adapter.register_uri("POST", "/api/submit", json={})
+        run_spec = get_run_spec(
+            repo_id="repo", configuration=TaskConfiguration(commands=["true"], dstack=True)
+        )
+        run = Run.model_construct(id=uuid.uuid4(), project_name="main", run_spec=run_spec)
+        job = Job.model_construct(
+            job_spec=JobSpec.model_construct(env={"DSTACK_TOKEN": "token"}),
+            job_submissions=[
+                JobSubmission.model_construct(
+                    id=uuid.uuid4(),
+                    submitted_at=datetime.now(timezone.utc),
+                )
+            ],
+        )
+        client = RunnerClient(port=DSTACK_RUNNER_HTTP_PORT)
+
+        client.submit_job(
+            run=run,
+            job=job,
+            cluster_info=ClusterInfo(job_ips=[], master_job_ip="", gpus_per_job=0),
+            secrets={},
+            repo_credentials=None,
+        )
+
+        assert adapter.last_request is not None
+        assert adapter.last_request.json()["job_spec"]["env"] == {
+            "DSTACK_PROJECT": "main",
+            "DSTACK_TOKEN": "token",
+        }
+        assert job.job_spec.env == {"DSTACK_TOKEN": "token"}
+
+    def test_preserves_explicit_project_for_server_access(self, adapter: requests_mock.Adapter):
+        adapter.register_uri("POST", "/api/submit", json={})
+        run_spec = get_run_spec(
+            repo_id="repo", configuration=TaskConfiguration(commands=["true"], dstack=True)
+        )
+        run = Run.model_construct(id=uuid.uuid4(), project_name="main", run_spec=run_spec)
+        job = Job.model_construct(
+            job_spec=JobSpec.model_construct(env={"DSTACK_PROJECT": "other"}),
+            job_submissions=[
+                JobSubmission.model_construct(
+                    id=uuid.uuid4(),
+                    submitted_at=datetime.now(timezone.utc),
+                )
+            ],
+        )
+        client = RunnerClient(port=DSTACK_RUNNER_HTTP_PORT)
+
+        client.submit_job(
+            run=run,
+            job=job,
+            cluster_info=ClusterInfo(job_ips=[], master_job_ip="", gpus_per_job=0),
+            secrets={},
+            repo_credentials=None,
+        )
+
+        assert adapter.last_request is not None
+        assert adapter.last_request.json()["job_spec"]["env"]["DSTACK_PROJECT"] == "other"
+
+
+class TestRunnerClientResponseErrors(BaseShimClientTest):
+    def test_status_error_reports_endpoint_status_and_body(self, adapter: requests_mock.Adapter):
+        adapter.register_uri(
+            "POST", "/api/stop", status_code=502, reason="Bad Gateway", text="upstream is down"
+        )
+        client = RunnerClient(port=DSTACK_RUNNER_HTTP_PORT)
+
+        with pytest.raises(RunnerResponseStatusError) as excinfo:
+            client.stop()
+
+        exc = excinfo.value
+        assert exc.status_code == 502
+        assert exc.response.status_code == 502
+        # The status line reason is dropped: Go derives it from the status code alone,
+        # while the body carries the message the handler actually wrote.
+        assert str(exc) == "POST /api/stop: 502: upstream is down"
+        assert repr(exc) == "RunnerResponseStatusError(502)"
+        # API errors must not be confused with connection errors
+        assert not isinstance(exc, requests.RequestException)
+
+    def test_status_error_without_body(self, adapter: requests_mock.Adapter):
+        adapter.register_uri("POST", "/api/stop", status_code=500, text="")
+        client = RunnerClient(port=DSTACK_RUNNER_HTTP_PORT)
+
+        with pytest.raises(RunnerResponseStatusError) as excinfo:
+            client.stop()
+
+        assert str(excinfo.value) == "POST /api/stop: 500: <empty>"
+
+    def test_status_error_truncates_long_body(self, adapter: requests_mock.Adapter):
+        adapter.register_uri("POST", "/api/stop", status_code=500, text="x" * 4096)
+        client = RunnerClient(port=DSTACK_RUNNER_HTTP_PORT)
+
+        with pytest.raises(RunnerResponseStatusError) as excinfo:
+            client.stop()
+
+        message = str(excinfo.value)
+        assert message.endswith("x" * 512 + "...")
+        assert len(message) < 600
+
+    def test_body_error_on_malformed_json(self, adapter: requests_mock.Adapter):
+        adapter.register_uri("GET", "/api/healthcheck", text="<html>not json")
+        client = RunnerClient(port=DSTACK_RUNNER_HTTP_PORT)
+
+        with pytest.raises(RunnerResponseBodyError) as excinfo:
+            client.healthcheck()
+
+        exc = excinfo.value
+        assert str(exc).startswith("GET /api/healthcheck: 1 validation error(s)")
+        assert str(exc).endswith("body: <html>not json")
+        # Parsing the body with pydantic rather than `Response.json()` keeps this out of the
+        # `requests.RequestException` hierarchy, where the tunnel would read it as transport.
+        assert not isinstance(exc, requests.RequestException)
+
+    def test_body_error_on_schema_mismatch(self, adapter: requests_mock.Adapter):
+        adapter.register_uri("GET", "/api/healthcheck", json={"service": "dstack-runner"})
+        client = RunnerClient(port=DSTACK_RUNNER_HTTP_PORT)
+
+        with pytest.raises(RunnerResponseBodyError) as excinfo:
+            client.healthcheck()
+
+        exc = excinfo.value
+        assert "first at version: Field required" in str(exc)
+        assert exc.error.error_count() == 1
+
+    def test_healthcheck_returns_none_on_connection_error(self, adapter: requests_mock.Adapter):
+        adapter.register_uri(
+            "GET", "/api/healthcheck", exc=requests.exceptions.ConnectionError("refused")
+        )
+        client = RunnerClient(port=DSTACK_RUNNER_HTTP_PORT)
+
+        assert client.healthcheck() is None
+
+    def test_healthcheck_raises_on_error_status(self, adapter: requests_mock.Adapter):
+        adapter.register_uri("GET", "/api/healthcheck", status_code=500)
+        client = RunnerClient(port=DSTACK_RUNNER_HTTP_PORT)
+
+        with pytest.raises(RunnerResponseStatusError):
+            client.healthcheck()
+
+
 class TestShimClientNegotiate(BaseShimClientTest):
     @pytest.mark.parametrize(
         ["expected_shim_version", "expected_api_version"],
@@ -81,10 +241,9 @@ class TestShimClientNegotiate(BaseShimClientTest):
             # invalid versions, assuming local builds with the latest version
             pytest.param(None, 2, marks=pytest.mark.shim_version("latest")),
             pytest.param(None, 2, marks=pytest.mark.shim_version("0.17.0-next")),
-            # even though this version is less than _FUTURE_API_MIN_VERSION, for the sake of
-            # simplicity we assume that any non-final version is the latest; normally, users
-            # should not use non-latest RC versions
-            pytest.param(None, 2, marks=pytest.mark.shim_version("0.17.0rc1")),
+            # pre-release versions are treated as the final version they lead to
+            pytest.param((0, 17, 0), 1, marks=pytest.mark.shim_version("0.17.0rc1")),
+            pytest.param((0, 18, 34), 2, marks=pytest.mark.shim_version("0.18.34rc1")),
         ],
     )
     def test(
@@ -105,19 +264,29 @@ class TestShimClientNegotiate(BaseShimClientTest):
         self.assert_request(adapter, 0, "GET", "/api/healthcheck")
 
 
-class TestShimClientRaiseForStatus(BaseShimClientTest):
-    def test(self, client: ShimClient, adapter: requests_mock.Adapter):
-        adapter.register_uri("GET", "/test/path", status_code=502, reason="Bad Gateway")
+class TestShimClientResponseErrors(BaseShimClientTest):
+    def test_status_error(self, client: ShimClient, adapter: requests_mock.Adapter):
+        adapter.register_uri(
+            "GET", "/test/path", status_code=502, reason="Bad Gateway", text="Task not found"
+        )
         response = client._request("GET", "/test/path")
 
-        with pytest.raises(ShimHTTPError) as excinfo:
+        with pytest.raises(ShimResponseStatusError) as excinfo:
             client._raise_for_status(response)
 
         exc = excinfo.value
         assert exc.status_code == 502
-        assert exc.message.startswith("502 Server Error: Bad Gateway")
-        assert str(exc).startswith("502 Server Error: Bad Gateway")
-        assert repr(exc) == "ShimHTTPError(502)"
+        assert str(exc) == "GET /test/path: 502: Task not found"
+        assert repr(exc) == "ShimResponseStatusError(502)"
+
+    def test_body_error(self, client: ShimClient, adapter: requests_mock.Adapter):
+        adapter.register_uri("GET", "/test/path", json={"service": "dstack-shim"})
+        response = client._request("GET", "/test/path")
+
+        with pytest.raises(ShimResponseBodyError) as excinfo:
+            client._response(HealthcheckResponse, response)
+
+        assert "first at version: Field required" in str(excinfo.value)
 
 
 @pytest.mark.shim_version("0.18.30")
@@ -517,9 +686,17 @@ class TestParseVersion:
     def test_valid_final(self, value: str, expected: tuple[int, int, int]):
         assert _parse_version(value) == expected
 
-    @pytest.mark.parametrize("value", ["1.12alpha1", "1.12.3rc1", "1.12.3.dev0"])
-    def test_valid_pre_dev_local(self, value: str):
-        assert _parse_version(value) is None
+    @pytest.mark.parametrize(
+        ["value", "expected"],
+        [
+            ["1.12alpha1", (1, 12, 0)],
+            ["1.12.3rc1", (1, 12, 3)],
+            ["1.12.3.dev0", (1, 12, 3)],
+            ["1.12.3.post1", (1, 12, 3)],
+        ],
+    )
+    def test_valid_pre_dev_post(self, value: str, expected: tuple[int, int, int]):
+        assert _parse_version(value) == expected
 
     @pytest.mark.parametrize("value", ["1", "1234"])
     def test_valid_major_only(self, value: str):
@@ -528,3 +705,64 @@ class TestParseVersion:
     @pytest.mark.parametrize("value", ["", "foo", "1.12.3-next.20241231"])
     def test_invalid(self, value: str):
         assert _parse_version(value) is None
+
+
+class TestHealthcheckResponseToInstanceCheck:
+    def test_reachable(self):
+        response = HealthcheckResponse(service="dstack-shim", version="0.19.0")
+        check = healthcheck_response_to_instance_check(response)
+        assert check.reachable
+        assert check.gpu_driver is None
+
+    def test_unexpected_service(self):
+        response = HealthcheckResponse(service="not-dstack-shim", version="0.19.0")
+        check = healthcheck_response_to_instance_check(response)
+        assert not check.reachable
+        assert check.gpu_driver is None
+
+
+class TestInstanceInfoResponseToGpuDriver:
+    def test_none_response(self):
+        assert instance_info_response_to_gpu_driver(None) is None
+
+    def test_no_gpus(self):
+        assert instance_info_response_to_gpu_driver(InstanceInfoResponse()) is None
+
+    def test_vendor_without_version(self):
+        response = InstanceInfoResponse(gpu_vendor="nvidia")
+        assert instance_info_response_to_gpu_driver(response) is None
+
+    def test_gpu_driver(self):
+        response = InstanceInfoResponse(gpu_vendor="nvidia", gpu_driver_version="570.86.15")
+        assert instance_info_response_to_gpu_driver(response) == GpuDriverInfo(
+            vendor=AcceleratorVendor.NVIDIA, version="570.86.15"
+        )
+
+
+class TestShimClientGetInstanceInfo(BaseShimClientTest):
+    @pytest.mark.shim_version("0.21.0")
+    def test_returns_instance_info(self, adapter: requests_mock.Adapter, client: ShimClient):
+        adapter.register_uri(
+            "GET",
+            "/api/instance/info",
+            json={"gpu_vendor": "nvidia", "gpu_driver_version": "570.86.15"},
+        )
+        resp = client.get_instance_info()
+        assert resp is not None
+        assert resp.gpu_vendor == "nvidia"
+        assert resp.gpu_driver_version == "570.86.15"
+        self.assert_request(adapter, 1, "GET", "/api/instance/info")
+
+    @pytest.mark.shim_version("0.20.29")
+    def test_returns_none_if_not_supported(
+        self, adapter: requests_mock.Adapter, client: ShimClient
+    ):
+        assert client.get_instance_info() is None
+        assert len(adapter.request_history) == 1  # healthcheck only
+
+    @pytest.mark.shim_version("latest")
+    def test_returns_none_if_not_found(self, adapter: requests_mock.Adapter, client: ShimClient):
+        adapter.register_uri("GET", "/api/instance/info", status_code=404, text="Not Found")
+        assert client.get_instance_info() is None
+        # An unknown shim version is assumed to support the endpoint, so it is requested
+        self.assert_request(adapter, 1, "GET", "/api/instance/info")

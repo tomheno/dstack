@@ -1,0 +1,158 @@
+---
+title: NCCL/RCCL tests
+description: Running NCCL and RCCL tests to validate cluster network bandwidth
+---
+
+# NCCL/RCCL tests
+
+This example shows how to run [NCCL](https://github.com/NVIDIA/nccl-tests) or [RCCL](https://github.com/ROCm/rccl-tests) tests on a cluster using [multi-node tasks](../../concepts/tasks.md#nodes).
+
+!!! info "Prerequisites"
+    Before running a multi-node task, make sure to create a fleet with `placement` set to `cluster` (can be a [managed fleet](../../concepts/fleets.md#cluster-placement) or an [SSH fleet](../../concepts/fleets.md#ssh-placement)).
+
+## Running as a task
+
+Here's an example of a task that runs AllReduce test on 2 nodes, each with 4 GPUs (8 processes in total), using [node groups](../../concepts/tasks.md#node-groups).
+
+=== "NCCL tests"
+
+    <div editor-title="nccl-tests.dstack.yml">
+
+    ```yaml
+    type: task
+    name: nccl-tests
+
+    startup_order: workers-first
+    stop_criteria: master-done
+
+    env:
+      - NCCL_DEBUG=INFO
+
+    groups:
+      - nodes: 1
+        commands:
+          - |
+            mpirun \
+              --allow-run-as-root \
+              --hostfile $DSTACK_MPI_HOSTFILE \
+              -n $DSTACK_GPUS_NUM \
+              -N $DSTACK_GPUS_PER_NODE \
+              --bind-to none \
+              /opt/nccl-tests/build/all_reduce_perf -b 8 -e 8G -f 2 -g 1
+        resources:
+          gpu: nvidia:1..8
+          shm_size: 16GB
+
+      - nodes: 1
+        commands:
+          - sleep infinity
+        resources:
+          gpu: nvidia:1..8
+          shm_size: 16GB
+
+    # Uncomment if the `kubernetes` backend requires it for `/dev/infiniband` access
+    #privileged: true
+    ```
+
+    </div>
+
+    !!! info "Default image"
+        If you don't specify `image`, `dstack` uses its [base](https://github.com/dstackai/dstack/tree/master/docker/base) Docker image pre-configured with 
+        `uv`, `python`, `pip`, essential CUDA drivers, `mpirun`, and NCCL tests (under `/opt/nccl-tests/build`). 
+
+=== "RCCL tests"
+
+    <div editor-title="rccl-tests.dstack.yml">
+
+    ```yaml
+    type: task
+    name: rccl-tests
+
+    startup_order: workers-first
+    stop_criteria: master-done
+
+    # Mount the system libraries folder from the host
+    volumes:
+      - /usr/local/lib:/mnt/lib
+
+    image: rocm/dev-ubuntu-22.04:6.4-complete
+    env:
+      - NCCL_DEBUG=INFO
+      - OPEN_MPI_HOME=/usr/lib/x86_64-linux-gnu/openmpi
+
+    groups:
+      - nodes: 1
+        commands:
+          # Setup MPI and build RCCL tests
+          - apt-get install -y git libopenmpi-dev openmpi-bin
+          - git clone https://github.com/ROCm/rccl-tests.git
+          - cd rccl-tests
+          - make MPI=1 MPI_HOME=$OPEN_MPI_HOME
+
+          # Preload the RoCE driver library from the host (for Broadcom driver compatibility)
+          - export LD_PRELOAD=/mnt/lib/libbnxt_re-rdmav34.so
+
+          # Run RCCL tests via MPI
+          - |
+            mpirun --allow-run-as-root \
+              --hostfile $DSTACK_MPI_HOSTFILE \
+              -n $DSTACK_GPUS_NUM \
+              -N $DSTACK_GPUS_PER_NODE \
+              --mca btl_tcp_if_include ens41np0 \
+              -x LD_PRELOAD \
+              -x NCCL_IB_HCA=mlx5_0/1,bnxt_re0,bnxt_re1,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re6,bnxt_re7 \
+              -x NCCL_IB_GID_INDEX=3 \
+              -x NCCL_IB_DISABLE=0 \
+              ./build/all_reduce_perf -b 8M -e 8G -f 2 -g 1 -w 5 --iters 20 -c 0;
+        resources:
+          gpu: MI300X:8
+
+      - nodes: 1
+        commands:
+          # Setup MPI and build RCCL tests
+          - apt-get install -y git libopenmpi-dev openmpi-bin
+          - git clone https://github.com/ROCm/rccl-tests.git
+          - cd rccl-tests
+          - make MPI=1 MPI_HOME=$OPEN_MPI_HOME
+
+          # Preload the RoCE driver library from the host (for Broadcom driver compatibility)
+          - export LD_PRELOAD=/mnt/lib/libbnxt_re-rdmav34.so
+
+          - sleep infinity
+        resources:
+          gpu: MI300X:8
+    ```
+
+    </div>
+
+    !!! info "RoCE library"
+        RCCL tests use the RDMA/RoCE interconnect for internode communication. To use the RDMA/RoCE interconnect on Broadcom `bnxt_re` devices, RCCL requires the Broadcom-specific userspace provider library `libbnxt_re-rdmav34.so` to be available inside the container at `/usr/lib/x86_64-linux-gnu/libibverbs/libbnxt_re-rdmav34.so`. We make this library available by mounting it from the host and using `LD_PRELOAD` when running MPI.
+
+        Alternatively, you can avoid `LD_PRELOAD` and directly mount `/usr/lib/x86_64-linux-gnu/libibverbs/libbnxt_re-rdmav34.so` if you use a custom image with OpenMPI pre-installed.
+
+!!! info "Privileged"
+    In some cases, the backend (e.g., `kubernetes`) may require `privileged: true` to access the high-speed interconnect (e.g., InfiniBand).
+
+### Apply a configuration
+
+To run a configuration, use the [`dstack apply`](../../reference/cli/dstack/apply.md) command.
+
+<div class="termy">
+
+```shell
+$ dstack apply -f nccl-tests.dstack.yml
+
+ #  BACKEND  REGION     INSTANCE       RESOURCES                                   SPOT  PRICE
+ 1  aws      us-east-1  g4dn.12xlarge  48xCPU, 192GB, 4xT4 (16GB), 100.0GB (disk)  no    $3.912
+ 2  aws      us-west-2  g4dn.12xlarge  48xCPU, 192GB, 4xT4 (16GB), 100.0GB (disk)  no    $3.912
+ 3  aws      us-east-2  g4dn.12xlarge  48xCPU, 192GB, 4xT4 (16GB), 100.0GB (disk)  no    $3.912
+
+Submit the run nccl-tests? [y/n]: y
+```
+
+</div>
+
+## What's next?
+
+1. Check [dev environments](../../concepts/dev-environments.md), [tasks](../../concepts/tasks.md), 
+   [services](../../concepts/services.md), and [fleets](../../concepts/fleets.md).

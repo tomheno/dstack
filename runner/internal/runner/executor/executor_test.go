@@ -1,0 +1,805 @@
+package executor
+
+import (
+	"archive/tar"
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/dstackai/dstack/runner/internal/common/types"
+	linuxuser "github.com/dstackai/dstack/runner/internal/runner/linux/user"
+	"github.com/dstackai/dstack/runner/internal/runner/schemas"
+)
+
+func TestExecutor_WorkingDir_Set(t *testing.T) {
+	var b bytes.Buffer
+	ex := makeTestExecutor(t)
+	baseDir, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	workingDir := path.Join(baseDir, "path/to/wd")
+
+	ex.jobSpec.WorkingDir = &workingDir
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "pwd")
+	err = ex.setJobWorkingDir(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, workingDir, ex.jobWorkingDir)
+	err = os.MkdirAll(workingDir, 0o755)
+	require.NoError(t, err)
+
+	err = ex.execJob(t.Context(), io.Writer(&b))
+	assert.NoError(t, err)
+	// Normalize line endings for cross-platform compatibility.
+	assert.Equal(t, workingDir+"\n", strings.ReplaceAll(b.String(), "\r\n", "\n"))
+}
+
+func TestExecutor_WorkingDir_NotSet(t *testing.T) {
+	var b bytes.Buffer
+	ex := makeTestExecutor(t)
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	ex.jobSpec.WorkingDir = nil
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "pwd")
+	err = ex.setJobWorkingDir(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, cwd, ex.jobWorkingDir)
+
+	err = ex.execJob(t.Context(), io.Writer(&b))
+	assert.NoError(t, err)
+	assert.Equal(t, cwd+"\n", strings.ReplaceAll(b.String(), "\r\n", "\n"))
+}
+
+func TestExecutor_HomeDir(t *testing.T) {
+	var b bytes.Buffer
+	ex := makeTestExecutor(t)
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "echo ~")
+
+	err := ex.execJob(t.Context(), io.Writer(&b))
+	assert.NoError(t, err)
+	assert.Equal(t, ex.currentUser.HomeDir+"\n", strings.ReplaceAll(b.String(), "\r\n", "\n"))
+}
+
+func TestExecutor_NonZeroExit(t *testing.T) {
+	ex := makeTestExecutor(t)
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "exit 100")
+	makeCodeTar(t, ex)
+
+	setUpTestExecutor(t, ex)
+	err := ex.Run(t.Context())
+	assert.Error(t, err)
+	assert.NotEmpty(t, ex.jobStateHistory)
+	exitStatus := ex.jobStateHistory[len(ex.jobStateHistory)-1].ExitStatus
+	assert.NotNil(t, exitStatus)
+	assert.Equal(t, 100, *exitStatus)
+}
+
+func TestExecutor_SSHCredentials(t *testing.T) {
+	key := "== ssh private key =="
+
+	var b bytes.Buffer
+	ex := makeTestExecutor(t)
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "cat ~/.ssh/id_rsa")
+	ex.repoCredentials = &schemas.RepoCredentials{
+		CloneURL:   "ssh://git@github.com/dstackai/dstack-examples.git",
+		PrivateKey: &key,
+	}
+
+	clean, err := ex.setupGitCredentials(t.Context())
+	defer clean()
+	require.NoError(t, err)
+
+	err = ex.execJob(t.Context(), io.Writer(&b))
+	assert.NoError(t, err)
+	assert.Equal(t, key, b.String())
+}
+
+func TestExecutor_LocalRepo(t *testing.T) {
+	var b bytes.Buffer
+	ex := makeTestExecutor(t)
+	cmd := fmt.Sprintf("cat %s/foo", *ex.jobSpec.RepoDir)
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, cmd)
+	makeCodeTar(t, ex)
+
+	err := ex.setupRepo(t.Context())
+	require.NoError(t, err)
+
+	err = ex.execJob(t.Context(), io.Writer(&b))
+	assert.NoError(t, err)
+	assert.Equal(t, "bar\n", strings.ReplaceAll(b.String(), "\r\n", "\n"))
+}
+
+func TestExecutor_Recover(t *testing.T) {
+	ex := makeTestExecutor(t)
+	ex.jobSpec.Commands = nil // cause a panic
+	makeCodeTar(t, ex)
+
+	setUpTestExecutor(t, ex)
+	err := ex.Run(t.Context())
+	assert.ErrorContains(t, err, "recovered: ")
+}
+
+// Setup can fail after it has already configured runner logging. It finalizes the executor
+// itself, so the buffered logs are flushed and the state it serves is reported as final --
+// otherwise /api/pull would keep waiting for logs that are never coming.
+func TestExecutor_SetupFailureFinalizes(t *testing.T) {
+	ex := makeTestExecutor(t)
+	workingDir := "not/an/absolute/path" // makes setJobWorkingDir, and so Setup, fail
+	ex.jobSpec.WorkingDir = &workingDir
+
+	err := ex.Setup(t.Context())
+	require.ErrorContains(t, err, "working dir must be absolute")
+
+	assert.Equal(t, WaitLogsFinished, ex.GetRunnerState())
+	history := ex.GetHistory(0)
+	assert.False(t, history.HasMore)
+	assert.NotEmpty(t, history.RunnerLogs, "runner logs must be flushed, not left in the stripper")
+
+	// The caller is expected to skip Run, but must not be punished for a redundant Finalize
+	assert.NotPanics(t, func() { ex.Finalize(t.Context()) })
+}
+
+// Run requires a successful Setup: without it there is no runner logging and no resolved job
+// user, so it must refuse rather than run the job with unset fields.
+func TestExecutor_RunWithoutSetup(t *testing.T) {
+	ex := makeTestExecutor(t)
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "echo hello")
+	makeCodeTar(t, ex)
+
+	err := ex.Run(t.Context())
+	assert.ErrorContains(t, err, "not set up")
+}
+
+// Run finalizes the executor itself, so a job that finishes on its own leaves nothing buffered
+// and reports its state as final without the caller doing anything.
+func TestExecutor_RunFinalizes(t *testing.T) {
+	ex := makeTestExecutor(t)
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "echo hello")
+	makeCodeTar(t, ex)
+	setUpTestExecutor(t, ex)
+
+	require.NoError(t, ex.Run(t.Context()))
+
+	assert.Equal(t, WaitLogsFinished, ex.GetRunnerState())
+	assert.False(t, ex.GetHistory(0).HasMore)
+	assert.NotPanics(t, func() { ex.Finalize(t.Context()) })
+
+	// Setup did happen, so the gate must report the finished job rather than a missing Setup
+	assert.ErrorContains(t, ex.Run(t.Context()), "already finished")
+}
+
+/* Long tests */
+
+func TestExecutor_MaxDuration(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	ex := makeTestExecutor(t)
+	ex.killDelay = 500 * time.Millisecond
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "echo 1 && sleep 2 && echo 2")
+	ex.jobSpec.MaxDuration = 1 // seconds
+	makeCodeTar(t, ex)
+
+	setUpTestExecutor(t, ex)
+	err := ex.Run(t.Context())
+	// The job is interrupted rather than killed: INTR reaches the workload through the
+	// terminal, so it exits on SIGINT long before the SIGKILL backstop would fire.
+	assert.ErrorContains(t, err, "interrupt")
+
+	history := ex.GetHistory(0)
+	lastState := history.JobStates[len(history.JobStates)-1]
+	assert.Equal(t, schemas.JobStateTerminated, lastState.State)
+	assert.Equal(t, types.TerminationReasonMaxDurationExceeded, lastState.TerminationReason)
+}
+
+func TestExecutor_LogQuota(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	ex := makeTestExecutor(t)
+	ex.killDelay = 500 * time.Millisecond
+	// Output >100 bytes to trigger the quota
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "for i in $(seq 1 20); do echo 'This line is long enough to exceed the quota easily'; done")
+	ex.jobLogs.SetQuota(100)
+	makeCodeTar(t, ex)
+
+	setUpTestExecutor(t, ex)
+	err := ex.Run(t.Context())
+	assert.ErrorContains(t, err, "log quota exceeded")
+
+	// Verify the termination state was set. The quota stops the job through the same
+	// cancellation an external stop uses, so the reason must survive that path.
+	history := ex.GetHistory(0)
+	lastState := history.JobStates[len(history.JobStates)-1]
+	assert.Equal(t, schemas.JobStateFailed, lastState.State)
+	assert.Equal(t, types.TerminationReasonLogQuotaExceeded, lastState.TerminationReason)
+}
+
+// A job that leaves a process behind keeps the pty slave open, so reading the master never
+// returns EIO. The executor must stop reading anyway instead of hanging forever.
+func TestExecutor_SurvivingProcessDoesNotHangRun(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	ex := makeTestExecutor(t)
+	ex.logsDrainDelay = 500 * time.Millisecond
+	// `-i` as the server sends it: job control puts the backgrounded process in its own
+	// process group, so it does not get the SIGHUP the kernel sends to the foreground group
+	// when the shell exits, and goes on holding the pty slave open. It must outlive the
+	// assertion below, or the executor would be let off the hook by the process exiting.
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "survivor.pid")
+	// Ignores SIGHUP, the way a nohup'd process or a daemon does, so it goes on holding the
+	// terminal open even after the hangup the job's own end sends -- which is the case the
+	// drain bound exists for.
+	survivor := filepath.Join(dir, "survivor.sh")
+	require.NoError(t, os.WriteFile(survivor, []byte(
+		"trap '' HUP\n"+
+			"echo $$ > "+pidPath+"\n"+
+			"while :; do sleep 0.2; done\n"), 0o600))
+	ex.jobSpec.Commands = []string{
+		"/bin/sh", "-i", "-c",
+		"/bin/sh " + survivor + " & echo done",
+	}
+	t.Cleanup(func() { killRecordedPid(t, pidPath) })
+	makeCodeTar(t, ex)
+
+	runDone := make(chan error, 1)
+	setUpTestExecutor(t, ex)
+	go func() { runDone <- ex.Run(t.Context()) }()
+
+	select {
+	case err := <-runDone:
+		assert.NoError(t, err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("Run did not return while a process left by the job held the terminal open")
+	}
+
+	history := ex.GetHistory(0)
+	lastState := history.JobStates[len(history.JobStates)-1]
+	assert.Equal(t, schemas.JobStateDone, lastState.State)
+
+	// Output written before the command exited must still be drained.
+	var logs strings.Builder
+	for _, event := range history.JobLogs {
+		logs.Write(event.Message)
+	}
+	assert.Contains(t, logs.String(), "done")
+}
+
+// Stopping a job must interrupt the workload, not just the wrapper shell: the workload gets a
+// chance to shut down cleanly instead of being killed once the grace period expires.
+func TestExecutor_StopInterruptsWorkload(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	workload := filepath.Join(t.TempDir(), "workload.sh")
+	require.NoError(t, os.WriteFile(workload, []byte(
+		"trap 'echo graceful shutdown; exit 0' INT\n"+
+			"echo ready\n"+
+			"sleep 300\n"), 0o600))
+
+	ex := makeTestExecutor(t)
+	// The SIGKILL backstop must not be what stops the job.
+	ex.killDelay = 60 * time.Second
+	// The trailing `&& :` is load-bearing. Given a single simple command, bash and BusyBox ash
+	// exec it in place, leaving no shell at all -- and the interrupt used to reach a workload
+	// that was the direct child just fine. A command list keeps the wrapper shell, which is the
+	// arrangement that used to swallow the interrupt. Verified against bash, dash and BusyBox
+	// ash; dash does not do the optimization either way.
+	ex.jobSpec.Commands = []string{"/bin/sh", "-i", "-c", "/bin/sh " + workload + " && :"}
+	makeCodeTar(t, ex)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	runDone := make(chan error, 1)
+	setUpTestExecutor(t, ex)
+	go func() { runDone <- ex.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(jobLogsSoFar(ex), "ready")
+	}, 30*time.Second, 100*time.Millisecond, "the workload never started")
+
+	cancel() // what /api/stop does
+	stoppedAt := time.Now()
+
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return after the job was stopped")
+	}
+	assert.Less(t, time.Since(stoppedAt), ex.killDelay,
+		"the job was stopped by the SIGKILL backstop rather than by INTR")
+
+	history := ex.GetHistory(0)
+	assert.Contains(t, combineLogMessages(history.JobLogs), "graceful shutdown",
+		"the workload did not receive SIGINT")
+	lastState := history.JobStates[len(history.JobStates)-1]
+	assert.Equal(t, schemas.JobStateTerminated, lastState.State)
+}
+
+// jobLogsSoFar reads the log history while the job is still running, under the lock the
+// executor's writers share.
+func jobLogsSoFar(ex *RunExecutor) string {
+	ex.mu.RLock()
+	defer ex.mu.RUnlock()
+	return combineLogMessages(ex.jobLogs.history)
+}
+
+// A job that ignores the interrupt is escalated: SIGHUP to its session, then SIGKILL. The
+// escalation has to cover what the job left outside the terminal's foreground process group,
+// since that is all the interrupt itself, or the kernel's hangup, can reach.
+func TestExecutor_StopKillsWholeSession(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "background.pid")
+	// Backgrounded, so job control gives it a process group of its own and neither the
+	// interrupt nor the kernel's hangup SIGHUP reaches it. It ignores both signals anyway, so
+	// only the SIGKILL stage can clear it.
+	background := filepath.Join(dir, "background.sh")
+	require.NoError(t, os.WriteFile(background, []byte(
+		"trap '' INT HUP\n"+
+			"echo $$ > "+pidPath+"\n"+
+			"while :; do sleep 0.2; done\n"), 0o600))
+	// Ignores the interrupt, so the job does not stop on its own and the shell stays alive.
+	foreground := filepath.Join(dir, "foreground.sh")
+	require.NoError(t, os.WriteFile(foreground, []byte(
+		"trap '' INT\n"+
+			"echo ready\n"+
+			"while :; do sleep 0.2; done\n"), 0o600))
+
+	ex := makeTestExecutor(t)
+	ex.hupDelay = 300 * time.Millisecond
+	ex.killDelay = 900 * time.Millisecond
+	ex.jobSpec.Commands = []string{
+		"/bin/sh", "-i", "-c",
+		"/bin/sh " + background + " & /bin/sh " + foreground,
+	}
+	makeCodeTar(t, ex)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	runDone := make(chan error, 1)
+	setUpTestExecutor(t, ex)
+	go func() { runDone <- ex.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(jobLogsSoFar(ex), "ready")
+	}, 30*time.Second, 100*time.Millisecond, "the job never started")
+	backgroundPid := readRecordedPid(t, pidPath)
+	t.Cleanup(func() { _ = syscall.Kill(backgroundPid, syscall.SIGKILL) })
+
+	cancel() // what /api/stop does
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return after the job was stopped")
+	}
+
+	assert.False(t, processAlive(backgroundPid),
+		"a process the job left outside the foreground group survived the stop")
+	history := ex.GetHistory(0)
+	lastState := history.JobStates[len(history.JobStates)-1]
+	assert.Equal(t, schemas.JobStateTerminated, lastState.State)
+}
+
+func readRecordedPid(t *testing.T, path string) int {
+	t.Helper()
+	var pid int
+	require.Eventually(t, func() bool {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return false
+		}
+		pid, err = strconv.Atoi(strings.TrimSpace(string(data)))
+		return err == nil && pid > 0
+	}, 30*time.Second, 100*time.Millisecond, "the process never recorded its pid")
+	return pid
+}
+
+// processAlive reports whether pid is a live process, treating a zombie as gone.
+func processAlive(pid int) bool {
+	state, ok := procState(pid)
+	return ok && state != 'Z'
+}
+
+// A job that finishes on its own can leave processes running -- a sidecar started with `&`,
+// say. They are about to lose the terminal, and shortly after the container, so they are told
+// rather than being killed outright without notice.
+func TestExecutor_FinishedJobHangsUpOnLeftoverProcesses(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "sidecar.pid")
+	hupPath := filepath.Join(dir, "sidecar.hup")
+	sidecar := filepath.Join(dir, "sidecar.sh")
+	require.NoError(t, os.WriteFile(sidecar, []byte(
+		"trap 'echo yes > "+hupPath+"; exit 0' HUP\n"+
+			"echo $$ > "+pidPath+"\n"+
+			"while :; do sleep 0.2; done\n"), 0o600))
+
+	ex := makeTestExecutor(t)
+	ex.jobSpec.Commands = []string{
+		"/bin/sh", "-i", "-c",
+		"/bin/sh " + sidecar + " & echo done",
+	}
+	makeCodeTar(t, ex)
+
+	runDone := make(chan error, 1)
+	setUpTestExecutor(t, ex)
+	go func() { runDone <- ex.Run(t.Context()) }()
+	select {
+	case err := <-runDone:
+		assert.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return")
+	}
+	t.Cleanup(func() { killRecordedPid(t, pidPath) })
+
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(hupPath)
+		return err == nil
+	}, 10*time.Second, 100*time.Millisecond, "the leftover process was never sent SIGHUP")
+
+	history := ex.GetHistory(0)
+	lastState := history.JobStates[len(history.JobStates)-1]
+	assert.Equal(t, schemas.JobStateDone, lastState.State)
+}
+
+func TestExecutor_RemoteRepo(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	var b bytes.Buffer
+	ex := makeTestExecutor(t)
+	ex.jobSpec.RepoData = &schemas.RepoData{
+		RepoType:        "remote",
+		RepoBranch:      "main",
+		RepoHash:        "2b83592e506ed6fe8e49f4eaa97c3866bc9402b1",
+		RepoConfigName:  "Dstack Developer",
+		RepoConfigEmail: "developer@dstack.ai",
+	}
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "git rev-parse HEAD && git config user.name && git config user.email")
+	err := ex.WriteRepoBlob(bytes.NewReader([]byte{})) // empty diff
+	require.NoError(t, err)
+
+	err = ex.setJobWorkingDir(t.Context())
+	require.NoError(t, err)
+	err = ex.setupRepo(t.Context())
+	require.NoError(t, err)
+
+	err = ex.execJob(t.Context(), io.Writer(&b))
+	assert.NoError(t, err)
+	expected := fmt.Sprintf("%s\n%s\n%s\n", ex.getRepoData().RepoHash, ex.getRepoData().RepoConfigName, ex.getRepoData().RepoConfigEmail)
+	assert.Equal(t, expected, strings.ReplaceAll(b.String(), "\r\n", "\n"))
+}
+
+/* Helpers */
+
+// setUpTestExecutor performs the Setup that Run requires
+func setUpTestExecutor(t *testing.T, ex *RunExecutor) {
+	t.Helper()
+	require.NoError(t, ex.Setup(t.Context()))
+}
+
+func makeTestExecutor(t *testing.T) *RunExecutor {
+	t.Helper()
+	baseDir, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+
+	repo := filepath.Join(baseDir, "repo")
+	body := schemas.SubmitBody{
+		Run: schemas.Run{
+			Id: "12346",
+			RunSpec: schemas.RunSpec{
+				RunName:  "red-turtle-1",
+				RepoId:   "test-000000",
+				RepoData: schemas.RepoData{RepoType: "local"},
+				Configuration: schemas.Configuration{
+					Type: "task",
+				},
+				ConfigurationPath: ".dstack.yml",
+			},
+		},
+		JobSpec: schemas.JobSpec{
+			Commands:    []string{"/bin/bash", "-c"},
+			Env:         make(map[string]string),
+			MaxDuration: 0, // no timeout
+			WorkingDir:  &repo,
+			RepoDir:     &repo,
+			RepoData:    &schemas.RepoData{RepoType: "local"},
+		},
+		Secrets: make(map[string]string),
+		RepoCredentials: &schemas.RepoCredentials{
+			CloneURL: "https://github.com/dstackai/dstack-examples.git",
+		},
+	}
+
+	tempDir := filepath.Join(baseDir, "temp")
+	require.NoError(t, os.Mkdir(tempDir, 0o700))
+
+	dstackDir := filepath.Join(baseDir, "dstack")
+	require.NoError(t, os.Mkdir(dstackDir, 0o755))
+
+	currentUser, err := linuxuser.FromCurrentProcess()
+	require.NoError(t, err)
+	homeDir := filepath.Join(baseDir, "home")
+	require.NoError(t, os.Mkdir(homeDir, 0o700))
+	currentUser.HomeDir = homeDir
+
+	ex, err := NewRunExecutor(tempDir, dstackDir, *currentUser, new(sshdMock))
+	require.NoError(t, err)
+
+	ex.SetJob(body)
+	require.NoError(t, ex.setJobUser(t.Context()))
+	require.NoError(t, ex.setJobWorkingDir(t.Context()))
+
+	return ex
+}
+
+func makeCodeTar(t *testing.T, ex *RunExecutor) {
+	t.Helper()
+	var b bytes.Buffer
+	tw := tar.NewWriter(&b)
+
+	files := []struct{ name, body string }{
+		{"foo", "bar\n"},
+	}
+
+	for _, f := range files {
+		hdr := &tar.Header{Name: f.name, Mode: 0o600, Size: int64(len(f.body))}
+		require.NoError(t, tw.WriteHeader(hdr))
+		_, err := tw.Write([]byte(f.body))
+		require.NoError(t, err)
+	}
+	require.NoError(t, tw.Close())
+
+	require.NoError(t, ex.WriteRepoBlob(&b))
+}
+
+func TestWriteDstackProfile(t *testing.T) {
+	testCases := []string{
+		"",
+		"string 'with 'single' quotes",
+		"multi\nline\tstring",
+	}
+	tmp := t.TempDir()
+	path := tmp + "/dstack_profile"
+	script := fmt.Sprintf(`. '%s'; printf '%%s' "$VAR"`, path)
+	for _, value := range testCases {
+		env := map[string]string{"VAR": value}
+		writeDstackProfile(t.Context(), env, path)
+		cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", script)
+		out, err := cmd.Output()
+		assert.NoError(t, err)
+		assert.Equal(t, value, string(out))
+	}
+}
+
+func TestWriteDstackProfile_NotShellIdentifiers(t *testing.T) {
+	tmp := t.TempDir()
+	path := tmp + "/dstack_profile"
+	script := fmt.Sprintf(`. '%s'; printf '%%s' "$VAR"`, path)
+	env := map[string]string{
+		"VAR":               "value",
+		"NOT-AN-IDENTIFIER": "value",
+		"0NOTANIDENTIFIER":  "value",
+		"NOT AN IDENTIFIER": "value",
+		"BASH_FUNC_foo%%":   "() {  echo hi\n}",
+	}
+
+	require.NoError(t, writeDstackProfile(t.Context(), env, path))
+
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", script)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	// Some shells only complain about a bad name, others abort the profile altogether,
+	// leaving VAR unset
+	assert.NoError(t, err)
+	assert.Empty(t, stderr.String())
+	assert.Equal(t, "value", string(out))
+}
+
+func TestWriteMpiHostfile(t *testing.T) {
+	tmp := t.TempDir()
+
+	t.Run("heterogeneous_slots", func(t *testing.T) {
+		path := filepath.Join(tmp, "hostfile_hetero")
+		err := writeMpiHostfile(
+			t.Context(),
+			[]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"},
+			[]int{8, 4, 0},
+			path,
+		)
+		require.NoError(t, err)
+		content, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, "10.0.0.1 slots=8\n10.0.0.2 slots=4\n10.0.0.3\n", string(content))
+	})
+
+	t.Run("homogeneous_slots", func(t *testing.T) {
+		path := filepath.Join(tmp, "hostfile_homo")
+		err := writeMpiHostfile(
+			t.Context(),
+			[]string{"10.0.0.1", "10.0.0.2"},
+			[]int{4, 4},
+			path,
+		)
+		require.NoError(t, err)
+		content, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, "10.0.0.1 slots=4\n10.0.0.2 slots=4\n", string(content))
+	})
+
+	t.Run("slots_length_mismatch", func(t *testing.T) {
+		path := filepath.Join(tmp, "hostfile_mismatch")
+		err := writeMpiHostfile(
+			t.Context(),
+			[]string{"10.0.0.1", "10.0.0.2"},
+			[]int{8},
+			path,
+		)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "gpus_per_node length 1 != job_ips length 2")
+	})
+
+	t.Run("empty_ip_writes_empty_hostfile", func(t *testing.T) {
+		path := filepath.Join(tmp, "hostfile_empty_ip")
+		err := writeMpiHostfile(
+			t.Context(),
+			[]string{"10.0.0.1", ""},
+			[]int{8, 4},
+			path,
+		)
+		require.NoError(t, err)
+		content, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, "", string(content))
+	})
+}
+
+func TestExecutor_Logs(t *testing.T) {
+	var b bytes.Buffer
+	ex := makeTestExecutor(t)
+	// Use printf to generate ANSI control codes.
+	// \033[31m = red text, \033[1;32m = bold green text, \033[0m = reset
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "printf '\\033[31mRed Hello World\\033[0m\\n' && printf '\\033[1;32mBold Green Line 2\\033[0m\\n' && printf 'Line 3\\n'")
+
+	err := ex.execJob(t.Context(), io.Writer(&b))
+	assert.NoError(t, err)
+
+	logHistory := ex.GetHistory(0).JobLogs
+	assert.NotEmpty(t, logHistory)
+
+	logString := combineLogMessages(logHistory)
+	normalizedLogString := strings.ReplaceAll(logString, "\r\n", "\n")
+
+	expectedOutput := "Red Hello World\nBold Green Line 2\nLine 3\n"
+	assert.Equal(t, expectedOutput, normalizedLogString, "Should strip ANSI codes from regular logs")
+
+	// Verify timestamps are in order
+	assert.Greater(t, len(logHistory), 0)
+	for i := 1; i < len(logHistory); i++ {
+		assert.GreaterOrEqual(t, logHistory[i].Timestamp, logHistory[i-1].Timestamp)
+	}
+}
+
+func TestExecutor_LogsWithErrors(t *testing.T) {
+	var b bytes.Buffer
+	ex := makeTestExecutor(t)
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, "echo 'Success message' && echo 'Error message' >&2 && exit 1")
+
+	err := ex.execJob(t.Context(), io.Writer(&b))
+	assert.Error(t, err)
+
+	logHistory := ex.GetHistory(0).JobLogs
+	assert.NotEmpty(t, logHistory)
+
+	logString := combineLogMessages(logHistory)
+	normalizedLogString := strings.ReplaceAll(logString, "\r\n", "\n")
+
+	expectedOutput := "Success message\nError message\n"
+	assert.Equal(t, expectedOutput, normalizedLogString)
+}
+
+func TestExecutor_LogsAnsiCodeHandling(t *testing.T) {
+	var b bytes.Buffer
+	ex := makeTestExecutor(t)
+
+	// Test a variety of ANSI escape sequences on stdout and stderr.
+	cmd := "printf '\\033[31mRed\\033[0m \\033[32mGreen\\033[0m\\n' && " +
+		"printf '\\033[1mBold\\033[0m \\033[4mUnderline\\033[0m\\n' && " +
+		"printf '\\033[s\\033[uPlain text\\n' >&2"
+
+	ex.jobSpec.Commands = append(ex.jobSpec.Commands, cmd)
+
+	err := ex.execJob(t.Context(), io.Writer(&b))
+	assert.NoError(t, err)
+
+	// 1. Check WebSocket logs, which should preserve ANSI codes.
+	wsLogHistory := ex.GetJobWsLogsHistory()
+	assert.NotEmpty(t, wsLogHistory)
+	wsLogString := combineLogMessages(wsLogHistory)
+	normalizedWsLogString := strings.ReplaceAll(wsLogString, "\r\n", "\n")
+
+	expectedWsOutput := "\033[31mRed\033[0m \033[32mGreen\033[0m\n" +
+		"\033[1mBold\033[0m \033[4mUnderline\033[0m\n" +
+		"\033[s\033[uPlain text\n"
+	assert.Equal(t, expectedWsOutput, normalizedWsLogString, "Websocket logs should preserve ANSI codes")
+
+	// 2. Check regular job logs, which should have ANSI codes stripped.
+	regularLogHistory := ex.GetHistory(0).JobLogs
+	assert.NotEmpty(t, regularLogHistory)
+	regularLogString := combineLogMessages(regularLogHistory)
+	normalizedRegularLogString := strings.ReplaceAll(regularLogString, "\r\n", "\n")
+
+	expectedRegularOutput := "Red Green\n" +
+		"Bold Underline\n" +
+		"Plain text\n"
+	assert.Equal(t, expectedRegularOutput, normalizedRegularLogString, "Regular logs should have ANSI codes stripped")
+
+	// Verify timestamps are ordered for both log types.
+	assert.Greater(t, len(wsLogHistory), 0)
+	for i := 1; i < len(wsLogHistory); i++ {
+		assert.GreaterOrEqual(t, wsLogHistory[i].Timestamp, wsLogHistory[i-1].Timestamp)
+	}
+}
+
+type sshdMock struct{}
+
+func (d *sshdMock) Port() int {
+	return 0
+}
+
+func (d *sshdMock) Start(context.Context) error {
+	return nil
+}
+
+func (d *sshdMock) Stop(context.Context) error {
+	return nil
+}
+
+func (d *sshdMock) AddAuthorizedKeys(context.Context, ...string) error {
+	return nil
+}
+
+func combineLogMessages(logHistory []schemas.LogEvent) string {
+	var logOutput bytes.Buffer
+	for _, logEvent := range logHistory {
+		logOutput.Write(logEvent.Message)
+	}
+	return logOutput.String()
+}
+
+func killRecordedPid(t *testing.T, pidPath string) {
+	t.Helper()
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+}

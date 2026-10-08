@@ -23,20 +23,27 @@ export const projectApi = createApi({
     tagTypes: ['Projects', 'NoFleetsProject', 'ProjectRepos', 'ProjectLogs', 'Backends'],
 
     endpoints: (builder) => ({
-        getProjects: builder.query<IProject[], void>({
-            query: () => {
+        getProjects: builder.query<TGetProjectListResponse, TGetProjectListParams>({
+            query: (body) => {
                 return {
                     url: API.PROJECTS.LIST(),
                     method: 'POST',
+                    body: {
+                        ...body,
+                        return_total_count: true,
+                    },
                 };
             },
 
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            transformResponse: (response: any[]): IProject[] => response.map(transformProjectResponse),
+            transformResponse: (response: any): TGetProjectListResponse => ({
+                ...response,
+                data: response.projects.map(transformProjectResponse),
+            }),
 
             providesTags: (result) =>
                 result
-                    ? [...result.map(({ project_name }) => ({ type: 'Projects' as const, id: project_name })), 'Projects']
+                    ? [...result.data.map(({ project_name }) => ({ type: 'Projects' as const, id: project_name })), 'Projects']
                     : ['Projects'],
         }),
 
@@ -74,7 +81,7 @@ export const projectApi = createApi({
             providesTags: (result) => (result ? [{ type: 'Projects' as const, id: result.project_name }] : []),
         }),
 
-        createProject: builder.mutation<IProject, IProject>({
+        createProject: builder.mutation<IProject, IProjectCreateRequestParams>({
             query: (project) => ({
                 url: API.PROJECTS.CREATE(),
                 method: 'POST',
@@ -187,11 +194,30 @@ export const projectApi = createApi({
             providesTags: () => ['ProjectRepos'],
         }),
 
-        updateProject: builder.mutation<IProject, { project_name: string; is_public: boolean }>({
-            query: ({ project_name, is_public }) => ({
+        updateProjectPublicPresets: builder.mutation<IProject, { project_name: string; public_presets: boolean }>({
+            query: ({ project_name, public_presets }) => ({
+                url: API.PROJECTS.UPDATE_PUBLIC_PRESETS(project_name),
+                method: 'POST',
+                body: { public_presets },
+            }),
+            transformResponse: transformProjectResponse,
+            invalidatesTags: (result, error, { project_name }) =>
+                error ? [] : [{ type: 'Projects' as const, id: project_name }],
+        }),
+
+        updateProject: builder.mutation<
+            IProject,
+            {
+                project_name: string;
+                is_public?: boolean;
+                templates_repo?: string | null;
+                reset_templates_repo?: boolean;
+            }
+        >({
+            query: ({ project_name, ...body }) => ({
                 url: API.PROJECTS.UPDATE(project_name),
                 method: 'POST',
-                body: { is_public },
+                body,
             }),
             transformResponse: transformProjectResponse,
             invalidatesTags: (result, error, params) => [{ type: 'Projects' as const, id: params?.project_name }],
@@ -201,8 +227,8 @@ export const projectApi = createApi({
 
 export const {
     useGetProjectsQuery,
-    useGetOnlyNoFleetsProjectsQuery,
     useLazyGetProjectsQuery,
+    useGetOnlyNoFleetsProjectsQuery,
     useGetProjectQuery,
     useCreateProjectMutation,
     useCreateWizardProjectMutation,
@@ -214,4 +240,5 @@ export const {
     useLazyGetProjectLogsQuery,
     useGetProjectReposQuery,
     useUpdateProjectMutation,
+    useUpdateProjectPublicPresetsMutation,
 } = projectApi;

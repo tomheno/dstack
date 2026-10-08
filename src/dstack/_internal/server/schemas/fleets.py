@@ -4,22 +4,37 @@ from uuid import UUID
 
 from pydantic import Field
 
+from dstack._internal.core.errors import ServerClientError
 from dstack._internal.core.models.common import CoreModel
 from dstack._internal.core.models.fleets import ApplyFleetPlanInput, FleetSpec
+from dstack._internal.utils.common import EntityID, EntityName, EntityNameOrID
 
 
 class ListFleetsRequest(CoreModel):
-    project_name: Optional[str]
+    project_name: Optional[str] = None
     only_active: bool = False
-    prev_created_at: Optional[datetime]
-    prev_id: Optional[UUID]
+    include_imported: bool = False
+    prev_created_at: Optional[datetime] = None
+    prev_id: Optional[UUID] = None
     limit: int = Field(100, ge=0, le=100)
     ascending: bool = False
 
 
+class ListProjectFleetsRequest(CoreModel):
+    include_imported: bool = False
+
+
 class GetFleetRequest(CoreModel):
-    name: Optional[str]
+    name: Optional[str] = None
     id: Optional[UUID] = None
+
+    def get_name_or_id(self) -> EntityNameOrID:
+        if self.id is not None:
+            return EntityID(id=self.id)
+        elif self.name is not None:
+            return EntityName(name=self.name)
+        else:
+            raise ServerClientError("name or id must be specified")
 
 
 class GetFleetPlanRequest(CoreModel):
@@ -34,10 +49,6 @@ class ApplyFleetPlanRequest(CoreModel):
             description="Use `force: true` to apply even if the expected resource does not match."
         ),
     ]
-
-
-class CreateFleetRequest(CoreModel):
-    spec: FleetSpec
 
 
 class DeleteFleetsRequest(CoreModel):

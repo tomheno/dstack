@@ -1,3 +1,7 @@
+//go:build linux
+
+// dstack-shim is supported only in Linux environments.
+
 package main
 
 import (
@@ -15,9 +19,9 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v3"
 
-	"github.com/dstackai/dstack/runner/consts"
-	"github.com/dstackai/dstack/runner/internal/common"
-	"github.com/dstackai/dstack/runner/internal/log"
+	"github.com/dstackai/dstack/runner/internal/common/consts"
+	"github.com/dstackai/dstack/runner/internal/common/gpu"
+	"github.com/dstackai/dstack/runner/internal/common/log"
 	"github.com/dstackai/dstack/runner/internal/shim"
 	"github.com/dstackai/dstack/runner/internal/shim/api"
 	"github.com/dstackai/dstack/runner/internal/shim/components"
@@ -25,7 +29,15 @@ import (
 )
 
 // Version is a build-time variable. The value is overridden by ldflags.
-var Version string
+// The "latest" default marks a dev build; the server treats it as the newest version.
+var Version = "latest"
+
+// https://everything.curl.dev/usingcurl/proxies/env.html
+// https://cs.opensource.google/go/x/net/+/657eb1317b5dd33038d683297c6be9cae05fa97d:http/httpproxy/proxy.go
+// We accept HTTP_PROXY in upper case without additional checks as it's unlikely that
+// the shim is running in the CGI context
+// The lower case form should be used as some applications ignore the upper case form, e.g., curl, apt
+const defaultPassEnv = "http_proxy,https_proxy,no_proxy,HTTP_PROXY,HTTPS_PROXY,NO_PROXY"
 
 func main() {
 	os.Exit(mainInner())
@@ -35,9 +47,9 @@ func mainInner() int {
 	var args shim.CLIArgs
 	var serviceMode bool
 
-	const defaultLogLevel = int(logrus.InfoLevel)
+	const defaultLogLevel = logrus.InfoLevel
 
-	log.DefaultEntry.Logger.SetLevel(logrus.Level(defaultLogLevel))
+	log.DefaultEntry.Logger.SetLevel(defaultLogLevel)
 	log.DefaultEntry.Logger.SetOutput(os.Stderr)
 
 	shimBinaryPath, err := os.Executable()
@@ -74,10 +86,10 @@ func mainInner() int {
 				Destination: &args.Shim.HTTPPort,
 				Sources:     cli.EnvVars("DSTACK_SHIM_HTTP_PORT"),
 			},
-			&cli.IntFlag{
+			&cli.StringFlag{
 				Name:        "shim-log-level",
 				Usage:       "Set shim's log level",
-				Value:       defaultLogLevel,
+				Value:       defaultLogLevel.String(),
 				Destination: &args.Shim.LogLevel,
 				Sources:     cli.EnvVars("DSTACK_SHIM_LOG_LEVEL"),
 			},
@@ -110,10 +122,16 @@ func mainInner() int {
 				Destination: &args.Runner.SSHPort,
 				Sources:     cli.EnvVars("DSTACK_RUNNER_SSH_PORT"),
 			},
-			&cli.IntFlag{
+			&cli.StringFlag{
+				Name:        "runner-ssh-log-level",
+				Usage:       "Set runner's ssh log level",
+				Destination: &args.Runner.SSHLogLevel,
+				Sources:     cli.EnvVars("DSTACK_RUNNER_SSH_LOG_LEVEL"),
+			},
+			&cli.StringFlag{
 				Name:        "runner-log-level",
 				Usage:       "Set runner's log level",
-				Value:       defaultLogLevel,
+				Value:       defaultLogLevel.String(),
 				Destination: &args.Runner.LogLevel,
 				Sources:     cli.EnvVars("DSTACK_RUNNER_LOG_LEVEL"),
 			},
@@ -141,6 +159,13 @@ func mainInner() int {
 				Sources:     cli.EnvVars("DSTACK_DCGM_ADDRESS"),
 			},
 			/* Docker Parameters */
+			&cli.StringFlag{
+				Name:        "pass-env",
+				Usage:       "Environment variables to pass on to the container, a comma-separated list of names",
+				Value:       defaultPassEnv,
+				Destination: &args.Docker.PassEnv,
+				Sources:     cli.EnvVars("DSTACK_DOCKER_PASS_ENV"),
+			},
 			&cli.BoolFlag{
 				Name:        "privileged",
 				Usage:       "Give extended privileges to the container",
@@ -178,7 +203,15 @@ func mainInner() int {
 }
 
 func start(ctx context.Context, args shim.CLIArgs, serviceMode bool) (err error) {
-	log.DefaultEntry.Logger.SetLevel(logrus.Level(args.Shim.LogLevel))
+	_, err = log.ParseLevel(args.Runner.LogLevel)
+	if err != nil {
+		return err
+	}
+	logLevel, err := log.ParseLevel(args.Shim.LogLevel)
+	if err != nil {
+		return err
+	}
+	log.DefaultEntry.Logger.SetLevel(logrus.Level(logLevel))
 	log.Info(ctx, "Starting dstack-shim", "version", Version)
 
 	shimHomeDir := args.Shim.HomeDir
@@ -236,7 +269,7 @@ func start(ctx context.Context, args shim.CLIArgs, serviceMode bool) (err error)
 	var dcgmExporter *dcgm.DCGMExporter
 	var dcgmWrapper dcgm.DCGMWrapperInterface
 
-	if common.GetGpuVendor() == common.GpuVendorNvidia {
+	if gpu.GetGpuVendor(ctx) == gpu.GpuVendorNvidia {
 		dcgmExporterPath, err := dcgm.GetDCGMExporterExecPath(ctx)
 		if err == nil {
 			interval := time.Duration(args.DCGMExporter.Interval * int(time.Millisecond))

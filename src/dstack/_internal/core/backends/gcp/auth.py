@@ -49,9 +49,9 @@ def get_credentials(creds: AnyGCPCreds) -> Tuple[Credentials, Optional[str]]:
 
 def validate_credentials(credentials: Credentials, project_id: str):
     try:
-        regions_client = compute_v1.RegionsClient(credentials=credentials)
-        regions_client.list(project=project_id)
+        client = compute_v1.ProjectsClient(credentials=credentials)
+        client.get(project=project_id)
     except google.api_core.exceptions.NotFound:
         raise BackendAuthError(f"project_id {project_id} not found")
-    except Exception:
-        raise BackendAuthError("Insufficient permissions")
+    except Exception as e:
+        raise BackendAuthError(f"Insufficient permissions: {e}")

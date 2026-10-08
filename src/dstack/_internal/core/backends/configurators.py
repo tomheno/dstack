@@ -36,11 +36,11 @@ except ImportError:
     pass
 
 try:
-    from dstack._internal.core.backends.cudo.configurator import (
-        CudoConfigurator,
+    from dstack._internal.core.backends.crusoe.configurator import (
+        CrusoeConfigurator,
     )
 
-    _CONFIGURATOR_CLASSES.append(CudoConfigurator)
+    _CONFIGURATOR_CLASSES.append(CrusoeConfigurator)
 except ImportError:
     pass
 
@@ -50,6 +50,13 @@ try:
     )
 
     _CONFIGURATOR_CLASSES.append(DataCrunchConfigurator)
+except ImportError:
+    pass
+
+try:
+    from dstack._internal.core.backends.daytona.configurator import DaytonaConfigurator
+
+    _CONFIGURATOR_CLASSES.append(DaytonaConfigurator)
 except ImportError:
     pass
 
@@ -75,6 +82,15 @@ try:
     )
 
     _CONFIGURATOR_CLASSES.append(HotAisleConfigurator)
+except ImportError:
+    pass
+
+try:
+    from dstack._internal.core.backends.jarvislabs.configurator import (
+        JarvisLabsConfigurator,
+    )
+
+    _CONFIGURATOR_CLASSES.append(JarvisLabsConfigurator)
 except ImportError:
     pass
 
@@ -119,6 +135,19 @@ try:
 except ImportError:
     pass
 
+try:
+    from dstack._internal.core.backends.slurm.configurator import SlurmConfigurator
+
+    _CONFIGURATOR_CLASSES.append(SlurmConfigurator)
+except ImportError:
+    pass
+
+try:
+    from dstack._internal.core.backends.seeweb.configurator import SeewebConfigurator
+
+    _CONFIGURATOR_CLASSES.append(SeewebConfigurator)
+except ImportError:
+    pass
 
 try:
     from dstack._internal.core.backends.vastai.configurator import VastAIConfigurator

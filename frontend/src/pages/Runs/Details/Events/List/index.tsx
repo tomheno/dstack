@@ -1,6 +1,8 @@
 import React from 'react';
+import { useListener } from 'react-bus';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useParams } from 'react-router-dom';
+import { product } from 'product';
 import Button from '@cloudscape-design/components/button';
 
 import { Header, Loader, Table } from 'components';
@@ -12,13 +14,15 @@ import { useLazyGetAllEventsQuery } from 'services/events';
 
 import { useColumnsDefinitions } from 'pages/Events/List/hooks/useColumnDefinitions';
 
+import { RUN_DETAILS_REFRESH_LIST_EVENT } from '../../constants';
+
 export const EventsList = () => {
     const { t } = useTranslation();
     const params = useParams();
     const paramRunId = params.runId ?? '';
     const navigate = useNavigate();
 
-    const { data, isLoading, isLoadingMore } = useInfiniteScroll<IEvent, TEventListRequestParams>({
+    const { data, isLoading, isLoadingMore, refreshList } = useInfiniteScroll<IEvent, TEventListRequestParams>({
         useLazyQuery: useLazyGetAllEventsQuery,
         args: { limit: DEFAULT_TABLE_PAGE_SIZE, within_runs: [paramRunId] },
 
@@ -27,6 +31,8 @@ export const EventsList = () => {
             prev_id: lastEvent.id,
         }),
     });
+
+    useListener(RUN_DETAILS_REFRESH_LIST_EVENT, refreshList);
 
     const { items, collectionProps } = useCollection<IEvent>(data, {
         selection: {},
@@ -46,7 +52,7 @@ export const EventsList = () => {
             loading={isLoading}
             loadingText={t('common.loading')}
             header={
-                <Header actions={<Button onClick={goToFullView}>{t('common.full_view')}</Button>}>
+                <Header actions={product.hasEvents && <Button onClick={goToFullView}>{t('common.full_view')}</Button>}>
                     {t('navigation.events')}
                 </Header>
             }

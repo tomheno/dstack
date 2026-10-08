@@ -1,50 +1,57 @@
 from typing import Dict, List, Optional
 
 from dstack._internal.core.errors import ServerClientError
-from dstack._internal.core.models.configurations import PortMapping, RunConfigurationType
+from dstack._internal.core.models.configurations import (
+    NodeGroup,
+    PortMapping,
+    RunConfigurationType,
+)
 from dstack._internal.core.models.profiles import SpotPolicy
 from dstack._internal.core.models.runs import RunSpec
+from dstack._internal.server.services.ides import get_ide
 from dstack._internal.server.services.jobs.configurators.base import JobConfigurator
-from dstack._internal.server.services.jobs.configurators.extensions.cursor import CursorDesktop
-from dstack._internal.server.services.jobs.configurators.extensions.vscode import VSCodeDesktop
-from dstack._internal.server.services.jobs.configurators.extensions.windsurf import WindsurfDesktop
 
 INSTALL_IPYKERNEL = (
+    "(echo 'uv pip install ipykernel...' && uv pip install -q --no-cache-dir ipykernel 2> /dev/null) || "
     "(echo 'pip install ipykernel...' && pip install -q --no-cache-dir ipykernel 2> /dev/null) || "
-    "echo 'no pip, ipykernel was not installed'"
+    "echo 'no uv or pip found, ipykernel was not installed'"
 )
 
 
 class DevEnvironmentJobConfigurator(JobConfigurator):
     TYPE: RunConfigurationType = RunConfigurationType.DEV_ENVIRONMENT
 
-    def __init__(self, run_spec: RunSpec, secrets: Dict[str, str]):
+    ide_extensions = ["ms-python.python", "ms-toolsai.jupyter"]
+
+    def __init__(
+        self, run_spec: RunSpec, secrets: Dict[str, str], replica_group_name: Optional[str] = None
+    ):
         assert run_spec.configuration.type == "dev-environment"
 
-        if run_spec.configuration.ide == "vscode":
-            __class = VSCodeDesktop
-        elif run_spec.configuration.ide == "cursor":
-            __class = CursorDesktop
-        elif run_spec.configuration.ide == "windsurf":
-            __class = WindsurfDesktop
+        if run_spec.configuration.ide is None:
+            self.ide = None
         else:
-            raise ServerClientError(f"Unsupported IDE: {run_spec.configuration.ide}")
-        self.ide = __class(
-            run_name=run_spec.run_name,
-            version=run_spec.configuration.version,
-            extensions=["ms-python.python", "ms-toolsai.jupyter"],
-        )
-        super().__init__(run_spec=run_spec, secrets=secrets)
+            ide = get_ide(run_spec.configuration.ide)
+            if ide is None:
+                raise ServerClientError(f"Unsupported IDE: {run_spec.configuration.ide}")
+            self.ide = ide
+        super().__init__(run_spec=run_spec, secrets=secrets, replica_group_name=replica_group_name)
 
-    def _shell_commands(self) -> List[str]:
+    def _shell_commands(self, node_group: Optional[NodeGroup] = None) -> List[str]:
         assert self.run_spec.configuration.type == "dev-environment"
 
-        commands = self.ide.get_install_commands()
+        commands = []
+        if self.ide is not None:
+            commands += self.ide.get_install_commands(
+                version=self.run_spec.configuration.version, extensions=self.ide_extensions
+            )
         commands.append(INSTALL_IPYKERNEL)
         commands += self.run_spec.configuration.setup
         commands.append("echo")
         commands += self.run_spec.configuration.init
-        commands += self.ide.get_print_readme_commands()
+        if self.ide is not None:
+            assert self.run_spec.run_name is not None
+            commands += self.ide.get_print_readme_commands(self.run_spec.run_name)
         commands += [
             f"echo 'To connect via SSH, use: `ssh {self.run_spec.run_name}`'",
             "echo",
@@ -62,6 +69,6 @@ class DevEnvironmentJobConfigurator(JobConfigurator):
     def _spot_policy(self) -> SpotPolicy:
         return self.run_spec.merged_profile.spot_policy or SpotPolicy.ONDEMAND
 
-    def _ports(self) -> List[PortMapping]:
+    def _ports(self, node_group: Optional[NodeGroup] = None) -> List[PortMapping]:
         assert self.run_spec.configuration.type == "dev-environment"
         return self.run_spec.configuration.ports

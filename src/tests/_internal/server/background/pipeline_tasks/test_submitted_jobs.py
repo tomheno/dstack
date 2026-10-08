@@ -1,0 +1,3411 @@
+import asyncio
+import uuid
+from datetime import timedelta
+from typing import cast
+from unittest.mock import AsyncMock, Mock, call, patch
+
+import gpuhunt
+import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
+
+from dstack._internal.core.errors import BackendError
+from dstack._internal.core.models.backends.base import BackendType
+from dstack._internal.core.models.common import (
+    EntityReference,
+    NetworkMode,
+    RegistryAuth,
+    validate_json_extra_ignore,
+)
+from dstack._internal.core.models.configurations import (
+    NodeGroup,
+    ServiceConfiguration,
+    TaskConfiguration,
+)
+from dstack._internal.core.models.envs import Env
+from dstack._internal.core.models.fleets import FleetNodesSpec, InstanceGroupPlacement
+from dstack._internal.core.models.instances import InstanceStatus
+from dstack._internal.core.models.placement import PlacementGroup
+from dstack._internal.core.models.profiles import (
+    CreationPolicy,
+    FleetInstanceSelector,
+    InstanceHostnameSelector,
+    InstanceNameSelector,
+    InstanceSelector,
+    Profile,
+)
+from dstack._internal.core.models.resources import CPUSpec, Memory, Range, ResourcesSpec
+from dstack._internal.core.models.runs import JobRuntimeData, JobStatus, JobTerminationReason
+from dstack._internal.core.models.users import GlobalRole
+from dstack._internal.core.models.volumes import (
+    VolumeAttachmentData,
+    VolumeMountPoint,
+    VolumeStatus,
+)
+from dstack._internal.server import settings as server_settings
+from dstack._internal.server.background.pipeline_tasks.jobs_submitted import (
+    JobSubmittedFetcher,
+    JobSubmittedPipeline,
+    JobSubmittedPipelineItem,
+    JobSubmittedWorker,
+    _get_new_capacity_failure_message,
+    _load_submitted_job_context,
+    _NewCapacityAttempts,
+    _OfferAttemptError,
+    _release_replica_jobs_from_master_wait,
+)
+from dstack._internal.server.models import (
+    ComputeGroupModel,
+    FleetModel,
+    InstanceModel,
+    JobModel,
+    PlacementGroupModel,
+    VolumeAttachmentModel,
+)
+from dstack._internal.server.services.docker import ImageConfig
+from dstack._internal.server.services.jobs import get_job_runtime_data
+from dstack._internal.server.services.jobs.configurators.base import JobConfigurator
+from dstack._internal.server.testing.common import (
+    ComputeMockSpec,
+    create_export,
+    create_fleet,
+    create_instance,
+    create_job,
+    create_placement_group,
+    create_project,
+    create_repo,
+    create_run,
+    create_secret,
+    create_user,
+    create_volume,
+    get_compute_group_provisioning_data,
+    get_fleet_spec,
+    get_instance_offer_with_availability,
+    get_job_provisioning_data,
+    get_placement_group_provisioning_data,
+    get_remote_connection_info,
+    get_run_spec,
+    get_ssh_fleet_configuration,
+    get_volume_provisioning_data,
+)
+from dstack._internal.utils.common import get_current_datetime, get_or_error
+
+pytestmark = pytest.mark.usefixtures("image_config_mock")
+
+
+@pytest.fixture
+def fetcher() -> JobSubmittedFetcher:
+    return JobSubmittedFetcher(
+        queue=asyncio.Queue(),
+        queue_desired_minsize=1,
+        min_processing_interval=timedelta(seconds=4),
+        lock_timeout=timedelta(seconds=30),
+        heartbeater=Mock(),
+    )
+
+
+@pytest.fixture
+def worker() -> JobSubmittedWorker:
+    return JobSubmittedWorker(queue=Mock(), heartbeater=Mock(), pipeline_hinter=Mock())
+
+
+def _lock_job_foreign(job_model: JobModel) -> None:
+    job_model.lock_expires_at = get_current_datetime() + timedelta(minutes=1)
+    job_model.lock_token = uuid.uuid4()
+    job_model.lock_owner = "OtherPipeline"
+
+
+def _lock_job_expired_same_owner(job_model: JobModel) -> None:
+    job_model.lock_expires_at = get_current_datetime() - timedelta(minutes=1)
+    job_model.lock_token = uuid.uuid4()
+    job_model.lock_owner = JobSubmittedPipeline.__name__
+
+
+def _lock_job(job_model: JobModel) -> None:
+    job_model.lock_expires_at = get_current_datetime() + timedelta(seconds=30)
+    job_model.lock_token = uuid.uuid4()
+    job_model.lock_owner = JobSubmittedPipeline.__name__
+
+
+def _job_to_pipeline_item(job_model: JobModel) -> JobSubmittedPipelineItem:
+    assert job_model.lock_token is not None
+    assert job_model.lock_expires_at is not None
+    return JobSubmittedPipelineItem(
+        __tablename__=job_model.__tablename__,
+        id=job_model.id,
+        lock_expires_at=job_model.lock_expires_at,
+        lock_token=job_model.lock_token,
+        prev_lock_expired=False,
+    )
+
+
+async def _process_job(
+    session: AsyncSession,
+    worker: JobSubmittedWorker,
+    job_model: JobModel,
+) -> None:
+    _lock_job(job_model)
+    await session.commit()
+    await worker.process(_job_to_pipeline_item(job_model))
+
+
+async def _get_job(session: AsyncSession, job_id) -> JobModel:
+    res = await session.execute(
+        select(JobModel)
+        .where(JobModel.id == job_id)
+        .options(joinedload(JobModel.instance))
+        .options(joinedload(JobModel.fleet))
+        .execution_options(populate_existing=True)
+    )
+    return res.unique().scalar_one()
+
+
+async def _get_placement_groups(
+    session: AsyncSession,
+    fleet_id: uuid.UUID,
+) -> list[PlacementGroupModel]:
+    res = await session.execute(
+        select(PlacementGroupModel)
+        .where(PlacementGroupModel.fleet_id == fleet_id)
+        .execution_options(populate_existing=True)
+    )
+    return list(res.scalars().all())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+class TestJobSubmittedFetcher:
+    async def test_fetch_selects_eligible_jobs_and_sets_lock_fields(
+        self, test_db, session: AsyncSession, fetcher: JobSubmittedFetcher
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        run = await create_run(session=session, project=project, repo=repo, user=user, fleet=fleet)
+        run_without_fleet = await create_run(
+            session=session, project=project, repo=repo, user=user
+        )
+        now = get_current_datetime()
+        stale = now - timedelta(minutes=1)
+
+        assignment_job = await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.SUBMITTED,
+            submitted_at=stale - timedelta(minutes=1),
+            last_processed_at=stale - timedelta(seconds=2),
+            instance_assigned=False,
+        )
+        provisioning_job = await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.SUBMITTED,
+            submitted_at=stale - timedelta(minutes=2),
+            last_processed_at=stale - timedelta(seconds=1),
+            instance_assigned=True,
+            job_num=1,
+        )
+        # submitted_at == last_processed_at bypasses the min_processing_interval filter
+        # so freshly submitted jobs are picked up immediately
+        fresh_job = await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.SUBMITTED,
+            submitted_at=now,
+            last_processed_at=now,
+            job_num=2,
+        )
+        waiting_master = await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.SUBMITTED,
+            submitted_at=stale - timedelta(minutes=3),
+            last_processed_at=stale - timedelta(seconds=3),
+            waiting_master_job=True,
+            job_num=3,
+        )
+        waiting_run_fleet = await create_job(
+            session=session,
+            run=run_without_fleet,
+            status=JobStatus.SUBMITTED,
+            submitted_at=stale - timedelta(minutes=3),
+            last_processed_at=stale - timedelta(seconds=3),
+            waiting_master_job=True,
+            job_num=3,
+        )
+        recent_retry = await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.SUBMITTED,
+            submitted_at=stale - timedelta(minutes=4),
+            last_processed_at=now - timedelta(seconds=1),
+            job_num=4,
+        )
+        foreign_locked = await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.SUBMITTED,
+            submitted_at=stale - timedelta(minutes=5),
+            last_processed_at=stale - timedelta(seconds=4),
+            job_num=5,
+        )
+        _lock_job_foreign(foreign_locked)
+        await session.commit()
+
+        items = await fetcher.fetch(limit=10)
+
+        assert [item.id for item in items] == [
+            assignment_job.id,
+            provisioning_job.id,
+            fresh_job.id,
+        ]
+        for job in [
+            assignment_job,
+            provisioning_job,
+            fresh_job,
+            waiting_master,
+            waiting_run_fleet,
+            recent_retry,
+            foreign_locked,
+        ]:
+            await session.refresh(job)
+
+        fetched_jobs = [assignment_job, provisioning_job, fresh_job]
+        assert all(job.lock_owner == JobSubmittedPipeline.__name__ for job in fetched_jobs)
+        assert all(job.lock_expires_at is not None for job in fetched_jobs)
+        assert all(job.lock_token is not None for job in fetched_jobs)
+        assert len({job.lock_token for job in fetched_jobs}) == 1
+
+        assert waiting_master.lock_owner is None
+        assert waiting_run_fleet.lock_owner is None
+        assert recent_retry.lock_owner is None
+        assert foreign_locked.lock_owner == "OtherPipeline"
+
+    async def test_fetch_orders_by_priority_then_last_processed_at(
+        self, test_db, session: AsyncSession, fetcher: JobSubmittedFetcher
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        now = get_current_datetime()
+
+        low_priority_run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_name="low-priority-run",
+            priority=1,
+        )
+        high_priority_run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_name="high-priority-run",
+            priority=10,
+        )
+
+        low_priority_job = await create_job(
+            session=session,
+            run=low_priority_run,
+            submitted_at=now - timedelta(minutes=3),
+            last_processed_at=now - timedelta(minutes=2),
+        )
+        newer_high_priority_job = await create_job(
+            session=session,
+            run=high_priority_run,
+            submitted_at=now - timedelta(minutes=4),
+            last_processed_at=now - timedelta(minutes=1),
+        )
+        older_high_priority_job = await create_job(
+            session=session,
+            run=high_priority_run,
+            submitted_at=now - timedelta(minutes=5),
+            last_processed_at=now - timedelta(minutes=2, seconds=30),
+        )
+
+        items = await fetcher.fetch(limit=3)
+
+        assert [item.id for item in items] == [
+            older_high_priority_job.id,
+            newer_high_priority_job.id,
+            low_priority_job.id,
+        ]
+
+    async def test_fetch_retries_expired_same_owner_lock_and_respects_limit(
+        self, test_db, session: AsyncSession, fetcher: JobSubmittedFetcher
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        now = get_current_datetime()
+        stale = now - timedelta(minutes=1)
+
+        oldest = await create_job(
+            session=session,
+            run=run,
+            submitted_at=stale - timedelta(minutes=2),
+            last_processed_at=stale - timedelta(seconds=2),
+        )
+        expired_same_owner = await create_job(
+            session=session,
+            run=run,
+            submitted_at=stale - timedelta(minutes=1),
+            last_processed_at=stale - timedelta(seconds=1),
+        )
+        newest = await create_job(
+            session=session,
+            run=run,
+            submitted_at=stale,
+            last_processed_at=stale,
+        )
+        _lock_job_expired_same_owner(expired_same_owner)
+        await session.commit()
+
+        items = await fetcher.fetch(limit=2)
+
+        assert [item.id for item in items] == [oldest.id, expired_same_owner.id]
+
+        await session.refresh(expired_same_owner)
+        assert expired_same_owner.lock_owner == JobSubmittedPipeline.__name__
+        assert expired_same_owner.lock_token is not None
+        assert expired_same_owner.lock_expires_at is not None
+
+        await session.refresh(newest)
+        assert newest.lock_owner is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+class TestJobSubmittedWorker:
+    async def test_provisions_assigned_job_on_existing_instance(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            status=InstanceStatus.BUSY,
+            busy_blocks=1,
+        )
+        job = await create_job(
+            session=session,
+            run=run,
+            instance=instance,
+            instance_assigned=True,
+            job_provisioning_data=get_job_provisioning_data(dockerized=True),
+        )
+        previous_last_processed_at = job.last_processed_at
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.PROVISIONING
+        assert job.instance_assigned
+        assert job.instance is not None and job.instance.id == instance.id
+        assert job.last_processed_at > previous_last_processed_at
+        assert job.lock_owner is None
+        assert job.lock_token is None
+        assert job.lock_expires_at is None
+
+    async def test_provisions_new_capacity_for_assigned_job_with_placeholder(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=1)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        job = await create_job(session=session, run=run)
+
+        offer = get_instance_offer_with_availability(backend=BackendType.AWS)
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value.get_offers.return_value = [offer]
+            backend_mock.compute.return_value.run_job.return_value = get_job_provisioning_data(
+                dockerized=True,
+                backend=BackendType.AWS,
+            )
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+            job = await _get_job(session, job.id)
+            assert job.status == JobStatus.SUBMITTED
+            assert job.instance_assigned
+            assert job.instance is not None
+            placeholder_id = job.instance.id
+            assert job.used_instance_id == placeholder_id
+            assert job.instance.status == InstanceStatus.PENDING
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.PROVISIONING
+        assert job.instance is not None
+        assert job.instance.id == placeholder_id
+        assert job.used_instance_id == placeholder_id
+        assert job.instance.status == InstanceStatus.PROVISIONING
+        assert job.instance.fleet_id == fleet.id
+        assert job.instance.offer is not None
+        assert job.instance.provisioning_job_id == job.id  # never cleared
+        res = await session.execute(
+            select(InstanceModel).where(
+                InstanceModel.fleet_id == fleet.id,
+                InstanceModel.deleted == False,
+            )
+        )
+        assert len(res.scalars().all()) == 1
+
+    async def test_multinode_master_reuses_placeholder_when_provisioning_falls_back_to_run_job(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=1)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        run_spec = get_run_spec(
+            run_name="run",
+            repo_id=repo.name,
+            configuration=TaskConfiguration(image="debian", nodes=2),
+        )
+        run = await create_run(
+            session=session,
+            run_name="run",
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            fleet=fleet,
+        )
+        master_job = await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            waiting_master_job=False,
+        )
+        worker_job = await create_job(
+            session=session,
+            run=run,
+            job_num=1,
+            waiting_master_job=True,
+        )
+
+        offer = get_instance_offer_with_availability(backend=BackendType.AWS)
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            compute_mock = Mock(spec=ComputeMockSpec)
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value = compute_mock
+            m.return_value = [backend_mock]
+            compute_mock.get_offers.return_value = [offer]
+            compute_mock.run_job.return_value = get_job_provisioning_data(
+                dockerized=True,
+                backend=BackendType.AWS,
+            )
+
+            await _process_job(session=session, worker=worker, job_model=master_job)
+
+            master_job = await _get_job(session, master_job.id)
+            worker_job = await _get_job(session, worker_job.id)
+            assert master_job.status == JobStatus.SUBMITTED
+            assert master_job.instance_assigned
+            assert master_job.instance is not None
+            placeholder_id = master_job.instance.id
+            assert master_job.instance.status == InstanceStatus.PENDING
+            assert master_job.used_instance_id == placeholder_id
+            assert master_job.fleet_id == fleet.id
+            assert worker_job.waiting_master_job
+            compute_mock.run_job.assert_not_called()
+            compute_mock.run_jobs.assert_not_called()
+
+            competing_instance = await create_instance(
+                session=session,
+                project=project,
+                fleet=fleet,
+                status=InstanceStatus.BUSY,
+                backend=BackendType.AWS,
+                job_provisioning_data=get_job_provisioning_data(backend=BackendType.AWS),
+            )
+
+            await _process_job(session=session, worker=worker, job_model=master_job)
+
+        master_job = await _get_job(session, master_job.id)
+        worker_job = await _get_job(session, worker_job.id)
+        assert master_job.status == JobStatus.PROVISIONING
+        assert master_job.instance is not None
+        assert master_job.instance.id == placeholder_id
+        assert master_job.instance.status == InstanceStatus.PROVISIONING
+        assert master_job.used_instance_id == placeholder_id
+        assert worker_job.waiting_master_job is False
+        compute_mock.run_job.assert_called_once()
+        compute_mock.run_jobs.assert_not_called()
+        res = await session.execute(
+            select(InstanceModel).where(
+                InstanceModel.fleet_id == fleet.id,
+                InstanceModel.deleted == False,
+            )
+        )
+        assert {instance.id for instance in res.scalars().all()} == {
+            placeholder_id,
+            competing_instance.id,
+        }
+
+    async def test_provisioning_master_job_respects_cluster_placement_in_non_empty_fleet(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.placement = InstanceGroupPlacement.CLUSTER
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.BUSY,
+            backend=BackendType.AWS,
+            job_provisioning_data=get_job_provisioning_data(region="eu-west-1"),
+        )
+        fleet.current_master_instance_id = instance.id
+        configuration = TaskConfiguration(image="debian", nodes=2)
+        run_spec = get_run_spec(run_name="run", repo_id=repo.name, configuration=configuration)
+        run = await create_run(
+            session=session,
+            run_name="run",
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            fleet=fleet,
+        )
+        job = await create_job(session=session, run=run, instance_assigned=True)
+        fleet_lock_expires_at = get_current_datetime() + timedelta(minutes=1)
+        fleet_lock_token = uuid.uuid4()
+        fleet.lock_expires_at = fleet_lock_expires_at
+        fleet.lock_token = fleet_lock_token
+        fleet.lock_owner = "OtherPipeline:cluster-master"
+        await session.commit()
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.AWS
+            offer_1 = get_instance_offer_with_availability(
+                backend=BackendType.AWS,
+                region="eu-west-2",
+            )
+            offer_2 = get_instance_offer_with_availability(
+                backend=BackendType.AWS,
+                region="eu-west-1",
+            )
+            backend_mock.compute.return_value.get_offers.return_value = [offer_1, offer_2]
+            backend_mock.compute.return_value.run_job.return_value = get_job_provisioning_data(
+                backend=BackendType.AWS,
+            )
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        await session.refresh(fleet)
+        assert job.status == JobStatus.PROVISIONING
+        assert fleet.lock_owner == "OtherPipeline:cluster-master"
+        assert fleet.lock_token == fleet_lock_token
+        assert fleet.lock_expires_at == fleet_lock_expires_at
+        backend_mock.compute.return_value.run_job.assert_called_once()
+        selected_offer = backend_mock.compute.return_value.run_job.call_args[0][2]
+        assert selected_offer.region == "eu-west-1"
+
+    async def test_defers_new_capacity_provisioning_until_fleet_master_is_elected(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.placement = InstanceGroupPlacement.CLUSTER
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.BUSY,
+            backend=BackendType.AWS,
+            job_provisioning_data=get_job_provisioning_data(region="eu-west-1"),
+        )
+        configuration = TaskConfiguration(image="debian", nodes=2)
+        run_spec = get_run_spec(run_name="run", repo_id=repo.name, configuration=configuration)
+        run = await create_run(
+            session=session,
+            run_name="run",
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            fleet=fleet,
+        )
+        job = await create_job(
+            session=session,
+            run=run,
+            instance_assigned=True,
+            waiting_master_job=False,
+        )
+        previous_last_processed_at = job.last_processed_at
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            await _process_job(session=session, worker=worker, job_model=job)
+            m.assert_not_called()
+
+        await session.refresh(job)
+        assert job.status == JobStatus.SUBMITTED
+        assert job.instance_assigned
+        assert job.instance is None
+        assert job.last_processed_at > previous_last_processed_at
+        assert job.lock_owner is None
+        assert job.lock_token is None
+        assert job.lock_expires_at is None
+        hint_fetch = cast(Mock, worker._pipeline_hinter.hint_fetch)
+        hint_fetch.assert_has_calls([call(FleetModel.__name__), call(JobModel.__name__)])
+
+    async def test_provisioning_non_master_job_ignores_cluster_master_fleet_lock(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.placement = InstanceGroupPlacement.CLUSTER
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        configuration = TaskConfiguration(image="debian", nodes=2)
+        run_spec = get_run_spec(run_name="run", repo_id=repo.name, configuration=configuration)
+        run = await create_run(
+            session=session,
+            run_name="run",
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            fleet=fleet,
+        )
+        await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            instance_assigned=True,
+            job_provisioning_data=get_job_provisioning_data(region="eu-west-1"),
+            waiting_master_job=False,
+        )
+        job = await create_job(
+            session=session,
+            run=run,
+            job_num=1,
+            instance_assigned=True,
+            waiting_master_job=False,
+        )
+        fleet_lock_expires_at = get_current_datetime() + timedelta(minutes=1)
+        fleet_lock_token = uuid.uuid4()
+        fleet.lock_expires_at = fleet_lock_expires_at
+        fleet.lock_token = fleet_lock_token
+        fleet.lock_owner = "OtherPipeline:cluster-master"
+        await session.commit()
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.AWS
+            offer_1 = get_instance_offer_with_availability(
+                backend=BackendType.AWS,
+                region="eu-west-2",
+            )
+            offer_2 = get_instance_offer_with_availability(
+                backend=BackendType.AWS,
+                region="eu-west-1",
+            )
+            backend_mock.compute.return_value.get_offers.return_value = [offer_1, offer_2]
+            backend_mock.compute.return_value.run_job.return_value = get_job_provisioning_data(
+                backend=BackendType.AWS,
+            )
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        await session.refresh(fleet)
+        assert job.status == JobStatus.PROVISIONING
+        assert fleet.lock_owner == "OtherPipeline:cluster-master"
+        assert fleet.lock_token == fleet_lock_token
+        assert fleet.lock_expires_at == fleet_lock_expires_at
+        backend_mock.compute.return_value.run_job.assert_called_once()
+        selected_offer = backend_mock.compute.return_value.run_job.call_args[0][2]
+        assert selected_offer.region == "eu-west-1"
+
+    async def test_creates_placement_group_for_cluster_fleet(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.placement = InstanceGroupPlacement.CLUSTER
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_name="test-run",
+            run_spec=get_run_spec(run_name="test-run", repo_id=repo.name),
+        )
+        job = await create_job(session=session, run=run, instance_assigned=True)
+        offer = get_instance_offer_with_availability(backend=BackendType.AWS)
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            compute_mock = Mock(spec=ComputeMockSpec)
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value = compute_mock
+            m.return_value = [backend_mock]
+            compute_mock.get_offers.return_value = [offer]
+            compute_mock.run_job.return_value = get_job_provisioning_data(
+                backend=BackendType.AWS,
+            )
+            compute_mock.create_placement_group.return_value = (
+                get_placement_group_provisioning_data()
+            )
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        await session.refresh(fleet)
+        assert job.status == JobStatus.PROVISIONING
+        assert fleet.lock_owner is None
+        assert fleet.lock_token is None
+        assert fleet.lock_expires_at is None
+        compute_mock.create_placement_group.assert_called_once()
+        compute_mock.run_job.assert_called_once()
+        assert isinstance(compute_mock.run_job.call_args[0][6], PlacementGroup)
+        placement_group = (await session.execute(select(PlacementGroupModel))).scalar()
+        assert placement_group is not None
+
+    @pytest.mark.parametrize("compatible", [True, False])
+    async def test_creates_placement_group_in_reservation_only_if_compatible(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker, compatible: bool
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.placement = InstanceGroupPlacement.CLUSTER
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        run_spec = get_run_spec(run_name="test-run", repo_id=repo.name)
+        run_spec.configuration.reservation = "test-reservation"
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_name="test-run",
+            run_spec=run_spec,
+        )
+        job = await create_job(session=session, run=run, instance_assigned=True)
+        offer = get_instance_offer_with_availability(backend=BackendType.AWS)
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            compute_mock = Mock(spec=ComputeMockSpec)
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value = compute_mock
+            m.return_value = [backend_mock]
+            compute_mock.get_offers.return_value = [offer]
+            compute_mock.are_placement_groups_compatible_with_reservation.return_value = compatible
+            compute_mock.run_job.return_value = get_job_provisioning_data(
+                backend=BackendType.AWS,
+            )
+            compute_mock.create_placement_group.return_value = (
+                get_placement_group_provisioning_data()
+            )
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        assert job.status == JobStatus.PROVISIONING
+        compute_mock.are_placement_groups_compatible_with_reservation.assert_called_once()
+        assert (
+            compute_mock.are_placement_groups_compatible_with_reservation.call_args[0][1]
+            == "test-reservation"
+        )
+        compute_mock.run_job.assert_called_once()
+        placement_group = (await session.execute(select(PlacementGroupModel))).scalar()
+        if compatible:
+            compute_mock.create_placement_group.assert_called_once()
+            assert isinstance(compute_mock.run_job.call_args[0][6], PlacementGroup)
+            assert placement_group is not None
+        else:
+            compute_mock.create_placement_group.assert_not_called()
+            assert compute_mock.run_job.call_args[0][6] is None
+            assert placement_group is None
+
+    async def test_marks_unused_existing_placement_groups_for_cleanup(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.placement = InstanceGroupPlacement.CLUSTER
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        selected_pg = await create_placement_group(
+            session=session,
+            project=project,
+            fleet=fleet,
+            name="selected-pg",
+        )
+        await create_placement_group(
+            session=session,
+            project=project,
+            fleet=fleet,
+            name="stale-pg",
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_name="test-run",
+            run_spec=get_run_spec(run_name="test-run", repo_id=repo.name),
+        )
+        job = await create_job(session=session, run=run, instance_assigned=True)
+        offer = get_instance_offer_with_availability(backend=BackendType.AWS)
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            compute_mock = Mock(spec=ComputeMockSpec)
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value = compute_mock
+            m.return_value = [backend_mock]
+            compute_mock.get_offers.return_value = [offer]
+            compute_mock.is_suitable_placement_group.side_effect = (
+                lambda placement_group, _: placement_group.name == selected_pg.name
+            )
+            compute_mock.run_job.return_value = get_job_provisioning_data(
+                backend=BackendType.AWS,
+            )
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        assert job.status == JobStatus.PROVISIONING
+        placement_groups = await _get_placement_groups(session=session, fleet_id=fleet.id)
+        assert {placement_group.name for placement_group in placement_groups} == {
+            "selected-pg",
+            "stale-pg",
+        }
+        placement_groups_by_name = {
+            placement_group.name: placement_group for placement_group in placement_groups
+        }
+        assert not placement_groups_by_name["selected-pg"].fleet_deleted
+        assert placement_groups_by_name["stale-pg"].fleet_deleted
+        compute_mock.create_placement_group.assert_not_called()
+
+    async def test_marks_new_and_existing_placement_groups_for_cleanup_on_failed_provisioning(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.placement = InstanceGroupPlacement.CLUSTER
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        await create_placement_group(
+            session=session,
+            project=project,
+            fleet=fleet,
+            name="existing-pg",
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_name="test-run",
+            run_spec=get_run_spec(run_name="test-run", repo_id=repo.name),
+        )
+        job = await create_job(session=session, run=run, instance_assigned=True)
+        offer = get_instance_offer_with_availability(backend=BackendType.AWS)
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            compute_mock = Mock(spec=ComputeMockSpec)
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value = compute_mock
+            m.return_value = [backend_mock]
+            compute_mock.get_offers.return_value = [offer]
+            compute_mock.is_suitable_placement_group.return_value = False
+            compute_mock.create_placement_group.return_value = (
+                get_placement_group_provisioning_data()
+            )
+            compute_mock.run_job.side_effect = BackendError("boom")
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        assert job.status == JobStatus.TERMINATING
+        placement_groups = await _get_placement_groups(session=session, fleet_id=fleet.id)
+        assert len(placement_groups) == 2
+        placement_groups_by_name = {
+            placement_group.name: placement_group for placement_group in placement_groups
+        }
+        assert placement_groups_by_name["existing-pg"].fleet_deleted
+        new_placement_groups = [
+            placement_group
+            for placement_group in placement_groups
+            if placement_group.name != "existing-pg"
+        ]
+        assert len(new_placement_groups) == 1
+        assert new_placement_groups[0].fleet_deleted
+        compute_mock.create_placement_group.assert_called_once()
+
+    async def test_resets_lock_for_retry_when_cluster_master_fleet_lock_is_unavailable(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.placement = InstanceGroupPlacement.CLUSTER
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        fleet.lock_expires_at = get_current_datetime() + timedelta(minutes=1)
+        fleet.lock_token = uuid.uuid4()
+        fleet.lock_owner = "OtherPipeline:cluster-master"
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+        )
+        job = await create_job(session=session, run=run, instance_assigned=True)
+        previous_last_processed_at = job.last_processed_at
+        await session.commit()
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            await _process_job(session=session, worker=worker, job_model=job)
+            m.assert_not_called()
+
+        await session.refresh(job)
+        await session.refresh(fleet)
+        assert job.status == JobStatus.SUBMITTED
+        assert job.instance_assigned
+        assert job.last_processed_at > previous_last_processed_at
+        assert job.lock_owner == JobSubmittedPipeline.__name__
+        assert job.lock_token is None
+        assert job.lock_expires_at is None
+        assert fleet.lock_owner == "OtherPipeline:cluster-master"
+        assert fleet.lock_token is not None
+        assert fleet.lock_expires_at is not None
+
+    async def test_reclaims_stale_related_cluster_master_fleet_lock(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.placement = InstanceGroupPlacement.CLUSTER
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+        )
+        job = await create_job(session=session, run=run, instance_assigned=True)
+        fleet.lock_expires_at = get_current_datetime() - timedelta(minutes=1)
+        fleet.lock_token = uuid.uuid4()
+        fleet.lock_owner = f"{JobSubmittedPipeline.__name__}:{job.id}"
+        await session.commit()
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value.get_offers.return_value = [
+                get_instance_offer_with_availability(backend=BackendType.AWS)
+            ]
+            backend_mock.compute.return_value.run_job.return_value = get_job_provisioning_data(
+                backend=BackendType.AWS,
+            )
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        await session.refresh(fleet)
+        assert job.status == JobStatus.PROVISIONING
+        assert fleet.lock_owner is None
+        assert fleet.lock_token is None
+        assert fleet.lock_expires_at is None
+        backend_mock.compute.return_value.run_job.assert_called_once()
+
+    async def test_processes_assignment_and_provisioning_in_separate_passes(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+        )
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.SUBMITTED
+        assert job.instance_assigned
+        assert job.instance is not None and job.instance.id == instance.id
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.PROVISIONING
+        assert job.instance_assigned
+        assert job.instance is not None and job.instance.id == instance.id
+
+    async def test_ignores_lock_token_mismatch(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        job = await create_job(session=session, run=run)
+        _lock_job(job)
+        await session.commit()
+        item = _job_to_pipeline_item(job)
+
+        job.lock_token = uuid.uuid4()
+        await session.commit()
+
+        await worker.process(item)
+
+        await session.refresh(job)
+        assert job.status == JobStatus.SUBMITTED
+        assert job.lock_token is not None
+
+    async def test_assigns_job_to_instance(
+        self,
+        test_db,
+        session: AsyncSession,
+        worker: JobSubmittedWorker,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        get_targeted_instance_offers_mock = AsyncMock()
+        monkeypatch.setattr(
+            "dstack._internal.server.background.pipeline_tasks.jobs_submitted.get_targeted_instance_offers",
+            get_targeted_instance_offers_mock,
+        )
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+        )
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        job = await create_job(session=session, run=run)
+        previous_last_processed_at = job.last_processed_at
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        await session.refresh(instance)
+        assert job.status == JobStatus.SUBMITTED
+        assert job.instance_assigned
+        assert job.instance is not None and job.instance.id == instance.id
+        assert job.used_instance_id == instance.id
+        assert job.fleet_id == fleet.id
+        assert job.job_provisioning_data == instance.job_provisioning_data
+        assert job.job_runtime_data is not None
+        assert job.last_processed_at > previous_last_processed_at
+        assert job.lock_owner is None
+        assert job.lock_token is None
+        assert job.lock_expires_at is None
+        assert instance.status == InstanceStatus.BUSY
+        assert instance.busy_blocks == 1
+        get_targeted_instance_offers_mock.assert_not_awaited()
+
+    async def test_assigns_job_to_specific_instance(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project, name="my-fleet")
+        await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+            name="my-fleet-0",
+        )
+        selected = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+            name="my-fleet-1",
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            profile=Profile(instances=[InstanceNameSelector(name="my-fleet-1")]),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_spec=run_spec,
+        )
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.SUBMITTED
+        assert job.instance_assigned
+        assert job.instance is not None and job.instance.id == selected.id
+        assert job.fleet_id == fleet.id
+
+    async def test_assigns_job_to_specific_hostname(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project, name="my-fleet")
+        await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+            remote_connection_info=get_remote_connection_info(host="192.168.1.10"),
+        )
+        selected = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+            remote_connection_info=get_remote_connection_info(host="192.168.1.11"),
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            profile=Profile(instances=[InstanceHostnameSelector(hostname="192.168.1.11")]),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_spec=run_spec,
+        )
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.SUBMITTED
+        assert job.instance_assigned
+        assert job.instance is not None and job.instance.id == selected.id
+        assert job.fleet_id == fleet.id
+
+    async def test_assigns_service_replicas_to_specific_shared_instance_blocks(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project, name="my-fleet")
+        selected = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+            name="shared-worker",
+            total_blocks=2,
+            busy_blocks=0,
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=ServiceConfiguration(
+                port=8080,
+                commands=["echo"],
+                replicas=Range[int](min=2, max=2),
+                resources=ResourcesSpec(
+                    cpu=CPUSpec.parse("1"),
+                    memory=Range[Memory](min=Memory.parse("1GB"), max=None),
+                    gpu=None,
+                ),
+            ),
+            profile=Profile(instances=[InstanceNameSelector(name="shared-worker")]),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_spec=run_spec,
+        )
+        first_job = await create_job(session=session, run=run, replica_num=0)
+        second_job = await create_job(session=session, run=run, replica_num=1)
+
+        await _process_job(session=session, worker=worker, job_model=first_job)
+        await session.refresh(selected)
+        assert selected.busy_blocks == 1
+
+        await _process_job(session=session, worker=worker, job_model=second_job)
+
+        first_job = await _get_job(session, first_job.id)
+        second_job = await _get_job(session, second_job.id)
+        await session.refresh(selected)
+        assert first_job.instance is not None and first_job.instance.id == selected.id
+        assert second_job.instance is not None and second_job.instance.id == selected.id
+        assert selected.status == InstanceStatus.BUSY
+        assert selected.busy_blocks == 2
+
+    async def test_specific_instance_assignment_stays_in_run_fleet(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        run_fleet = await create_fleet(session=session, project=project, name="run-fleet")
+        other_fleet = await create_fleet(session=session, project=project, name="other-fleet")
+        selected = await create_instance(
+            session=session,
+            project=project,
+            fleet=run_fleet,
+            status=InstanceStatus.IDLE,
+            name="run-fleet-0",
+            price=10,
+        )
+        await create_instance(
+            session=session,
+            project=project,
+            fleet=other_fleet,
+            status=InstanceStatus.IDLE,
+            name="other-fleet-0",
+            price=1,
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            profile=Profile(
+                instances=[
+                    InstanceNameSelector(name="run-fleet-0"),
+                    InstanceNameSelector(name="other-fleet-0"),
+                ]
+            ),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=run_fleet,
+            run_spec=run_spec,
+        )
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.SUBMITTED
+        assert job.instance_assigned
+        assert job.instance is not None and job.instance.id == selected.id
+        assert job.fleet_id == run_fleet.id
+
+    async def test_assigns_job_to_specific_instance_in_imported_fleet(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        exporter_user = await create_user(
+            session, name="exporter-user", global_role=GlobalRole.USER
+        )
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(
+            session, name="exporter-project", owner=exporter_user
+        )
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        repo = await create_repo(session=session, project_id=importer_project.id)
+        local_fleet = await create_fleet(
+            session=session,
+            project=importer_project,
+            name="same-fleet",
+            spec=get_fleet_spec(get_ssh_fleet_configuration()),
+        )
+        exported_fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            name="same-fleet",
+            spec=get_fleet_spec(get_ssh_fleet_configuration()),
+        )
+        await create_instance(
+            session=session,
+            project=importer_project,
+            fleet=local_fleet,
+            status=InstanceStatus.IDLE,
+            instance_num=1,
+            name="local-worker",
+        )
+        selected = await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=exported_fleet,
+            status=InstanceStatus.IDLE,
+            instance_num=1,
+            name="exported-worker",
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[exported_fleet],
+        )
+        selectors: list[InstanceSelector] = [
+            FleetInstanceSelector(
+                fleet=EntityReference.parse("exporter-project/same-fleet"),
+                instance=1,
+            )
+        ]
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            profile=Profile(instances=selectors),
+        )
+        run = await create_run(
+            session=session,
+            project=importer_project,
+            repo=repo,
+            user=importer_user,
+            run_spec=run_spec,
+        )
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.SUBMITTED
+        assert job.instance_assigned
+        assert job.instance is not None and job.instance.id == selected.id
+        assert job.fleet_id == exported_fleet.id
+
+    async def test_does_not_assign_multinode_job_without_enough_specific_instances(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.placement = InstanceGroupPlacement.CLUSTER
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+            name="shared-worker",
+            backend=BackendType.AWS,
+            total_blocks=2,
+            busy_blocks=0,
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(image="debian", nodes=2, commands=["echo"]),
+            profile=Profile(instances=[InstanceNameSelector(name="shared-worker")]),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_spec=run_spec,
+        )
+        master_job = await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            waiting_master_job=False,
+        )
+        worker_job = await create_job(
+            session=session,
+            run=run,
+            job_num=1,
+            waiting_master_job=True,
+        )
+
+        await _process_job(session=session, worker=worker, job_model=master_job)
+
+        master_job = await _get_job(session, master_job.id)
+        await session.refresh(worker_job)
+        await session.refresh(instance)
+        assert master_job.status == JobStatus.TERMINATING
+        assert (
+            master_job.termination_reason
+            == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
+        )
+        assert not master_job.instance_assigned
+        assert worker_job.waiting_master_job
+        assert instance.status == InstanceStatus.IDLE
+        assert instance.busy_blocks == 0
+
+    async def test_assigns_multinode_jobs_to_specific_shared_ssh_instances(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(
+            session=session,
+            project=project,
+            spec=get_fleet_spec(
+                get_ssh_fleet_configuration(
+                    hosts=["10.0.0.1", "10.0.0.2"],
+                    placement=InstanceGroupPlacement.CLUSTER,
+                    blocks=2,
+                )
+            ),
+        )
+        selected_master = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+            name="worker-0",
+            backend=BackendType.REMOTE,
+            region="remote",
+            price=1,
+            total_blocks=2,
+            busy_blocks=0,
+            offer=get_instance_offer_with_availability(
+                backend=BackendType.REMOTE,
+                region="remote",
+                cpu_count=2,
+                memory_gib=4,
+                total_blocks=2,
+            ),
+            job_provisioning_data=get_job_provisioning_data(
+                backend=BackendType.REMOTE,
+                region="remote",
+                cpu_count=2,
+                memory_gib=4,
+            ),
+        )
+        selected_worker = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+            name="worker-1",
+            backend=BackendType.REMOTE,
+            region="remote",
+            price=2,
+            instance_num=1,
+            total_blocks=2,
+            busy_blocks=0,
+            offer=get_instance_offer_with_availability(
+                backend=BackendType.REMOTE,
+                region="remote",
+                cpu_count=2,
+                memory_gib=4,
+                total_blocks=2,
+            ),
+            job_provisioning_data=get_job_provisioning_data(
+                backend=BackendType.REMOTE,
+                region="remote",
+                cpu_count=2,
+                memory_gib=4,
+            ),
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(
+                image="debian",
+                nodes=2,
+                commands=["echo"],
+                resources=ResourcesSpec(
+                    cpu=CPUSpec.parse("1.."),
+                    memory=Range[Memory](min=Memory.parse("1GB"), max=None),
+                    gpu=None,
+                ),
+            ),
+            profile=Profile(
+                instances=[
+                    InstanceNameSelector(name="worker-0"),
+                    InstanceNameSelector(name="worker-1"),
+                ]
+            ),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_spec=run_spec,
+        )
+        master_job = await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            waiting_master_job=False,
+        )
+        worker_job = await create_job(
+            session=session,
+            run=run,
+            job_num=1,
+            waiting_master_job=True,
+        )
+
+        await _process_job(session=session, worker=worker, job_model=master_job)
+        master_job = await _get_job(session, master_job.id)
+        assert master_job.instance is not None and master_job.instance.id == selected_master.id
+
+        await _process_job(session=session, worker=worker, job_model=master_job)
+        master_job = await _get_job(session, master_job.id)
+        await session.refresh(worker_job)
+        assert master_job.status == JobStatus.PROVISIONING
+        assert worker_job.waiting_master_job is False
+
+        await _process_job(session=session, worker=worker, job_model=worker_job)
+
+        worker_job = await _get_job(session, worker_job.id)
+        await session.refresh(selected_master)
+        await session.refresh(selected_worker)
+        assert worker_job.instance is not None and worker_job.instance.id == selected_worker.id
+        assert selected_master.busy_blocks == 2
+        assert selected_worker.busy_blocks == 2
+        master_runtime = validate_json_extra_ignore(
+            JobRuntimeData, get_or_error(master_job.job_runtime_data)
+        )
+        worker_runtime = validate_json_extra_ignore(
+            JobRuntimeData, get_or_error(worker_job.job_runtime_data)
+        )
+        assert master_runtime.network_mode == NetworkMode.HOST
+        assert worker_runtime.network_mode == NetworkMode.HOST
+        assert master_runtime.offer is not None and master_runtime.offer.blocks == 2
+        assert worker_runtime.offer is not None and worker_runtime.offer.blocks == 2
+
+    async def test_assigns_multinode_jobs_to_specific_instances_in_same_cluster_fleet(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.placement = InstanceGroupPlacement.CLUSTER
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        selected_master = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+            name="worker-0",
+            backend=BackendType.AWS,
+            region="eu-west-1",
+            price=1,
+            job_provisioning_data=get_job_provisioning_data(region="eu-west-1"),
+        )
+        selected_worker = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+            name="worker-1",
+            backend=BackendType.AWS,
+            region="eu-west-1",
+            price=2,
+            job_provisioning_data=get_job_provisioning_data(region="eu-west-1"),
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(image="debian", nodes=2, commands=["echo"]),
+            profile=Profile(
+                instances=[
+                    InstanceNameSelector(name="worker-0"),
+                    InstanceNameSelector(name="worker-1"),
+                ]
+            ),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_spec=run_spec,
+        )
+        master_job = await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            waiting_master_job=False,
+        )
+        worker_job = await create_job(
+            session=session,
+            run=run,
+            job_num=1,
+            waiting_master_job=True,
+        )
+
+        await _process_job(session=session, worker=worker, job_model=master_job)
+        master_job = await _get_job(session, master_job.id)
+        assert master_job.instance is not None and master_job.instance.id == selected_master.id
+        assert master_job.status == JobStatus.SUBMITTED
+
+        await _process_job(session=session, worker=worker, job_model=master_job)
+        master_job = await _get_job(session, master_job.id)
+        await session.refresh(worker_job)
+        assert master_job.status == JobStatus.PROVISIONING
+        assert worker_job.waiting_master_job is False
+
+        await _process_job(session=session, worker=worker, job_model=worker_job)
+
+        worker_job = await _get_job(session, worker_job.id)
+        await session.refresh(selected_master)
+        await session.refresh(selected_worker)
+        assert worker_job.status == JobStatus.SUBMITTED
+        assert worker_job.instance is not None and worker_job.instance.id == selected_worker.id
+        assert selected_master.busy_blocks == 1
+        assert selected_worker.busy_blocks == 1
+
+    async def test_does_not_create_capacity_when_specific_instance_is_missing(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        await create_fleet(session=session, project=project)
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            profile=Profile(instances=[InstanceNameSelector(name="missing-instance")]),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+        )
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.TERMINATING
+        assert job.termination_reason == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
+        res = await session.execute(select(InstanceModel))
+        assert res.scalars().all() == []
+
+    async def test_assigns_job_to_imported_fleet(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        exporter_user = await create_user(
+            session, name="exporter-user", global_role=GlobalRole.USER
+        )
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(
+            session, name="exporter-project", owner=exporter_user
+        )
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        repo = await create_repo(session=session, project_id=importer_project.id)
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration()),
+        )
+        instance = await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        run = await create_run(
+            session=session,
+            project=importer_project,
+            repo=repo,
+            user=importer_user,
+        )
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.SUBMITTED
+        assert job.instance_assigned
+        assert job.instance is not None and job.instance.id == instance.id
+        assert job.fleet_id == fleet.id
+
+    async def test_assigns_job_to_specific_fleet(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_1 = await create_fleet(session=session, project=project, name="fleet-1")
+        fleet_2 = await create_fleet(session=session, project=project, name="fleet-2")
+        await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet_1,
+            status=InstanceStatus.IDLE,
+            name="fleet-1-instance",
+        )
+        instance_2 = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet_2,
+            status=InstanceStatus.IDLE,
+            name="fleet-2-instance",
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            profile=Profile(name="default", fleets=[fleet_2.name]),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+        )
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.instance_assigned
+        assert job.instance is not None and job.instance.id == instance_2.id
+        assert job.fleet_id == fleet_2.id
+
+    async def test_assignment_creates_placeholder_instance_for_new_capacity(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        job = await create_job(session=session, run=run)
+
+        offer = get_instance_offer_with_availability(backend=BackendType.AWS)
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value.get_offers.return_value = [offer]
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.SUBMITTED
+        assert job.instance_assigned
+        assert job.fleet_id == fleet.id
+        assert job.used_instance_id is not None
+        # Query the placeholder instance directly to avoid stale session cache
+        res = await session.execute(
+            select(InstanceModel)
+            .where(InstanceModel.id == job.used_instance_id)
+            .execution_options(populate_existing=True)
+        )
+        placeholder = res.scalar_one()
+        assert placeholder.status == InstanceStatus.PENDING
+        assert placeholder.provisioning_job_id == job.id
+        assert placeholder.fleet_id == fleet.id
+        assert placeholder.offer is None
+        assert placeholder.instance_num == 0
+
+    async def test_assigns_job_to_instance_with_reuse_creation_policy(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            profile=Profile(creation_policy=CreationPolicy.REUSE),
+        )
+        run = await create_run(
+            session=session, project=project, repo=repo, user=user, run_spec=run_spec
+        )
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.SUBMITTED
+        assert job.instance_assigned
+        assert job.instance is not None and job.instance.id == instance.id
+        assert job.fleet_id == fleet.id
+
+    async def test_terminates_job_when_no_reusable_instances_with_reuse_creation_policy(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.BUSY,
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            profile=Profile(creation_policy=CreationPolicy.REUSE),
+        )
+        run = await create_run(
+            session=session, project=project, repo=repo, user=user, run_spec=run_spec
+        )
+        job = await create_job(session=session, run=run)
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        # Backend offers must not be requested with the reuse policy.
+        m.assert_not_called()
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.TERMINATING
+        assert job.termination_reason == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
+        assert job.termination_reason_message == "Could not reuse any instance for this job"
+        assert not job.instance_assigned
+        # No placeholder must be created when reuse fails.
+        res = await session.execute(
+            select(InstanceModel).where(
+                InstanceModel.fleet_id == fleet.id,
+                InstanceModel.deleted == False,
+            )
+        )
+        assert len(res.scalars().all()) == 1
+
+    @pytest.mark.parametrize("fleet_type", ["cloud", "ssh"])
+    async def test_job_fails_when_fleet_is_full(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker, fleet_type: str
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        if fleet_type == "cloud":
+            fleet_spec = get_fleet_spec()
+            fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=1)
+        else:
+            fleet_spec = get_fleet_spec(get_ssh_fleet_configuration(hosts=["10.0.0.1"]))
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.BUSY,
+        )
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        job = await create_job(session=session, run=run)
+
+        offer = get_instance_offer_with_availability(backend=BackendType.AWS)
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value.get_offers.return_value = [offer]
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.TERMINATING
+        assert job.termination_reason == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
+        assert job.termination_reason_message == "Fleet is at capacity"
+        # No placeholder must be committed when the fleet is full.
+        res = await session.execute(
+            select(InstanceModel).where(
+                InstanceModel.fleet_id == fleet.id,
+                InstanceModel.deleted == False,
+            )
+        )
+        assert len(res.scalars().all()) == 1
+
+    async def test_leaves_placeholder_for_terminating_pipeline_on_failed_new_capacity_provisioning(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+        )
+        placeholder = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.PENDING,
+            offer=None,
+            job_provisioning_data=None,
+            backend=BackendType.AWS,
+        )
+        job = await create_job(
+            session=session, run=run, instance=placeholder, instance_assigned=True
+        )
+        placeholder.provisioning_job_id = job.id
+        await session.commit()
+
+        offer = get_instance_offer_with_availability(backend=BackendType.AWS)
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            compute_mock = Mock(spec=ComputeMockSpec)
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value = compute_mock
+            m.return_value = [backend_mock]
+            compute_mock.get_offers.return_value = [offer]
+            compute_mock.run_job.side_effect = BackendError("boom")
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.status == JobStatus.TERMINATING
+        assert job.termination_reason == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
+        await session.refresh(placeholder)
+        assert not placeholder.deleted
+        assert placeholder.status == InstanceStatus.PENDING
+
+    async def test_reports_tried_offers_when_new_capacity_provisioning_fails(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=1)
+        fleet = await create_fleet(session=session, project=project, spec=fleet_spec)
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        job = await create_job(session=session, run=run)
+
+        offer = get_instance_offer_with_availability(backend=BackendType.AWS, region="us-east-1")
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            compute_mock = Mock(spec=ComputeMockSpec)
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value = compute_mock
+            m.return_value = [backend_mock]
+            compute_mock.get_offers.return_value = [offer]
+            compute_mock.run_job.side_effect = BackendError("InsufficientInstanceCapacity")
+
+            # The first pass assigns the job to the fleet, the second one provisions.
+            await _process_job(session=session, worker=worker, job_model=job)
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        job = await _get_job(session, job.id)
+        assert job.termination_reason == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
+        assert job.termination_reason_message is not None
+        assert f"Failed to provision in fleet '{fleet.name}'" in job.termination_reason_message
+        assert "tried 1 of 1 offers, all failed" in job.termination_reason_message
+        assert "us-east-1: InsufficientInstanceCapacity" in job.termination_reason_message
+
+    async def test_provisions_compute_group(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        run_spec = get_run_spec(repo_id=repo.name)
+        run_spec.configuration = TaskConfiguration(nodes=2, commands=["echo"])
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_spec=run_spec,
+        )
+        job1 = await create_job(
+            session=session,
+            run=run,
+            instance_assigned=True,
+            job_num=0,
+            waiting_master_job=False,
+        )
+        job2 = await create_job(
+            session=session,
+            run=run,
+            instance_assigned=False,
+            job_num=1,
+            waiting_master_job=True,
+        )
+
+        offer = get_instance_offer_with_availability(backend=BackendType.RUNPOD)
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            compute_mock = Mock(spec=ComputeMockSpec)
+            backend_mock.compute.return_value = compute_mock
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.RUNPOD
+            compute_mock.get_offers.return_value = [offer]
+            compute_mock.run_jobs.return_value = get_compute_group_provisioning_data(
+                job_provisioning_datas=[
+                    get_job_provisioning_data(dockerized=True, backend=BackendType.RUNPOD),
+                    get_job_provisioning_data(dockerized=True, backend=BackendType.RUNPOD),
+                ]
+            )
+
+            await _process_job(session=session, worker=worker, job_model=job1)
+
+        await session.refresh(job1)
+        await session.refresh(job2)
+        assert job1.status == JobStatus.PROVISIONING
+        assert job2.status == JobStatus.PROVISIONING
+        res = await session.execute(select(ComputeGroupModel))
+        assert res.scalar_one_or_none() is not None
+
+    async def test_provisions_one_job_node_group_via_run_job(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        """1-node hetero groups use run_job (not run_jobs).
+
+        RunPod Instant Clusters reject pod_count=1; Slurm gets node_count=1 from run_job.
+        """
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        configuration = TaskConfiguration(
+            image="debian",
+            groups=[
+                NodeGroup(name="prefill", nodes=1, commands=["echo prefill"]),
+                NodeGroup(name="decode", nodes=1, commands=["echo decode"]),
+            ],
+        )
+        run_spec = get_run_spec(repo_id=repo.name, configuration=configuration)
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_spec=run_spec,
+        )
+        job0 = await create_job(
+            session=session,
+            run=run,
+            instance_assigned=True,
+            job_num=0,
+            waiting_master_job=False,
+        )
+        await create_job(
+            session=session,
+            run=run,
+            instance_assigned=False,
+            job_num=1,
+            waiting_master_job=True,
+        )
+
+        offer = get_instance_offer_with_availability(backend=BackendType.RUNPOD)
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            compute_mock = Mock(spec=ComputeMockSpec)
+            backend_mock.compute.return_value = compute_mock
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.RUNPOD
+            compute_mock.get_offers.return_value = [offer]
+            compute_mock.run_job.return_value = get_job_provisioning_data(
+                dockerized=True, backend=BackendType.RUNPOD
+            )
+
+            await _process_job(session=session, worker=worker, job_model=job0)
+
+        compute_mock.run_job.assert_called_once()
+        compute_mock.run_jobs.assert_not_called()
+        assert compute_mock.run_job.call_args[0][1].job_spec.job_num == 0
+        job0 = await _get_job(session, job0.id)
+        assert job0.status == JobStatus.PROVISIONING
+
+    async def test_defers_job_while_waiting_for_master_provisioning(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        run_spec = get_run_spec(repo_id=repo.name)
+        run_spec.configuration = TaskConfiguration(nodes=2, commands=["echo"])
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+        )
+        await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            waiting_master_job=False,
+        )
+        job = await create_job(
+            session=session,
+            run=run,
+            job_num=1,
+            waiting_master_job=False,
+        )
+        previous_last_processed_at = job.last_processed_at
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        assert job.status == JobStatus.SUBMITTED
+        assert not job.instance_assigned
+        assert job.instance_id is None
+        assert job.fleet_id is None
+        assert job.last_processed_at > previous_last_processed_at
+        assert job.lock_owner is None
+        assert job.lock_token is None
+        assert job.lock_expires_at is None
+
+    async def test_defers_job_while_waiting_for_run_fleet_assignment(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        run_spec = get_run_spec(repo_id=repo.name)
+        run_spec.configuration = TaskConfiguration(nodes=2, commands=["echo"])
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+        )
+        await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            instance_assigned=True,
+            job_provisioning_data=get_job_provisioning_data(),
+            waiting_master_job=False,
+        )
+        job = await create_job(
+            session=session,
+            run=run,
+            job_num=1,
+            waiting_master_job=False,
+        )
+        previous_last_processed_at = job.last_processed_at
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        assert job.status == JobStatus.SUBMITTED
+        assert not job.instance_assigned
+        assert job.fleet_id is None
+        assert job.last_processed_at > previous_last_processed_at
+        assert job.lock_owner is None
+        assert job.lock_token is None
+        assert job.lock_expires_at is None
+
+    async def test_terminates_job_when_volume_preparation_fails(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        volume = await create_volume(
+            session=session,
+            project=project,
+            user=user,
+            status=VolumeStatus.ACTIVE,
+            volume_provisioning_data=get_volume_provisioning_data(),
+        )
+        volume.to_be_deleted = True
+        await session.commit()
+        run_spec = get_run_spec(repo_id=repo.name)
+        run_spec.configuration.volumes = [VolumeMountPoint(name=volume.name, path="/volume")]
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+        )
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        assert job.status == JobStatus.TERMINATING
+        assert job.termination_reason == JobTerminationReason.VOLUME_ERROR
+        assert job.termination_reason_message is not None
+        assert "marked for deletion" in job.termination_reason_message
+        assert job.lock_owner is None
+        assert job.lock_token is None
+        assert job.lock_expires_at is None
+
+    async def test_terminates_job_when_specified_fleets_cannot_be_used(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            profile=Profile(name="default", fleets=["missing-fleet"]),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+        )
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        assert job.status == JobStatus.TERMINATING
+        assert job.termination_reason == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
+        assert job.termination_reason_message == "Failed to use specified fleets"
+
+    async def test_terminates_job_when_no_matching_fleet(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        job = await create_job(session=session, run=run)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        assert job.status == JobStatus.TERMINATING
+        assert job.termination_reason == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
+        assert job.termination_reason_message is not None
+        assert "No matching fleet found" in job.termination_reason_message
+
+    async def test_terminates_legacy_autocreated_job_with_no_fleet(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        # Simulate legacy in-flight state: instance_assigned=True but no fleet
+        job = await create_job(session=session, run=run, instance_assigned=True)
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        assert job.status == JobStatus.TERMINATING
+        assert job.termination_reason == JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY
+        assert job.termination_reason_message is not None
+        assert "No matching fleet found" in job.termination_reason_message
+
+    async def test_resets_lock_for_retry_when_existing_instance_offer_cannot_be_locked(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.IDLE,
+        )
+        instance.lock_expires_at = get_current_datetime() + timedelta(minutes=1)
+        instance.lock_token = uuid.uuid4()
+        instance.lock_owner = "OtherPipeline"
+        await session.commit()
+
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        job = await create_job(session=session, run=run)
+        previous_last_processed_at = job.last_processed_at
+
+        await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        await session.refresh(instance)
+        assert job.status == JobStatus.SUBMITTED
+        assert not job.instance_assigned
+        assert job.instance_id is None
+        assert job.used_instance_id is None
+        assert job.last_processed_at > previous_last_processed_at
+        # lock_owner is intentionally preserved so the fetcher can distinguish
+        # an in-progress lock from a reset that came from this pipeline
+        assert job.lock_owner == JobSubmittedPipeline.__name__
+        assert job.lock_token is None
+        assert job.lock_expires_at is None
+        assert instance.status == InstanceStatus.IDLE
+        assert instance.busy_blocks == 0
+
+    async def test_attaches_volume_on_existing_instance(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        volume = await create_volume(
+            session=session,
+            project=project,
+            user=user,
+            status=VolumeStatus.ACTIVE,
+            volume_provisioning_data=get_volume_provisioning_data(),
+            backend=BackendType.AWS,
+            region="us-east-1",
+        )
+        fleet = await create_fleet(session=session, project=project)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.BUSY,
+            busy_blocks=1,
+            backend=BackendType.AWS,
+            region="us-east-1",
+        )
+        run_spec = get_run_spec(repo_id=repo.name)
+        run_spec.configuration.volumes = [VolumeMountPoint(name=volume.name, path="/volume")]
+        run = await create_run(
+            session=session, project=project, repo=repo, user=user, run_spec=run_spec
+        )
+        job = await create_job(
+            session=session,
+            run=run,
+            instance=instance,
+            instance_assigned=True,
+        )
+
+        with patch("dstack._internal.server.services.backends.get_project_backend_by_type") as m:
+            backend_mock = Mock()
+            m.return_value = backend_mock
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value = Mock(spec=ComputeMockSpec)
+            backend_mock.compute.return_value.attach_volume.return_value = VolumeAttachmentData()
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        res = await session.execute(
+            select(JobModel)
+            .where(JobModel.id == job.id)
+            .options(
+                joinedload(JobModel.instance)
+                .joinedload(InstanceModel.volume_attachments)
+                .joinedload(VolumeAttachmentModel.volume)
+            )
+            .execution_options(populate_existing=True)
+        )
+        job = res.unique().scalar_one()
+        await session.refresh(volume)
+        assert job.status == JobStatus.PROVISIONING
+        assert job.instance is not None
+        assert len(job.instance.volume_attachments) == 1
+        assert job.instance.volume_attachments[0].volume_id == volume.id
+        assert volume.lock_owner is None
+        assert volume.lock_token is None
+        assert volume.lock_expires_at is None
+        backend_mock.compute.return_value.attach_volume.assert_called_once()
+
+    async def test_reuses_existing_volume_attachment_on_existing_instance(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        # Fork (db1d670ed): a reused fleet instance can still hold the attachment row of
+        # the volume from an earlier job. A second row breaks the UNIQUE constraint on
+        # (volume_id, instance_id), so the job must reuse the row and skip the attach call.
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        volume = await create_volume(
+            session=session,
+            project=project,
+            user=user,
+            status=VolumeStatus.ACTIVE,
+            volume_provisioning_data=get_volume_provisioning_data(),
+            backend=BackendType.AWS,
+            region="us-east-1",
+        )
+        fleet = await create_fleet(session=session, project=project)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.BUSY,
+            busy_blocks=1,
+            backend=BackendType.AWS,
+            region="us-east-1",
+        )
+        session.add(
+            VolumeAttachmentModel(
+                volume_id=volume.id,
+                instance=instance,
+                attachment_data=VolumeAttachmentData().model_dump_json(),
+            )
+        )
+        await session.commit()
+        run_spec = get_run_spec(repo_id=repo.name)
+        run_spec.configuration.volumes = [VolumeMountPoint(name=volume.name, path="/volume")]
+        run = await create_run(
+            session=session, project=project, repo=repo, user=user, run_spec=run_spec
+        )
+        job = await create_job(
+            session=session,
+            run=run,
+            instance=instance,
+            instance_assigned=True,
+        )
+
+        with patch("dstack._internal.server.services.backends.get_project_backend_by_type") as m:
+            backend_mock = Mock()
+            m.return_value = backend_mock
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value = Mock(spec=ComputeMockSpec)
+            backend_mock.compute.return_value.attach_volume.return_value = VolumeAttachmentData()
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        res = await session.execute(
+            select(JobModel)
+            .where(JobModel.id == job.id)
+            .options(
+                joinedload(JobModel.instance)
+                .joinedload(InstanceModel.volume_attachments)
+                .joinedload(VolumeAttachmentModel.volume)
+            )
+            .execution_options(populate_existing=True)
+        )
+        job = res.unique().scalar_one()
+        assert job.status == JobStatus.PROVISIONING
+        assert job.instance is not None
+        assert len(job.instance.volume_attachments) == 1
+        assert job.instance.volume_attachments[0].volume_id == volume.id
+        backend_mock.compute.return_value.attach_volume.assert_not_called()
+        job_runtime_data = get_job_runtime_data(job)
+        assert job_runtime_data is not None
+        assert job_runtime_data.volume_names == [volume.name]
+
+    async def test_terminates_job_when_volume_is_locked_for_processing(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        volume = await create_volume(
+            session=session,
+            project=project,
+            user=user,
+            status=VolumeStatus.ACTIVE,
+            volume_provisioning_data=get_volume_provisioning_data(),
+            backend=BackendType.AWS,
+            region="us-east-1",
+        )
+        volume.lock_expires_at = get_current_datetime() + timedelta(minutes=1)
+        volume.lock_token = uuid.uuid4()
+        volume.lock_owner = "OtherPipeline"
+        fleet = await create_fleet(session=session, project=project)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.BUSY,
+            busy_blocks=1,
+            backend=BackendType.AWS,
+            region="us-east-1",
+        )
+        run_spec = get_run_spec(repo_id=repo.name)
+        run_spec.configuration.volumes = [VolumeMountPoint(name=volume.name, path="/volume")]
+        run = await create_run(
+            session=session, project=project, repo=repo, user=user, run_spec=run_spec
+        )
+        job = await create_job(
+            session=session,
+            run=run,
+            instance=instance,
+            instance_assigned=True,
+        )
+        await session.commit()
+
+        with patch("dstack._internal.server.services.backends.get_project_backend_by_type") as m:
+            backend_mock = Mock()
+            m.return_value = backend_mock
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value = Mock(spec=ComputeMockSpec)
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        await session.refresh(volume)
+        assert job.status == JobStatus.TERMINATING
+        assert job.termination_reason == JobTerminationReason.VOLUME_ERROR
+        assert job.termination_reason_message is not None
+        assert "locked for processing" in job.termination_reason_message
+        assert volume.lock_owner == "OtherPipeline"
+        assert volume.lock_token is not None
+        assert volume.lock_expires_at is not None
+        backend_mock.compute.return_value.attach_volume.assert_not_called()
+
+    async def test_reclaims_stale_related_volume_lock(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        volume = await create_volume(
+            session=session,
+            project=project,
+            user=user,
+            status=VolumeStatus.ACTIVE,
+            volume_provisioning_data=get_volume_provisioning_data(),
+            backend=BackendType.AWS,
+            region="us-east-1",
+        )
+        fleet = await create_fleet(session=session, project=project)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.BUSY,
+            busy_blocks=1,
+            backend=BackendType.AWS,
+            region="us-east-1",
+        )
+        run_spec = get_run_spec(repo_id=repo.name)
+        run_spec.configuration.volumes = [VolumeMountPoint(name=volume.name, path="/volume")]
+        run = await create_run(
+            session=session, project=project, repo=repo, user=user, run_spec=run_spec
+        )
+        job = await create_job(
+            session=session,
+            run=run,
+            instance=instance,
+            instance_assigned=True,
+        )
+        volume.lock_expires_at = get_current_datetime() - timedelta(minutes=1)
+        volume.lock_token = uuid.uuid4()
+        volume.lock_owner = f"{JobSubmittedPipeline.__name__}:{job.id}"
+        await session.commit()
+
+        with patch("dstack._internal.server.services.backends.get_project_backend_by_type") as m:
+            backend_mock = Mock()
+            m.return_value = backend_mock
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value = Mock(spec=ComputeMockSpec)
+            backend_mock.compute.return_value.attach_volume.return_value = VolumeAttachmentData()
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        await session.refresh(volume)
+        assert job.status == JobStatus.PROVISIONING
+        assert volume.lock_owner is None
+        assert volume.lock_token is None
+        assert volume.lock_expires_at is None
+        backend_mock.compute.return_value.attach_volume.assert_called_once()
+
+    async def test_run_job_uses_server_default_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        test_db,
+        session: AsyncSession,
+        worker: JobSubmittedWorker,
+    ):
+        monkeypatch.setattr(server_settings, "SERVER_DEFAULT_DOCKER_REGISTRY", "registry.example")
+        monkeypatch.setattr(
+            server_settings, "SERVER_DEFAULT_DOCKER_REGISTRY_USERNAME", "server-user"
+        )
+        monkeypatch.setattr(
+            server_settings, "SERVER_DEFAULT_DOCKER_REGISTRY_PASSWORD", "server-pass"
+        )
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        run_spec = get_run_spec(
+            run_name="test-run",
+            repo_id=repo.name,
+            configuration=TaskConfiguration(image="ubuntu"),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_spec=run_spec,
+        )
+        job = await create_job(session=session, run=run, instance_assigned=True)
+
+        offer = get_instance_offer_with_availability(backend=BackendType.RUNPOD)
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.RUNPOD
+            backend_mock.compute.return_value.get_offers.return_value = [offer]
+            backend_mock.compute.return_value.run_job.return_value = get_job_provisioning_data(
+                dockerized=False, backend=BackendType.RUNPOD
+            )
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        backend_mock.compute.return_value.run_job.assert_called_once()
+        submitted_job = backend_mock.compute.return_value.run_job.call_args[0][1]
+        assert submitted_job.job_spec.image_name == "registry.example/ubuntu"
+        assert submitted_job.job_spec.registry_auth == RegistryAuth(
+            username="server-user", password="server-pass"
+        )
+
+    async def test_run_jobs_uses_server_default_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        test_db,
+        session: AsyncSession,
+        worker: JobSubmittedWorker,
+    ):
+        monkeypatch.setattr(server_settings, "SERVER_DEFAULT_DOCKER_REGISTRY", "registry.example")
+        monkeypatch.setattr(
+            server_settings, "SERVER_DEFAULT_DOCKER_REGISTRY_USERNAME", "server-user"
+        )
+        monkeypatch.setattr(
+            server_settings, "SERVER_DEFAULT_DOCKER_REGISTRY_PASSWORD", "server-pass"
+        )
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        run_spec = get_run_spec(
+            run_name="test-run",
+            repo_id=repo.name,
+            configuration=TaskConfiguration(image="ubuntu", nodes=2, commands=["echo"]),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_spec=run_spec,
+        )
+        job1 = await create_job(
+            session=session,
+            run=run,
+            instance_assigned=True,
+            job_num=0,
+            waiting_master_job=False,
+        )
+        await create_job(
+            session=session,
+            run=run,
+            instance_assigned=False,
+            job_num=1,
+            waiting_master_job=True,
+        )
+
+        offer = get_instance_offer_with_availability(backend=BackendType.RUNPOD)
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            compute_mock = Mock(spec=ComputeMockSpec)
+            backend_mock.compute.return_value = compute_mock
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.RUNPOD
+            compute_mock.get_offers.return_value = [offer]
+            compute_mock.run_jobs.return_value = get_compute_group_provisioning_data(
+                job_provisioning_datas=[
+                    get_job_provisioning_data(dockerized=False, backend=BackendType.RUNPOD),
+                    get_job_provisioning_data(dockerized=False, backend=BackendType.RUNPOD),
+                ]
+            )
+
+            await _process_job(session=session, worker=worker, job_model=job1)
+
+        compute_mock.run_jobs.assert_called_once()
+        job_configurations = compute_mock.run_jobs.call_args[0][1]
+        for job_configuration in job_configurations:
+            assert job_configuration.job.job_spec.image_name == "registry.example/ubuntu"
+            assert job_configuration.job.job_spec.registry_auth == RegistryAuth(
+                username="server-user", password="server-pass"
+            )
+
+    async def test_interpolates_secrets_when_provisioning_new_capacity(
+        self,
+        test_db,
+        session: AsyncSession,
+        image_config_mock: ImageConfig,
+        worker: JobSubmittedWorker,
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        await create_secret(session=session, project=project, name="token", value="s3cret")
+        await create_secret(
+            session=session, project=project, name="registry_user", value="docker-user"
+        )
+        await create_secret(
+            session=session, project=project, name="registry_pass", value="docker-pass"
+        )
+        run_spec = get_run_spec(
+            run_name="test-run",
+            repo_id=repo.name,
+            configuration=TaskConfiguration(
+                image="ubuntu",
+                env=Env.model_validate({"TOKEN": "${{ secrets.token }}"}),
+                registry_auth=RegistryAuth(
+                    username="${{ secrets.registry_user }}",
+                    password="${{ secrets.registry_pass }}",
+                ),
+            ),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_spec=run_spec,
+        )
+        with patch.object(JobConfigurator, "_get_image_config_and_cpu_architectures") as m:
+            m.return_value = (image_config_mock, {gpuhunt.CPUArchitecture.X86})
+            job = await create_job(session=session, run=run, instance_assigned=True)
+
+        offer = get_instance_offer_with_availability(backend=BackendType.RUNPOD)
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.RUNPOD
+            backend_mock.compute.return_value.get_offers.return_value = [offer]
+            backend_mock.compute.return_value.run_job.return_value = get_job_provisioning_data(
+                dockerized=False, backend=BackendType.RUNPOD
+            )
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        backend_mock.compute.return_value.run_job.assert_called_once()
+        submitted_job = backend_mock.compute.return_value.run_job.call_args[0][1]
+        assert submitted_job.job_spec.env == {"TOKEN": "s3cret"}
+        assert submitted_job.job_spec.registry_auth == RegistryAuth(
+            username="docker-user", password="docker-pass"
+        )
+        # The persisted JobModel keeps the unresolved literals so secrets aren't leaked.
+        await session.refresh(job)
+        assert "${{ secrets.token }}" in job.job_spec_data
+        assert "${{ secrets.registry_user }}" in job.job_spec_data
+        assert "${{ secrets.registry_pass }}" in job.job_spec_data
+
+    async def test_terminates_job_when_secret_is_missing(
+        self,
+        test_db,
+        session: AsyncSession,
+        image_config_mock: ImageConfig,
+        worker: JobSubmittedWorker,
+    ):
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        run_spec = get_run_spec(
+            run_name="test-run",
+            repo_id=repo.name,
+            configuration=TaskConfiguration(
+                image="ubuntu",
+                registry_auth=RegistryAuth(
+                    username="registry_user",
+                    password="${{ secrets.registry_pass }}",
+                ),
+            ),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+            run_spec=run_spec,
+        )
+        with patch.object(JobConfigurator, "_get_image_config_and_cpu_architectures") as m:
+            m.return_value = (image_config_mock, {gpuhunt.CPUArchitecture.X86})
+            job = await create_job(session=session, run=run, instance_assigned=True)
+
+        offer = get_instance_offer_with_availability(backend=BackendType.RUNPOD)
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.RUNPOD
+            backend_mock.compute.return_value.get_offers.return_value = [offer]
+            backend_mock.compute.return_value.run_job.return_value = get_job_provisioning_data(
+                dockerized=False, backend=BackendType.RUNPOD
+            )
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        await session.refresh(job)
+        assert job.status == JobStatus.TERMINATING
+        assert job.termination_reason == JobTerminationReason.TERMINATED_BY_SERVER
+        assert job.termination_reason_message is not None
+        assert "Secrets interpolation error" in job.termination_reason_message
+        backend_mock.compute.return_value.run_job.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+class TestLoadSubmittedJobContext:
+    async def test_single_node_master_loads_only_current_job(self, test_db, session: AsyncSession):
+        """Master single-node: run_model.jobs should contain only the current job (latest submission)."""
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        run = await create_run(session=session, project=project, repo=repo, user=user, fleet=fleet)
+        job = await create_job(session=session, run=run, status=JobStatus.SUBMITTED)
+        await session.commit()
+
+        context = await _load_submitted_job_context(session=session, job_model=job)
+        # Only the current job's latest submission should be loaded.
+        assert len(context.run_model.jobs) == 1
+        assert context.run_model.jobs[0].id == job.id
+        assert not context.multinode
+        assert context.jobs_to_provision == [context.job]
+
+    async def test_non_master_multinode_loads_master_and_current_job(
+        self, test_db, session: AsyncSession
+    ):
+        """Homogeneous multinode workers: run_model.jobs should contain job 0 + current."""
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        configuration = TaskConfiguration(image="debian", nodes=3)
+        run_spec = get_run_spec(run_name="run", repo_id=repo.name, configuration=configuration)
+        run = await create_run(
+            session=session,
+            run_name="run",
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            fleet=fleet,
+        )
+        master_job = await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            status=JobStatus.SUBMITTED,
+            instance_assigned=True,
+            job_provisioning_data=get_job_provisioning_data(),
+            waiting_master_job=False,
+        )
+        worker_job_1 = await create_job(
+            session=session,
+            run=run,
+            job_num=1,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=False,
+        )
+        await create_job(
+            session=session,
+            run=run,
+            job_num=2,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=False,
+        )
+        await session.commit()
+
+        context = await _load_submitted_job_context(session=session, job_model=worker_job_1)
+        loaded_job_ids = {jm.id for jm in context.run_model.jobs}
+        assert loaded_job_ids == {master_job.id, worker_job_1.id}
+        assert context.jobs_to_provision == [context.job]
+
+    async def test_multinode_master_loads_all_replica_jobs(self, test_db, session: AsyncSession):
+        """Master multinode: run_model.jobs should contain all same-replica jobs (latest submissions)."""
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        configuration = TaskConfiguration(image="debian", nodes=2)
+        run_spec = get_run_spec(run_name="run", repo_id=repo.name, configuration=configuration)
+        run = await create_run(
+            session=session,
+            run_name="run",
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            fleet=fleet,
+        )
+        master_job = await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=False,
+        )
+        worker_job = await create_job(
+            session=session,
+            run=run,
+            job_num=1,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=True,
+        )
+        await session.commit()
+
+        context = await _load_submitted_job_context(session=session, job_model=master_job)
+        # All jobs in same replica should be loaded.
+        loaded_job_ids = {jm.id for jm in context.run_model.jobs}
+        assert loaded_job_ids == {master_job.id, worker_job.id}
+        assert context.multinode
+        assert len(context.jobs_to_provision) == 2
+        assert len(context.replica_job_model_ids) == 2
+
+    async def test_node_group_master_provisions_only_its_group(
+        self, test_db, session: AsyncSession
+    ):
+        """Heterogeneous node groups: each group master batches only its own group."""
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        configuration = TaskConfiguration(
+            image="debian",
+            groups=[
+                NodeGroup(
+                    name="small",
+                    nodes=1,
+                    resources=ResourcesSpec(
+                        cpu=CPUSpec(count=Range[int](min=2)),
+                        memory=Range[Memory](min=Memory(4)),
+                    ),
+                    commands=["echo small"],
+                ),
+                NodeGroup(
+                    name="large",
+                    nodes=2,
+                    resources=ResourcesSpec(
+                        cpu=CPUSpec(count=Range[int](min=4)),
+                        memory=Range[Memory](min=Memory(8)),
+                    ),
+                    commands=["echo large"],
+                ),
+            ],
+        )
+        run_spec = get_run_spec(run_name="run", repo_id=repo.name, configuration=configuration)
+        run = await create_run(
+            session=session,
+            run_name="run",
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            fleet=fleet,
+        )
+        small_job = await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=False,
+        )
+        large_job_0 = await create_job(
+            session=session,
+            run=run,
+            job_num=1,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=False,
+        )
+        large_job_1 = await create_job(
+            session=session,
+            run=run,
+            job_num=2,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=False,
+        )
+        await session.commit()
+
+        small_context = await _load_submitted_job_context(session=session, job_model=small_job)
+        # Multinode master: load all replica jobs.
+        assert {jm.job_num for jm in small_context.run_model.jobs} == {0, 1, 2}
+        assert [j.job_spec.job_num for j in small_context.jobs_to_provision] == [0]
+        assert small_context.jobs_to_provision[0].job_spec.node_group_name == "small"
+
+        large_context = await _load_submitted_job_context(session=session, job_model=large_job_0)
+        # Node-group masters load all replica jobs (for chain unlock).
+        assert {jm.job_num for jm in large_context.run_model.jobs} == {0, 1, 2}
+        assert sorted(j.job_spec.job_num for j in large_context.jobs_to_provision) == [1, 2]
+        assert {j.job_spec.node_group_name for j in large_context.jobs_to_provision} == {"large"}
+
+        large_worker_context = await _load_submitted_job_context(
+            session=session, job_model=large_job_1
+        )
+        # Non-master job in the group: job 0 + current.
+        assert {jm.job_num for jm in large_worker_context.run_model.jobs} == {0, 2}
+        assert [j.job_spec.job_num for j in large_worker_context.jobs_to_provision] == [2]
+
+    async def test_global_master_unlocks_only_next_waiting_group_master(
+        self, test_db, session: AsyncSession
+    ):
+        """After job 0, unlock only the next waiting group master — not later masters or their workers."""
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        configuration = TaskConfiguration(
+            image="debian",
+            groups=[
+                NodeGroup(name="small", nodes=1, commands=["echo small"]),
+                NodeGroup(name="large", nodes=2, commands=["echo large"]),
+                NodeGroup(name="other", nodes=1, commands=["echo other"]),
+            ],
+        )
+        run_spec = get_run_spec(run_name="run", repo_id=repo.name, configuration=configuration)
+        run = await create_run(
+            session=session,
+            run_name="run",
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            fleet=fleet,
+        )
+        small_job = await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=False,
+        )
+        large_master = await create_job(
+            session=session,
+            run=run,
+            job_num=1,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=True,
+        )
+        large_worker = await create_job(
+            session=session,
+            run=run,
+            job_num=2,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=True,
+        )
+        other_master = await create_job(
+            session=session,
+            run=run,
+            job_num=3,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=True,
+        )
+        await session.commit()
+
+        context = await _load_submitted_job_context(session=session, job_model=small_job)
+        _release_replica_jobs_from_master_wait(
+            job_model=context.job_model,
+            job=context.job,
+            replica_job_models=list(context.run_model.jobs),
+        )
+        await session.commit()
+        await session.refresh(large_master)
+        await session.refresh(large_worker)
+        await session.refresh(other_master)
+
+        assert large_master.waiting_master_job is False
+        assert large_worker.waiting_master_job is True
+        assert other_master.waiting_master_job is True
+
+    async def test_homogeneous_master_unlocks_same_group_workers(
+        self, test_db, session: AsyncSession
+    ):
+        """Homogeneous nodes:N — job 0 unlocks the other ranks in the single group."""
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        configuration = TaskConfiguration(image="debian", nodes=3, commands=["true"])
+        run_spec = get_run_spec(run_name="run", repo_id=repo.name, configuration=configuration)
+        run = await create_run(
+            session=session,
+            run_name="run",
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            fleet=fleet,
+        )
+        master = await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=False,
+        )
+        worker_1 = await create_job(
+            session=session,
+            run=run,
+            job_num=1,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=True,
+        )
+        worker_2 = await create_job(
+            session=session,
+            run=run,
+            job_num=2,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=True,
+        )
+        await session.commit()
+
+        context = await _load_submitted_job_context(session=session, job_model=master)
+        _release_replica_jobs_from_master_wait(
+            job_model=context.job_model,
+            job=context.job,
+            replica_job_models=list(context.run_model.jobs),
+        )
+        await session.commit()
+        await session.refresh(worker_1)
+        await session.refresh(worker_2)
+
+        assert worker_1.waiting_master_job is False
+        assert worker_2.waiting_master_job is False
+
+    async def test_group_master_unlocks_same_group_workers_and_next_master(
+        self, test_db, session: AsyncSession
+    ):
+        """After a non-zero group master: unlock its workers and the next waiting group master."""
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        configuration = TaskConfiguration(
+            image="debian",
+            groups=[
+                NodeGroup(name="small", nodes=1, commands=["echo small"]),
+                NodeGroup(name="large", nodes=2, commands=["echo large"]),
+                NodeGroup(name="other", nodes=1, commands=["echo other"]),
+            ],
+        )
+        run_spec = get_run_spec(run_name="run", repo_id=repo.name, configuration=configuration)
+        run = await create_run(
+            session=session,
+            run_name="run",
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            fleet=fleet,
+        )
+        await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=False,
+        )
+        large_master = await create_job(
+            session=session,
+            run=run,
+            job_num=1,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=False,
+        )
+        large_worker = await create_job(
+            session=session,
+            run=run,
+            job_num=2,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=True,
+        )
+        other_master = await create_job(
+            session=session,
+            run=run,
+            job_num=3,
+            status=JobStatus.SUBMITTED,
+            waiting_master_job=True,
+        )
+        await session.commit()
+
+        context = await _load_submitted_job_context(session=session, job_model=large_master)
+        assert {jm.job_num for jm in context.run_model.jobs} == {0, 1, 2, 3}
+        _release_replica_jobs_from_master_wait(
+            job_model=context.job_model,
+            job=context.job,
+            replica_job_models=list(context.run_model.jobs),
+        )
+        await session.commit()
+        await session.refresh(large_worker)
+        await session.refresh(other_master)
+
+        assert large_worker.waiting_master_job is False
+        assert other_master.waiting_master_job is False
+
+    async def test_loads_only_latest_submission(self, test_db, session: AsyncSession):
+        """Only the latest submission per (replica_num, job_num) should be loaded, not historical ones."""
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        fleet = await create_fleet(session=session, project=project)
+        run = await create_run(session=session, project=project, repo=repo, user=user, fleet=fleet)
+        # Create two submissions for the same job (simulating resubmission).
+        await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            submission_num=0,
+            status=JobStatus.SUBMITTED,
+        )
+        latest_job = await create_job(
+            session=session,
+            run=run,
+            job_num=0,
+            submission_num=1,
+            status=JobStatus.SUBMITTED,
+        )
+        await session.commit()
+
+        context = await _load_submitted_job_context(session=session, job_model=latest_job)
+        # Only the latest submission should be loaded.
+        assert len(context.run_model.jobs) == 1
+        assert context.run_model.jobs[0].id == latest_job.id
+
+
+class TestGetNewCapacityFailureMessage:
+    def _get_offer_attempt_error(self, region: str, error: str) -> _OfferAttemptError:
+        return _OfferAttemptError(backend="aws", region=region, instance="g5.xlarge", error=error)
+
+    def test_reports_no_offers(self):
+        attempts = _NewCapacityAttempts(
+            total=0, tried=0, skip_reasons=[], errors=[], limit_reached=False
+        )
+
+        message = _get_new_capacity_failure_message(fleet_name="my-fleet", attempts=attempts)
+
+        assert "No offers matching the run requirements in fleet 'my-fleet'" in message
+
+    def test_reports_skip_reasons_when_no_offer_was_tried(self):
+        attempts = _NewCapacityAttempts(
+            total=3,
+            tried=0,
+            skip_reasons=["no compatible placement group", "no compatible placement group"],
+            errors=[],
+            limit_reached=False,
+        )
+
+        message = _get_new_capacity_failure_message(fleet_name="my-fleet", attempts=attempts)
+
+        assert "None of the 3 offers in fleet 'my-fleet' could be tried" in message
+        # Repeated reasons are reported once.
+        assert message.count("no compatible placement group") == 1
+
+    def test_reports_tried_offers_and_errors(self):
+        attempts = _NewCapacityAttempts(
+            total=12,
+            tried=5,
+            skip_reasons=[],
+            errors=[
+                self._get_offer_attempt_error("us-east-1", "InsufficientInstanceCapacity"),
+                self._get_offer_attempt_error("us-west-2", "InsufficientInstanceCapacity"),
+                self._get_offer_attempt_error("eu-west-1", "RequestLimitExceeded"),
+            ],
+            limit_reached=True,
+        )
+
+        message = _get_new_capacity_failure_message(fleet_name="my-fleet", attempts=attempts)
+
+        assert (
+            "Failed to provision in fleet 'my-fleet':"
+            " tried 5 of 12 offers (attempt limit reached), all failed." in message
+        )
+        # The same error is reported once, for the first offer that hit it.
+        assert message.count("InsufficientInstanceCapacity") == 1
+        assert "g5.xlarge in aws/us-east-1: InsufficientInstanceCapacity" in message
+        assert "g5.xlarge in aws/eu-west-1: RequestLimitExceeded" in message
+        assert "us-west-2" not in message
+
+    def test_does_not_report_the_attempt_limit_when_all_offers_were_tried(self):
+        attempts = _NewCapacityAttempts(
+            total=5, tried=5, skip_reasons=[], errors=[], limit_reached=False
+        )
+
+        message = _get_new_capacity_failure_message(fleet_name="my-fleet", attempts=attempts)
+
+        assert "tried 5 of 5 offers, all failed" in message
+        assert "attempt limit" not in message
+
+    def test_truncates_reported_errors(self):
+        attempts = _NewCapacityAttempts(
+            total=5,
+            tried=5,
+            skip_reasons=[],
+            errors=[self._get_offer_attempt_error(f"region-{i}", f"error-{i}") for i in range(5)],
+            limit_reached=False,
+        )
+
+        message = _get_new_capacity_failure_message(fleet_name="my-fleet", attempts=attempts)
+
+        assert "and 2 more" in message
+        assert "error-3" not in message

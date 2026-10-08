@@ -9,16 +9,18 @@ from dstack._internal.core.models.common import CoreModel
 
 class RouterType(str, Enum):
     SGLANG = "sglang"
+    DYNAMO = "dynamo"
 
 
-class SGLangRouterConfig(CoreModel):
-    type: Annotated[Literal["sglang"], Field(description="The router type")] = "sglang"
-    policy: Annotated[
-        Literal["random", "round_robin", "cache_aware", "power_of_two"],
+class ReplicaGroupRouterConfig(CoreModel):
+    type: Annotated[
+        Literal["sglang", "dynamo"],
         Field(
-            description="The routing policy. Options: `random`, `round_robin`, `cache_aware`, `power_of_two`"
+            description=(
+                "The router implementation for this replica group. "
+                "`sglang` runs the SGLang router and dstack syncs worker URLs to it. "
+                "`dynamo` runs the NVIDIA Dynamo frontend, which discovers workers "
+                "itself via etcd/NATS."
+            ),
         ),
-    ] = "cache_aware"
-
-
-AnyRouterConfig = SGLangRouterConfig
+    ] = "sglang"

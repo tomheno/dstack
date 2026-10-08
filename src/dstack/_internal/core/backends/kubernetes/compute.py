@@ -1,90 +1,123 @@
+import concurrent.futures
+import random
 import shlex
 import subprocess
 import tempfile
-import threading
 import time
+from contextlib import ExitStack
+from decimal import Decimal
 from enum import Enum
+from functools import partial
 from typing import List, Optional
 
-from gpuhunt import KNOWN_AMD_GPUS, KNOWN_NVIDIA_GPUS, AcceleratorVendor
+from gpuhunt import AcceleratorVendor
 from kubernetes import client
+from typing_extensions import Self
 
+from dstack._internal.core.backends.base.authorized_keys import (
+    build_authorized_keys,
+    get_add_authorized_keys_script,
+    normalize_authorized_keys,
+)
 from dstack._internal.core.backends.base.compute import (
     Compute,
-    ComputeWithFilteredOffersCached,
+    ComputeWithAllOffersCached,
     ComputeWithGatewaySupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     ComputeWithPrivilegedSupport,
+    ComputeWithVolumeSupport,
     generate_unique_gateway_instance_name,
     generate_unique_instance_name_for_job,
+    generate_unique_name,
+    generate_unique_volume_name,
     get_docker_commands,
     get_dstack_gateway_commands,
-    normalize_arch,
+    merge_tags,
 )
-from dstack._internal.core.backends.base.offers import filter_offers_by_requirements
-from dstack._internal.core.backends.kubernetes.models import (
-    KubernetesConfig,
-    KubernetesProxyJumpConfig,
+from dstack._internal.core.backends.base.offers import (
+    OfferModifier,
+    RegionalSkipOfferCache,
+    gpu_matches_gpu_spec,
+)
+from dstack._internal.core.backends.kubernetes.api_client import API_CLIENT_EXCEPTIONS
+from dstack._internal.core.backends.kubernetes.models import KubernetesConfig
+from dstack._internal.core.backends.kubernetes.resources import (
+    AMD_GPU_DEVICE_ID_LABEL_PREFIX,
+    AMD_GPU_NAME_TO_DEVICE_IDS,
+    AMD_GPU_NODE_TAINT,
+    LABEL_VALUE_MAX_LENGTH,
+    NVIDIA_GPU_NODE_TAINT,
+    NVIDIA_GPU_PRODUCT_LABEL,
+    OBJECT_NAME_MAX_LENGTH,
+    AnyKubernetesGPUResource,
+    KubernetesResource,
+    PodPhase,
+    ResourceLimits,
+    ResourceRequests,
+    TaintEffect,
+    adjust_resources_by_resource_requests,
+    build_base_labels,
+    build_dockerconfigjson,
+    filter_invalid_labels,
+    format_memory,
+    get_amd_gpu_from_node_labels,
+    get_instance_offer_from_node,
+    get_instance_offers,
+    get_node_labels,
+    get_node_name,
+    get_nvidia_gpu_from_node_labels,
+    is_hard_taint,
+    is_taint_tolerated,
+    parse_quantity,
 )
 from dstack._internal.core.backends.kubernetes.utils import (
+    LEGACY_CURRENT_CONTEXT_REGION,
+    Cluster,
     call_api_method,
-    get_api_from_config_data,
-    get_cluster_public_ip,
+    get_clusters_from_backend_config,
+    try_delete_object_if_exists,
+    watch_events,
 )
 from dstack._internal.core.consts import DSTACK_RUNNER_SSH_PORT
-from dstack._internal.core.errors import ComputeError
+from dstack._internal.core.errors import ComputeError, ProvisioningError, SkipOffer
 from dstack._internal.core.models.backends.base import BackendType
+from dstack._internal.core.models.common import CoreModel, validate_json_extra_ignore
 from dstack._internal.core.models.gateways import (
-    GatewayComputeConfiguration,
-    GatewayProvisioningData,
+    GatewayReplicaConfiguration,
+    GatewayReplicaProvisioningData,
 )
 from dstack._internal.core.models.instances import (
-    Disk,
-    Gpu,
-    InstanceAvailability,
     InstanceOfferWithAvailability,
-    InstanceRuntime,
-    InstanceType,
-    Resources,
     SSHConnectionParams,
 )
 from dstack._internal.core.models.placement import PlacementGroup
-from dstack._internal.core.models.resources import CPUSpec, GPUSpec, Memory
-from dstack._internal.core.models.routers import AnyRouterConfig
-from dstack._internal.core.models.runs import Job, JobProvisioningData, Requirements, Run
-from dstack._internal.core.models.volumes import Volume
-from dstack._internal.utils.common import get_or_error, parse_memory
+from dstack._internal.core.models.resources import GPUSpec
+from dstack._internal.core.models.runs import (
+    Job,
+    JobProvisioningData,
+    JobSpec,
+    Requirements,
+    Run,
+    RunSpec,
+)
+from dstack._internal.core.models.volumes import (
+    InstanceMountPoint,
+    KubernetesVolumeConfiguration,
+    Volume,
+    VolumeMountPoint,
+    VolumeProvisioningData,
+)
+from dstack._internal.utils.common import get_or_error
 from dstack._internal.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 JUMP_POD_IMAGE = "testcontainers/sshd:1.3.0@sha256:c50c0f59554dcdb2d9e5e705112144428ae9d04ac0af6322b365a18e24213a6a"
 JUMP_POD_SSH_PORT = 22
-DUMMY_REGION = "-"
+JUMP_POD_USER = "root"
 
-NVIDIA_GPU_RESOURCE = "nvidia.com/gpu"
-NVIDIA_GPU_NODE_TAINT = NVIDIA_GPU_RESOURCE
-NVIDIA_GPU_PRODUCT_LABEL = f"{NVIDIA_GPU_RESOURCE}.product"
-
-AMD_GPU_RESOURCE = "amd.com/gpu"
-AMD_GPU_NODE_TAINT = AMD_GPU_RESOURCE
-# The oldest but still supported label format, the safest option, see the commit message:
-# https://github.com/ROCm/k8s-device-plugin/commit/c0b0231b391a56bc9da4f362d561e25e960d7a48
-# E.g., beta.amd.com/gpu.device-id.74b5=4 - A node with four MI300X VF (0x74b5) GPUs
-# We cannot rely on the beta.amd.com/gpu.product-name.* label, as it may be missing, see the issue:
-# https://github.com/ROCm/k8s-device-plugin/issues/112
-AMD_GPU_DEVICE_ID_LABEL_PREFIX = f"beta.{AMD_GPU_RESOURCE}.device-id."
-
-# Taints we know and tolerate when creating our objects, e.g., the jump pod.
-TOLERATED_NODE_TAINTS = (NVIDIA_GPU_NODE_TAINT, AMD_GPU_NODE_TAINT)
-
-NVIDIA_GPU_NAME_TO_GPU_INFO = {gpu.name: gpu for gpu in KNOWN_NVIDIA_GPUS}
-NVIDIA_GPU_NAMES = NVIDIA_GPU_NAME_TO_GPU_INFO.keys()
-
-AMD_GPU_DEVICE_ID_TO_GPU_INFO = {
-    device_id: gpu_info for gpu_info in KNOWN_AMD_GPUS for device_id in gpu_info.device_ids
-}
-AMD_GPU_NAME_TO_DEVICE_IDS = {gpu.name: gpu.device_ids for gpu in KNOWN_AMD_GPUS}
+JOB_POD_SCHEDULING_TIMEOUT = 10
 
 
 class Operator(str, Enum):
@@ -92,41 +125,73 @@ class Operator(str, Enum):
     IN = "In"
 
 
-class TaintEffect(str, Enum):
-    NO_EXECUTE = "NoExecute"
-    NO_SCHEDULE = "NoSchedule"
-    PREFER_NO_SCHEDULE = "PreferNoSchedule"
+class KubernetesBackendData(CoreModel):
+    jump_pod_name: str
+    jump_pod_service_name: str
+    # TODO: remove `user_ssh_public_key` once servers before 0.21.4 are no longer supported.
+    user_ssh_public_key: str = ""
+    """Superseded by `extra_authorized_keys`, but still written -- as the first extra key, or an
+    empty string if there are none -- because servers before 0.21.4 require this field and may
+    read this record during a rolling deployment. Read only if `extra_authorized_keys` is empty,
+    that is, if such a server wrote the record.
+    """
+    extra_authorized_keys: list[str] = []
+    """Empty in records written before the field was introduced, see `user_ssh_public_key`."""
+
+    @classmethod
+    def load(cls, raw: str) -> Self:
+        return validate_json_extra_ignore(cls, raw)
 
 
 class KubernetesCompute(
-    ComputeWithFilteredOffersCached,
+    ComputeWithAllOffersCached,
     ComputeWithPrivilegedSupport,
+    ComputeWithInstanceVolumesSupport,
+    ComputeWithVolumeSupport,
     ComputeWithGatewaySupport,
     ComputeWithMultinodeSupport,
     Compute,
 ):
+    unallocated_resources_argument_has_effect = True
+
     def __init__(self, config: KubernetesConfig):
         super().__init__()
-        self.config = config.copy()
-        proxy_jump = self.config.proxy_jump
-        if proxy_jump is None:
-            proxy_jump = KubernetesProxyJumpConfig()
-        self.proxy_jump = proxy_jump
-        self.api = get_api_from_config_data(config.kubeconfig.data)
+        self.region_cluster_map = {c.region: c for c in get_clusters_from_backend_config(config)}
+        self.skip_offer_cache = RegionalSkipOfferCache(ttl=60)
 
-    def get_offers_by_requirements(
-        self, requirements: Requirements
+    def get_all_offers_with_availability(
+        self, unallocated_resources: bool
     ) -> list[InstanceOfferWithAvailability]:
-        gpu_request = 0
-        if (gpu_spec := requirements.resources.gpu) is not None:
-            gpu_request = _get_gpu_request_from_gpu_spec(gpu_spec)
-        instance_offers: list[InstanceOfferWithAvailability] = []
-        for node in self.api.list_node().items:
-            if (instance_offer := _get_instance_offer_from_node(node, gpu_request)) is not None:
-                instance_offers.extend(
-                    filter_offers_by_requirements([instance_offer], requirements)
-                )
-        return instance_offers
+        offers: list[InstanceOfferWithAvailability] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            future_cluster_map: dict[
+                concurrent.futures.Future[list[InstanceOfferWithAvailability]], Cluster
+            ] = {}
+            for region, cluster in self.region_cluster_map.items():
+                api = client.CoreV1Api(cluster.api_client)
+                future = executor.submit(get_instance_offers, api, region, unallocated_resources)
+                future_cluster_map[future] = cluster
+            for future in concurrent.futures.as_completed(future_cluster_map):
+                try:
+                    cluster_offers = future.result()
+                except API_CLIENT_EXCEPTIONS as e:
+                    logger.warning(
+                        "Failed to get offers from cluster %s: %s: %s",
+                        future_cluster_map[future],
+                        e.__class__.__name__,
+                        e,
+                    )
+                    continue
+                offers.extend(cluster_offers)
+        return offers
+
+    def get_offers_modifiers(
+        self, requirements: Requirements, full_offers: bool
+    ) -> list[OfferModifier]:
+        if full_offers:
+            return []
+        resource_requests = ResourceRequests.from_resources_spec(requirements.resources)
+        return [partial(_offer_modifier, resource_requests)]
 
     def run_job(
         self,
@@ -137,181 +202,174 @@ class KubernetesCompute(
         project_ssh_private_key: str,
         volumes: list[Volume],
         placement_group: Optional[PlacementGroup],
+        requirements: Requirements,
+        extra_authorized_keys: list[str],
     ) -> JobProvisioningData:
-        instance_name = generate_unique_instance_name_for_job(run, job)
-        assert run.run_spec.ssh_key_pub is not None
-        commands = get_docker_commands(
-            [run.run_spec.ssh_key_pub.strip(), project_ssh_public_key.strip()]
-        )
-        # Before running a job, ensure a jump pod service is running.
-        # There is a one jump pod per Kubernetes backend that is used
-        # as an ssh proxy jump to connect to all other services in Kubernetes.
-        # Setup jump pod in a separate thread to avoid long-running run_job.
-        # In case the thread fails, the job will be failed and resubmitted.
-        jump_pod_hostname = self.proxy_jump.hostname
-        if jump_pod_hostname is None:
-            jump_pod_hostname = get_cluster_public_ip(self.api)
-            if jump_pod_hostname is None:
-                raise ComputeError(
-                    "Failed to acquire an IP for jump pod automatically. "
-                    "Specify ssh_host for Kubernetes backend."
-                )
-        jump_pod_port, created = _create_jump_pod_service_if_not_exists(
-            api=self.api,
-            namespace=self.config.namespace,
+        cluster = self.region_cluster_map.get(instance_offer.region)
+        if cluster is None:
+            raise ComputeError(f"Unknown region: {instance_offer.region!r}")
+        if self.skip_offer_cache.check(run, job, instance_offer):
+            raise SkipOffer(f"cluster {cluster} has recently failed to schedule a similar job")
+        api = client.CoreV1Api(cluster.api_client)
+        namespace = cluster.namespace
+
+        # The jump pod, created below only if it does not exist yet, gets the project key alone.
+        # This job's extra keys are added to it later by update_provisioning_data(), which runs
+        # for every job, whether or not the job created the pod. The job pod gets both at once.
+        project_authorized_keys = build_authorized_keys(project_ssh_public_key, [])
+        extra_authorized_keys = normalize_authorized_keys(extra_authorized_keys)
+        authorized_keys = project_authorized_keys + extra_authorized_keys
+
+        # There is one jump pod per project that is used as an ssh proxy jump to connect
+        # to all job pods of the same project.
+        # The service is created here and configured later in update_provisioning_data()
+        jump_pod_name = f"dstack-{run.project_name}-ssh-jump-pod"
+        jump_pod_service_name = _get_pod_service_name(jump_pod_name)
+        _create_jump_pod_service_if_not_exists(
+            api=api,
+            namespace=namespace,
             project_name=run.project_name,
-            ssh_public_keys=[project_ssh_public_key.strip(), run.run_spec.ssh_key_pub.strip()],
-            jump_pod_port=self.proxy_jump.port,
+            jump_pod_name=jump_pod_name,
+            jump_pod_service_name=jump_pod_service_name,
+            jump_pod_port=cluster.proxy_jump.port,
+            authorized_keys=project_authorized_keys,
         )
-        if not created:
-            threading.Thread(
-                target=_continue_setup_jump_pod,
-                kwargs={
-                    "api": self.api,
-                    "namespace": self.config.namespace,
-                    "project_name": run.project_name,
-                    "project_ssh_private_key": project_ssh_private_key.strip(),
-                    "user_ssh_public_key": run.run_spec.ssh_key_pub.strip(),
-                    "jump_pod_host": jump_pod_hostname,
-                    "jump_pod_port": jump_pod_port,
-                },
-            ).start()
 
-        resources_requests: dict[str, str] = {}
-        resources_limits: dict[str, str] = {}
-        node_affinity: Optional[client.V1NodeAffinity] = None
-        tolerations: list[client.V1Toleration] = []
-        volumes_: list[client.V1Volume] = []
-        volume_mounts: list[client.V1VolumeMount] = []
+        pod_name = generate_unique_instance_name_for_job(
+            run, job, max_length=LABEL_VALUE_MAX_LENGTH
+        )
 
-        resources_spec = job.job_spec.requirements.resources
-        assert isinstance(resources_spec.cpu, CPUSpec)
-        if (cpu_min := resources_spec.cpu.count.min) is not None:
-            resources_requests["cpu"] = str(cpu_min)
-        if (cpu_max := resources_spec.cpu.count.max) is not None:
-            resources_limits["cpu"] = str(cpu_max)
-        if (gpu_spec := resources_spec.gpu) is not None:
-            if (gpu_request := _get_gpu_request_from_gpu_spec(gpu_spec)) > 0:
-                gpu_resource, node_affinity, node_taint = _get_pod_spec_parameters_for_gpu(
-                    self.api, gpu_spec
+        base_labels = build_base_labels(
+            component="job",
+            unique_name=pod_name,
+            project=run.project_name,
+            name=job.job_spec.job_name,
+            user=run.user,
+        )
+        labels = merge_tags(
+            base_tags=base_labels,
+            resource_tags=run.run_spec.configuration.tags,
+        )
+        labels = filter_invalid_labels(labels)
+
+        registry_auth_secret_name: Optional[str] = None
+        with ExitStack() as exit_stack:
+            if job.job_spec.registry_auth is not None:
+                registry_auth_secret_name = _get_registry_auth_secret_name(pod_name)
+                _create_registry_auth_secret(
+                    api=api,
+                    namespace=namespace,
+                    labels=labels,
+                    secret_name=registry_auth_secret_name,
+                    image_name=job.job_spec.image_name,
+                    username=job.job_spec.registry_auth.username,
+                    password=job.job_spec.registry_auth.password,
                 )
-                logger.debug("Requesting GPU resource: %s=%d", gpu_resource, gpu_request)
-                resources_requests[gpu_resource] = str(gpu_request)
-                # Limit must be set (GPU resources cannot be overcommitted)
-                # and must be equal to request.
-                resources_limits[gpu_resource] = str(gpu_request)
-                # It should be NoSchedule, but we also add NoExecute toleration just in case.
-                for effect in [TaintEffect.NO_SCHEDULE, TaintEffect.NO_EXECUTE]:
-                    tolerations.append(
-                        client.V1Toleration(
-                            key=node_taint, operator=Operator.EXISTS, effect=effect
-                        )
-                    )
-        if (memory_min := resources_spec.memory.min) is not None:
-            resources_requests["memory"] = _render_memory(memory_min)
-        if (memory_max := resources_spec.memory.max) is not None:
-            resources_limits["memory"] = _render_memory(memory_max)
-        if (disk_spec := resources_spec.disk) is not None:
-            if (disk_min := disk_spec.size.min) is not None:
-                resources_requests["ephemeral-storage"] = _render_memory(disk_min)
-            if (disk_max := disk_spec.size.max) is not None:
-                resources_limits["ephemeral-storage"] = _render_memory(disk_max)
-        if (shm_size := resources_spec.shm_size) is not None:
-            shm_volume_name = "dev-shm"
-            volumes_.append(
-                client.V1Volume(
-                    name=shm_volume_name,
-                    empty_dir=client.V1EmptyDirVolumeSource(
-                        medium="Memory",
-                        size_limit=_render_memory(shm_size),
+                exit_stack.callback(
+                    try_delete_object_if_exists,
+                    api.delete_namespaced_secret,
+                    namespace=namespace,
+                    name=registry_auth_secret_name,
+                    description="registry auth secret",
+                    should_delete_manually_if_failed=True,
+                )
+
+            _create_job_pod(
+                api=api,
+                namespace=namespace,
+                labels=labels,
+                pod_name=pod_name,
+                registry_auth_secret_name=registry_auth_secret_name,
+                run_spec=run.run_spec,
+                job_spec=job.job_spec,
+                volumes=volumes,
+                requirements=requirements,
+                authorized_keys=authorized_keys,
+            )
+            exit_stack.callback(
+                try_delete_object_if_exists,
+                api.delete_namespaced_pod,
+                namespace=namespace,
+                name=pod_name,
+                description="pod",
+                should_delete_manually_if_failed=True,
+            )
+            is_pod_scheduled_or_finished, pod_phase = _wait_for_pod_scheduled_or_finished(
+                api=api,
+                namespace=namespace,
+                pod_name=pod_name,
+                timeout_seconds=JOB_POD_SCHEDULING_TIMEOUT,
+            )
+            if not is_pod_scheduled_or_finished:
+                self.skip_offer_cache.add(run, job, instance_offer)
+                reason, message = _get_unscheduled_pod_reason_message(
+                    api=api,
+                    namespace=namespace,
+                    pod_name=pod_name,
+                )
+                raise ComputeError(
+                    f"Pod {pod_name} was not scheduled:"
+                    f" {reason or 'unknown reason'}: {message or 'no message'}"
+                )
+            if pod_phase is not None and pod_phase.is_finished():
+                # It's not clear if we should add an entry to the SkipOfferCache in this case.
+                raise ComputeError(f"Pod {pod_name} already finished: {pod_phase}")
+
+            pod_service_name = _get_pod_service_name(pod_name)
+            api.create_namespaced_service(
+                namespace=namespace,
+                body=client.V1Service(
+                    metadata=client.V1ObjectMeta(
+                        name=pod_service_name,
+                        labels=labels,
                     ),
-                )
+                    spec=client.V1ServiceSpec(
+                        type="ClusterIP",
+                        selector=_build_service_selector_from_labels(base_labels),
+                        ports=[client.V1ServicePort(port=DSTACK_RUNNER_SSH_PORT)],
+                    ),
+                ),
             )
-            volume_mounts.append(
-                client.V1VolumeMount(
-                    name=shm_volume_name,
-                    mount_path="/dev/shm",
-                )
+            exit_stack.callback(
+                try_delete_object_if_exists,
+                api.delete_namespaced_service,
+                namespace=namespace,
+                name=pod_service_name,
+                description="pod service",
+                should_delete_manually_if_failed=True,
             )
 
-        pod = client.V1Pod(
-            metadata=client.V1ObjectMeta(
-                name=instance_name,
-                labels={"app.kubernetes.io/name": instance_name},
-            ),
-            spec=client.V1PodSpec(
-                containers=[
-                    client.V1Container(
-                        name=f"{instance_name}-container",
-                        image=job.job_spec.image_name,
-                        command=["/bin/sh"],
-                        args=["-c", " && ".join(commands)],
-                        ports=[
-                            client.V1ContainerPort(
-                                container_port=DSTACK_RUNNER_SSH_PORT,
-                            )
-                        ],
-                        security_context=client.V1SecurityContext(
-                            run_as_user=0,
-                            run_as_group=0,
-                            privileged=job.job_spec.privileged,
-                            capabilities=client.V1Capabilities(
-                                add=[
-                                    # Allow to increase hard resource limits, see getrlimit(2)
-                                    "SYS_RESOURCE",
-                                ],
-                            ),
-                        ),
-                        resources=client.V1ResourceRequirements(
-                            requests=resources_requests,
-                            limits=resources_limits,
-                        ),
-                        volume_mounts=volume_mounts,
-                    )
-                ],
-                affinity=client.V1Affinity(
-                    node_affinity=node_affinity,
-                ),
-                tolerations=tolerations,
-                volumes=volumes_,
-            ),
+            # Cancel all cleanup callbacks
+            exit_stack.pop_all()
+
+        backend_data = KubernetesBackendData(
+            jump_pod_name=jump_pod_name,
+            jump_pod_service_name=jump_pod_service_name,
+            extra_authorized_keys=extra_authorized_keys,
+            # For compatibility with server replicas < 0.21.4
+            user_ssh_public_key=next(iter(extra_authorized_keys), ""),
         )
-        self.api.create_namespaced_pod(
-            namespace=self.config.namespace,
-            body=pod,
-        )
-        self.api.create_namespaced_service(
-            namespace=self.config.namespace,
-            body=client.V1Service(
-                metadata=client.V1ObjectMeta(name=_get_pod_service_name(instance_name)),
-                spec=client.V1ServiceSpec(
-                    type="ClusterIP",
-                    selector={"app.kubernetes.io/name": instance_name},
-                    ports=[client.V1ServicePort(port=DSTACK_RUNNER_SSH_PORT)],
-                ),
-            ),
-        )
+
         return JobProvisioningData(
             backend=instance_offer.backend,
-            instance_type=instance_offer.instance,
-            instance_id=instance_name,
-            # Although we can already get Service's ClusterIP from the `V1Service` object returned
-            # by the `create_namespaced_service` method, we still need 1) updated instance offer
-            # 2) PodIP for multinode runs.
-            # We'll update all these fields once the pod is assigned to the node.
-            hostname=None,
-            internal_ip=None,
+            instance_id=pod_name,
             region=instance_offer.region,
             price=instance_offer.price,
             username="root",
             ssh_port=DSTACK_RUNNER_SSH_PORT,
             dockerized=False,
-            ssh_proxy=SSHConnectionParams(
-                hostname=jump_pod_hostname,
-                username="root",
-                port=jump_pod_port,
-            ),
-            backend_data=None,
+            # Although we can already get Service's ClusterIP from the `V1Service` object returned
+            # by the `create_namespaced_service` method, we still need:
+            # - updated instance offer
+            # - job pod's PodIP for multinode runs
+            # - jump pod node's ExternalIP and jump pod service's NodePort for ssh_proxy
+            # We'll update all these fields once both the jump pod and the job pod are assigned
+            # to the nodes.
+            hostname=None,
+            instance_type=instance_offer.instance,
+            internal_ip=None,
+            ssh_proxy=None,
+            backend_data=backend_data.model_dump_json(),
         )
 
     def update_provisioning_data(
@@ -320,9 +378,40 @@ class KubernetesCompute(
         project_ssh_public_key: str,
         project_ssh_private_key: str,
     ):
-        pod = self.api.read_namespaced_pod(
+        cluster = self.region_cluster_map.get(provisioning_data.region)
+        if cluster is None:
+            raise ProvisioningError(f"Unknown region: {provisioning_data.region!r}")
+        api = client.CoreV1Api(cluster.api_client)
+        namespace = cluster.namespace
+
+        if provisioning_data.backend_data is not None:
+            # Before running a job, ensure the jump pod is running and has user's public SSH key.
+            backend_data = KubernetesBackendData.load(provisioning_data.backend_data)
+            extra_authorized_keys = backend_data.extra_authorized_keys
+            # TODO: remove the fallback once servers before 0.21.4 are no longer supported.
+            if not extra_authorized_keys and backend_data.user_ssh_public_key:
+                # Written by a server that predates the `extra_authorized_keys` field.
+                extra_authorized_keys = [backend_data.user_ssh_public_key]
+            ssh_proxy = _check_and_configure_jump_pod_service(
+                api=api,
+                namespace=namespace,
+                jump_pod_name=backend_data.jump_pod_name,
+                jump_pod_service_name=backend_data.jump_pod_service_name,
+                jump_pod_hostname=cluster.proxy_jump.hostname,
+                project_ssh_private_key=project_ssh_private_key,
+                authorized_keys=extra_authorized_keys,
+            )
+            if ssh_proxy is None:
+                # Jump pod is not ready yet
+                return
+            provisioning_data.ssh_proxy = ssh_proxy
+            # Remove backend data to save space in DB and skip this step
+            # in case update_provisioning_data() is called again.
+            provisioning_data.backend_data = None
+
+        pod = api.read_namespaced_pod(
             name=provisioning_data.instance_id,
-            namespace=self.config.namespace,
+            namespace=namespace,
         )
         if pod.status is None:
             return
@@ -330,44 +419,86 @@ class KubernetesCompute(
         if not pod_ip:
             return
         provisioning_data.internal_ip = pod_ip
-        service = self.api.read_namespaced_service(
+        service = api.read_namespaced_service(
             name=_get_pod_service_name(provisioning_data.instance_id),
-            namespace=self.config.namespace,
+            namespace=namespace,
         )
         service_spec = get_or_error(service.spec)
         provisioning_data.hostname = get_or_error(service_spec.cluster_ip)
         pod_spec = get_or_error(pod.spec)
-        node = self.api.read_node(name=get_or_error(pod_spec.node_name))
-        # The original offer has a list of GPUs already sliced according to pod spec's GPU resource
-        # request, which is inferred from dstack's GPUSpec, see _get_gpu_request_from_gpu_spec
-        gpu_request = len(provisioning_data.instance_type.resources.gpus)
-        if (instance_offer := _get_instance_offer_from_node(node, gpu_request)) is not None:
+        node = api.read_node(name=get_or_error(pod_spec.node_name))
+        # TODO: Set provisioning_data.gpu_driver from the node labels:
+        # nvidia.com/cuda.driver-version.full set by GPU Feature Discovery
+        # (or nvidia.com/cuda.driver.{major,minor,rev} set by older GFD versions),
+        # amd.com/gpu.driver-version set by the AMD GPU Operator.
+        instance_offer = get_instance_offer_from_node(node=node, region=cluster.region)
+        if instance_offer is not None:
+            resource_requirements = get_or_error(pod_spec.containers[0].resources)
+            resource_requests = ResourceRequests.from_kubernetes_map(
+                resource_requirements.requests or {}
+            )
+            adjust_resources_by_resource_requests(
+                instance_offer.instance.resources, resource_requests, force=True
+            )
             provisioning_data.instance_type = instance_offer.instance
-            provisioning_data.region = instance_offer.region
             provisioning_data.price = instance_offer.price
 
     def terminate_instance(
         self, instance_id: str, region: str, backend_data: Optional[str] = None
     ):
-        call_api_method(
-            self.api.delete_namespaced_service,
-            expected=404,
-            name=_get_pod_service_name(instance_id),
-            namespace=self.config.namespace,
-            body=client.V1DeleteOptions(),
-        )
-        call_api_method(
-            self.api.delete_namespaced_pod,
-            expected=404,
-            name=instance_id,
-            namespace=self.config.namespace,
-            body=client.V1DeleteOptions(),
-        )
+        cluster = self.region_cluster_map.get(region)
+        if cluster is None and region == "-":
+            # legacy DUMMY_REGION
+            cluster = self.region_cluster_map.get(LEGACY_CURRENT_CONTEXT_REGION)
+            if cluster is not None:
+                logger.warning(
+                    (
+                        "Terminating instance %s in unknown region %s."
+                        " Assuming it was created before multi-cluster support was added"
+                        " and is located in cluster %s"
+                    ),
+                    instance_id,
+                    repr(region),
+                    cluster,
+                )
+        if cluster is None:
+            raise ComputeError(f"Unknown region: {region!r}")
+        api = client.CoreV1Api(cluster.api_client)
+        namespace = cluster.namespace
+        deleted = [
+            try_delete_object_if_exists(
+                api.delete_namespaced_service,
+                namespace=namespace,
+                name=_get_pod_service_name(instance_id),
+                description="pod service",
+            ),
+            try_delete_object_if_exists(
+                api.delete_namespaced_pod,
+                namespace=namespace,
+                name=instance_id,
+                description="pod",
+            ),
+            try_delete_object_if_exists(
+                api.delete_namespaced_secret,
+                namespace=namespace,
+                name=_get_registry_auth_secret_name(instance_id),
+                description="registry auth secret",
+            ),
+        ]
+        if not all(deleted):
+            raise ComputeError("Not all objects were deleted, check logs")
 
-    def create_gateway(
+    def create_gateway_replica(
         self,
-        configuration: GatewayComputeConfiguration,
-    ) -> GatewayProvisioningData:
+        configuration: GatewayReplicaConfiguration,
+        gateway_backend_data: Optional[str] = None,
+    ) -> GatewayReplicaProvisioningData:
+        cluster = self.region_cluster_map.get(configuration.region)
+        if cluster is None:
+            raise ComputeError(f"Unknown region: {configuration.region!r}")
+        api = client.CoreV1Api(cluster.api_client)
+        namespace = cluster.namespace
+
         # Gateway creation is currently limited to Kubernetes with Load Balancer support.
         # If the cluster does not support Load Balancer, the service will be provisioned but
         # the external IP/hostname will never be allocated.
@@ -380,14 +511,28 @@ class KubernetesCompute(
                 "The `kubernetes` backend does not support the `instance_type`"
                 " gateway configuration property"
             )
-        instance_name = generate_unique_gateway_instance_name(configuration)
-        commands = _get_gateway_commands(
-            authorized_keys=[configuration.ssh_key_pub], router=configuration.router
+
+        instance_name = generate_unique_gateway_instance_name(
+            configuration, max_length=LABEL_VALUE_MAX_LENGTH
         )
+
+        base_labels = build_base_labels(
+            component="gateway",
+            unique_name=instance_name,
+            project=configuration.project_name,
+            name=configuration.instance_name,
+        )
+        labels = merge_tags(
+            base_tags=base_labels,
+            resource_tags=configuration.tags,
+        )
+        labels = filter_invalid_labels(labels)
+
+        commands = _get_gateway_commands(authorized_keys=[configuration.ssh_key_pub])
         pod = client.V1Pod(
             metadata=client.V1ObjectMeta(
                 name=instance_name,
-                labels={"app.kubernetes.io/name": instance_name},
+                labels=labels,
             ),
             spec=client.V1PodSpec(
                 containers=[
@@ -415,17 +560,18 @@ class KubernetesCompute(
                 ]
             ),
         )
-        self.api.create_namespaced_pod(
-            namespace=self.config.namespace,
+        api.create_namespaced_pod(
+            namespace=namespace,
             body=pod,
         )
         service = client.V1Service(
             metadata=client.V1ObjectMeta(
                 name=_get_pod_service_name(instance_name),
+                labels=labels,
             ),
             spec=client.V1ServiceSpec(
                 type="LoadBalancer",
-                selector={"app.kubernetes.io/name": instance_name},
+                selector=_build_service_selector_from_labels(base_labels),
                 ports=[
                     client.V1ServicePort(
                         name="ssh",
@@ -445,185 +591,188 @@ class KubernetesCompute(
                 ],
             ),
         )
-        self.api.create_namespaced_service(
-            namespace=self.config.namespace,
+        api.create_namespaced_service(
+            namespace=namespace,
             body=service,
         )
         # address is eiher a domain name or an IP address
         address = _wait_for_load_balancer_address(
-            api=self.api,
-            namespace=self.config.namespace,
+            api=api,
+            namespace=namespace,
             service_name=_get_pod_service_name(instance_name),
         )
-        region = DUMMY_REGION
         if address is None:
-            self.terminate_instance(instance_name, region=region)
+            self.terminate_instance(instance_name, region=configuration.region)
             raise ComputeError(
-                "Failed to get gateway hostname. "
+                "Failed to get gateway replica hostname. "
                 "Ensure the Kubernetes cluster supports Load Balancer services."
             )
-        return GatewayProvisioningData(
+        return GatewayReplicaProvisioningData(
             instance_id=instance_name,
             ip_address=address,
-            region=region,
+            region=cluster.region,
         )
 
-    def terminate_gateway(
+    def terminate_gateway_replica(
         self,
         instance_id: str,
-        configuration: GatewayComputeConfiguration,
+        configuration: GatewayReplicaConfiguration,
         backend_data: Optional[str] = None,
     ):
+        region = configuration.region
+        cluster = self.region_cluster_map.get(region)
+        if cluster is None:
+            # It may be a legacy configuration with the region set to an arbitrary value
+            cluster = self.region_cluster_map.get(LEGACY_CURRENT_CONTEXT_REGION)
+            if cluster is not None:
+                logger.warning(
+                    (
+                        "Terminating gateway replica %s in unknown region %s."
+                        " Assuming it was created before multi-cluster support was added"
+                        " and is located in cluster %s"
+                    ),
+                    instance_id,
+                    repr(region),
+                    cluster,
+                )
+                region = LEGACY_CURRENT_CONTEXT_REGION
+            else:
+                raise ComputeError(f"Unknown region: {region!r}")
         self.terminate_instance(
             instance_id=instance_id,
-            region=configuration.region,
+            region=region,
             backend_data=backend_data,
         )
 
+    def register_volume(self, volume: Volume) -> VolumeProvisioningData:
+        assert isinstance(volume.configuration, KubernetesVolumeConfiguration)
 
-def _get_gpu_request_from_gpu_spec(gpu_spec: GPUSpec) -> int:
-    return gpu_spec.count.min or 0
+        region = volume.configuration.region
+        cluster = self.region_cluster_map.get(region)
+        if cluster is None:
+            if region == "":
+                raise ComputeError("region is not set")
+            raise ComputeError(f"Unknown region: {region!r}")
+        api = client.CoreV1Api(cluster.api_client)
+        namespace = cluster.namespace
 
+        pvc_name = volume.configuration.claim_name
+        assert pvc_name is not None
 
-def _get_instance_offer_from_node(
-    node: client.V1Node, gpu_request: int
-) -> Optional[InstanceOfferWithAvailability]:
-    try:
-        node_name = get_or_error(get_or_error(node.metadata).name)
-        node_status = get_or_error(node.status)
-        allocatable = get_or_error(node_status.allocatable)
-        _cpu_arch: Optional[str] = None
-        if node_status.node_info is not None:
-            _cpu_arch = node_status.node_info.architecture
-        cpu_arch = normalize_arch(_cpu_arch).to_cpu_architecture()
-        cpus = _parse_cpu(allocatable["cpu"])
-        memory_mib = _parse_memory(allocatable["memory"])
-        disk_size_mib = _parse_memory(allocatable["ephemeral-storage"])
-        gpus = _get_node_gpus(node)
-    except (ValueError, KeyError) as e:
-        logger.exception("Failed to process node: %s: %s", type(e).__name__, e)
-        return None
-    return InstanceOfferWithAvailability(
-        backend=BackendType.KUBERNETES,
-        instance=InstanceType(
-            name=node_name,
-            resources=Resources(
-                cpus=cpus,
-                cpu_arch=cpu_arch,
-                memory_mib=memory_mib,
-                gpus=gpus[:gpu_request],
-                spot=False,
-                disk=Disk(size_mib=disk_size_mib),
+        pvc = call_api_method(
+            api.read_namespaced_persistent_volume_claim,
+            expected=404,
+            namespace=namespace,
+            name=pvc_name,
+        )
+        if pvc is None:
+            raise ComputeError(f"PersistentVolumeClaim {pvc_name} not found")
+
+        capacity_bytes: Optional[Decimal] = None
+        if pvc.status is not None:
+            actual_capacity_qty = (pvc.status.capacity or {}).get("storage")
+            if actual_capacity_qty is not None:
+                capacity_bytes = parse_quantity(actual_capacity_qty)
+        if capacity_bytes is None and pvc.spec is not None and pvc.spec.resources is not None:
+            requested_capacity_qty = (pvc.spec.resources.requests or {}).get("storage")
+            if requested_capacity_qty is not None:
+                capacity_bytes = parse_quantity(requested_capacity_qty)
+        if capacity_bytes is None:
+            raise ComputeError(f"Failed to detect PersistentVolumeClaim {pvc_name} capacity")
+
+        return VolumeProvisioningData(
+            backend=BackendType.KUBERNETES,
+            volume_id=pvc_name,
+            size_gb=int(capacity_bytes // 2**30),
+            attachable=False,
+            detachable=False,
+        )
+
+    def create_volume(self, volume: Volume) -> VolumeProvisioningData:
+        assert isinstance(volume.configuration, KubernetesVolumeConfiguration)
+        assert volume.configuration.size is not None
+
+        region = volume.configuration.region
+        cluster = self.region_cluster_map.get(region)
+        if cluster is None:
+            if region == "":
+                raise ComputeError("region is not set")
+            raise ComputeError(f"Unknown region: {region!r}")
+        api = client.CoreV1Api(cluster.api_client)
+        namespace = cluster.namespace
+
+        pvc_name = generate_unique_volume_name(volume, max_length=LABEL_VALUE_MAX_LENGTH)
+
+        base_labels = build_base_labels(
+            component="volume",
+            unique_name=pvc_name,
+            project=volume.project_name,
+            name=volume.name,
+            user=volume.user,
+        )
+        labels = merge_tags(
+            base_tags=base_labels,
+            resource_tags=volume.configuration.tags,
+        )
+        labels = filter_invalid_labels(labels)
+
+        pvc = client.V1PersistentVolumeClaim(
+            metadata=client.V1ObjectMeta(
+                name=pvc_name,
+                labels=labels,
             ),
-        ),
-        price=0,
-        region=DUMMY_REGION,
-        availability=InstanceAvailability.AVAILABLE,
-        instance_runtime=InstanceRuntime.RUNNER,
-    )
+            spec=client.V1PersistentVolumeClaimSpec(
+                access_modes=volume.configuration.access_modes,
+                storage_class_name=volume.configuration.storage_class_name,
+                resources=client.V1VolumeResourceRequirements(
+                    requests={
+                        "storage": format_memory(volume.configuration.size),
+                    },
+                ),
+            ),
+        )
+        api.create_namespaced_persistent_volume_claim(
+            namespace=namespace,
+            body=pvc,
+        )
+        logger.debug("Created PVC %s for volume %s", pvc_name, volume.name)
 
+        return VolumeProvisioningData(
+            backend=BackendType.KUBERNETES,
+            volume_id=pvc_name,
+            size_gb=volume.configuration.size_gb,
+            attachable=False,
+            detachable=False,
+        )
 
-def _parse_cpu(cpu: str) -> int:
-    if cpu.endswith("m"):
-        # "m" means millicpu (1/1000 CPU), e.g., 7900m -> 7.9 -> 7
-        return int(float(cpu[:-1]) / 1000)
-    return int(cpu)
+    def delete_volume(self, volume: Volume):
+        assert isinstance(volume.configuration, KubernetesVolumeConfiguration)
 
+        region = volume.configuration.region
+        cluster = self.region_cluster_map.get(region)
+        if cluster is None:
+            raise ComputeError(f"Unknown region: {region!r}")
+        api = client.CoreV1Api(cluster.api_client)
+        namespace = cluster.namespace
 
-def _parse_memory(memory: str) -> int:
-    if memory.isdigit():
-        # no suffix means that the value is in bytes
-        return int(memory) // 2**20
-    return int(parse_memory(memory, as_untis="M"))
+        pvc_name = volume.volume_id
+        assert pvc_name is not None
 
-
-def _render_memory(memory: Memory) -> str:
-    return f"{float(memory)}Gi"
-
-
-def _get_node_labels(node: client.V1Node) -> dict[str, str]:
-    if (metadata := node.metadata) is None:
-        return {}
-    if (labels := metadata.labels) is None:
-        return {}
-    return labels
-
-
-def _get_node_gpus(node: client.V1Node) -> list[Gpu]:
-    node_name = get_or_error(get_or_error(node.metadata).name)
-    allocatable = get_or_error(get_or_error(node.status).allocatable)
-    labels = _get_node_labels(node)
-    for gpu_resource, gpu_getter in (
-        (NVIDIA_GPU_RESOURCE, _get_nvidia_gpu_from_node_labels),
-        (AMD_GPU_RESOURCE, _get_amd_gpu_from_node_labels),
-    ):
-        _gpu_count = allocatable.get(gpu_resource)
-        if not _gpu_count:
-            continue
-        gpu_count = int(_gpu_count)
-        if gpu_count < 1:
-            continue
-        gpu = gpu_getter(labels)
-        if gpu is None:
-            logger.warning(
-                "Node %s: GPU resource found, but failed to detect its model: %s=%d",
-                node_name,
-                gpu_resource,
-                gpu_count,
-            )
-            return []
-        return [gpu] * gpu_count
-    logger.debug("Node %s: no GPU resource found", node_name)
-    return []
-
-
-def _get_nvidia_gpu_from_node_labels(labels: dict[str, str]) -> Optional[Gpu]:
-    # We rely on https://github.com/NVIDIA/k8s-device-plugin/tree/main/docs/gpu-feature-discovery
-    # to detect gpus. Note that "nvidia.com/gpu.product" is not a short gpu name like "T4" or
-    # "A100" but a product name like "Tesla-T4" or "A100-SXM4-40GB".
-    # Thus, we convert the product name to a known gpu name.
-    gpu_product = labels.get(NVIDIA_GPU_PRODUCT_LABEL)
-    if gpu_product is None:
-        return None
-    gpu_product = gpu_product.replace("RTX-", "RTX")
-    for gpu_name in NVIDIA_GPU_NAMES:
-        if gpu_name.lower() in gpu_product.lower().split("-"):
-            break
-    else:
-        return None
-    gpu_info = NVIDIA_GPU_NAME_TO_GPU_INFO[gpu_name]
-    gpu_memory = gpu_info.memory * 1024
-    # A100 may come in two variants
-    if "40GB" in gpu_product:
-        gpu_memory = 40 * 1024
-    return Gpu(vendor=AcceleratorVendor.NVIDIA, name=gpu_name, memory_mib=gpu_memory)
-
-
-def _get_amd_gpu_from_node_labels(labels: dict[str, str]) -> Optional[Gpu]:
-    # (AMDGPUInfo.name, AMDGPUInfo.memory) pairs
-    gpus: set[tuple[str, int]] = set()
-    for label in labels:
-        if not label.startswith(AMD_GPU_DEVICE_ID_LABEL_PREFIX):
-            continue
-        _, _, _device_id = label.rpartition(".")
-        device_id = int(_device_id, 16)
-        gpu_info = AMD_GPU_DEVICE_ID_TO_GPU_INFO.get(device_id)
-        if gpu_info is None:
-            logger.warning("Unknown AMD GPU device id: %X", device_id)
-            continue
-        gpus.add((gpu_info.name, gpu_info.memory))
-    if not gpus:
-        return None
-    if len(gpus) == 1:
-        gpu_name, gpu_memory_gib = next(iter(gpus))
-        return Gpu(vendor=AcceleratorVendor.AMD, name=gpu_name, memory_mib=gpu_memory_gib * 1024)
-    logger.warning("Multiple AMD GPU models detected: %s, ignoring all GPUs", gpus)
-    return None
+        pvc = call_api_method(
+            api.delete_namespaced_persistent_volume_claim,
+            expected=404,
+            namespace=namespace,
+            name=pvc_name,
+        )
+        if pvc is None:
+            logger.debug("PVC %s for volume %s not found", pvc_name, volume.name)
+        else:
+            logger.debug("Deleted PVC %s for volume %s", pvc_name, volume.name)
 
 
 def _get_pod_spec_parameters_for_gpu(
     api: client.CoreV1Api, gpu_spec: GPUSpec
-) -> tuple[str, client.V1NodeAffinity, str]:
+) -> tuple[AnyKubernetesGPUResource, client.V1NodeAffinity, str]:
     nodes = api.list_node().items
     gpu_vendor = gpu_spec.vendor
     # If no vendor specified, we assume it's NVIDIA. Technically, it's possible to request either
@@ -631,10 +780,10 @@ def _get_pod_spec_parameters_for_gpu(
     # but we ignore such configurations as it's hard to translate them to K8s request.
     if gpu_vendor is None or gpu_vendor == AcceleratorVendor.NVIDIA:
         node_affinity = _get_nvidia_gpu_node_affinity(gpu_spec, nodes)
-        return NVIDIA_GPU_RESOURCE, node_affinity, NVIDIA_GPU_NODE_TAINT
+        return KubernetesResource.NVIDIA_GPU, node_affinity, NVIDIA_GPU_NODE_TAINT
     if gpu_vendor == AcceleratorVendor.AMD:
         node_affinity = _get_amd_gpu_node_affinity(gpu_spec, nodes)
-        return AMD_GPU_RESOURCE, node_affinity, AMD_GPU_NODE_TAINT
+        return KubernetesResource.AMD_GPU, node_affinity, AMD_GPU_NODE_TAINT
     raise ComputeError(f"Unsupported GPU vendor: {gpu_vendor}")
 
 
@@ -643,9 +792,9 @@ def _get_nvidia_gpu_node_affinity(
 ) -> client.V1NodeAffinity:
     matching_gpu_label_values: set[str] = set()
     for node in nodes:
-        labels = _get_node_labels(node)
-        gpu = _get_nvidia_gpu_from_node_labels(labels)
-        if gpu is not None and _gpu_matches_gpu_spec(gpu, gpu_spec):
+        labels = get_node_labels(node)
+        gpu = get_nvidia_gpu_from_node_labels(labels)
+        if gpu is not None and gpu_matches_gpu_spec(gpu, gpu_spec):
             matching_gpu_label_values.add(labels[NVIDIA_GPU_PRODUCT_LABEL])
     if not matching_gpu_label_values:
         raise ComputeError(
@@ -676,9 +825,9 @@ def _get_amd_gpu_node_affinity(
 ) -> client.V1NodeAffinity:
     matching_device_ids: set[int] = set()
     for node in nodes:
-        labels = _get_node_labels(node)
-        gpu = _get_amd_gpu_from_node_labels(labels)
-        if gpu is not None and _gpu_matches_gpu_spec(gpu, gpu_spec):
+        labels = get_node_labels(node)
+        gpu = get_amd_gpu_from_node_labels(labels)
+        if gpu is not None and gpu_matches_gpu_spec(gpu, gpu_spec):
             matching_device_ids.update(AMD_GPU_NAME_TO_DEVICE_IDS[gpu.name])
     return client.V1NodeAffinity(
         required_during_scheduling_ignored_during_execution=client.V1NodeSelector(
@@ -697,59 +846,30 @@ def _get_amd_gpu_node_affinity(
     )
 
 
-def _gpu_matches_gpu_spec(gpu: Gpu, gpu_spec: GPUSpec) -> bool:
-    if gpu_spec.vendor is not None and gpu.vendor != gpu_spec.vendor:
-        return False
-    if gpu_spec.name is not None and gpu.name.lower() not in map(str.lower, gpu_spec.name):
-        return False
-    if gpu_spec.memory is not None:
-        min_memory_gib = gpu_spec.memory.min
-        if min_memory_gib is not None and gpu.memory_mib < min_memory_gib * 1024:
-            return False
-        max_memory_gib = gpu_spec.memory.max
-        if max_memory_gib is not None and gpu.memory_mib > max_memory_gib * 1024:
-            return False
-    if gpu_spec.compute_capability is not None:
-        if gpu.vendor != AcceleratorVendor.NVIDIA:
-            return False
-        gpu_info = NVIDIA_GPU_NAME_TO_GPU_INFO.get(gpu.name)
-        if gpu_info is None:
-            return False
-        if gpu_info.compute_capability < gpu_spec.compute_capability:
-            return False
-    return True
-
-
-def _continue_setup_jump_pod(
-    api: client.CoreV1Api,
-    namespace: str,
-    project_name: str,
-    project_ssh_private_key: str,
-    user_ssh_public_key: str,
-    jump_pod_host: str,
-    jump_pod_port: int,
-):
-    _wait_for_pod_ready(
-        api=api,
-        namespace=namespace,
-        pod_name=_get_jump_pod_name(project_name),
-    )
-    _add_authorized_key_to_jump_pod(
-        jump_pod_host=jump_pod_host,
-        jump_pod_port=jump_pod_port,
-        ssh_private_key=project_ssh_private_key,
-        ssh_authorized_key=user_ssh_public_key,
-    )
+def _offer_modifier(
+    resource_requests: ResourceRequests, offer: InstanceOfferWithAvailability
+) -> InstanceOfferWithAvailability:
+    offer_copy = offer.model_copy(deep=True)
+    adjust_resources_by_resource_requests(offer_copy.instance.resources, resource_requests)
+    return offer_copy
 
 
 def _create_jump_pod_service_if_not_exists(
     api: client.CoreV1Api,
     namespace: str,
     project_name: str,
-    ssh_public_keys: list[str],
+    jump_pod_name: str,
+    jump_pod_service_name: str,
     jump_pod_port: Optional[int],
-) -> tuple[int, bool]:
-    created = False
+    authorized_keys: list[str],
+) -> None:
+    base_labels = build_base_labels(
+        component="ssh-proxy",
+        unique_name=jump_pod_name,
+        project=project_name,
+    )
+    labels = filter_invalid_labels(base_labels)
+
     service: Optional[client.V1Service] = None
     pod: Optional[client.V1Pod] = None
     _namespace = call_api_method(
@@ -761,7 +881,6 @@ def _create_jump_pod_service_if_not_exists(
         _namespace = client.V1Namespace(
             metadata=client.V1ObjectMeta(
                 name=namespace,
-                labels={"app.kubernetes.io/name": namespace},
             ),
         )
         api.create_namespace(body=_namespace)
@@ -769,52 +888,27 @@ def _create_jump_pod_service_if_not_exists(
         service = call_api_method(
             api.read_namespaced_service,
             expected=404,
-            name=_get_jump_pod_service_name(project_name),
+            name=jump_pod_service_name,
             namespace=namespace,
         )
         pod = call_api_method(
             api.read_namespaced_pod,
             expected=404,
-            name=_get_jump_pod_name(project_name),
+            name=jump_pod_name,
             namespace=namespace,
         )
+
     # The service may exist without the pod if the node on which the jump pod was running
     # has been deleted.
-    if service is None or pod is None:
-        service = _create_jump_pod_service(
-            api=api,
-            namespace=namespace,
-            project_name=project_name,
-            ssh_public_keys=ssh_public_keys,
-            jump_pod_port=jump_pod_port,
-        )
-        created = True
-    port: Optional[int] = None
-    if service.spec is not None and service.spec.ports:
-        port = service.spec.ports[0].node_port
-    if port is None:
-        raise ComputeError(
-            f"Failed to get NodePort of jump pod Service for project '{project_name}'"
-        )
-    return port, created
+    if service is not None and pod is not None:
+        return
 
-
-def _create_jump_pod_service(
-    api: client.CoreV1Api,
-    namespace: str,
-    project_name: str,
-    ssh_public_keys: list[str],
-    jump_pod_port: Optional[int],
-) -> client.V1Service:
-    # TODO use restricted ssh-forwarding-only user for jump pod instead of root.
-    pod_name = _get_jump_pod_name(project_name)
     call_api_method(
         api.delete_namespaced_pod,
         expected=404,
         namespace=namespace,
-        name=pod_name,
+        name=jump_pod_name,
     )
-
     # False if we found at least one node without any "hard" taint, that is, if we don't need to
     # specify the toleration.
     toleration_required = True
@@ -828,10 +922,10 @@ def _create_jump_pod_service(
         taints = node_spec.taints or []
         for taint in taints:
             # A "soft" taint, ignore.
-            if taint.effect == TaintEffect.PREFER_NO_SCHEDULE:
+            if not is_hard_taint(taint):
                 continue
             has_hard_taint = True
-            if taint.key in TOLERATED_NODE_TAINTS:
+            if is_taint_tolerated(taint):
                 tolerated_taints.add((taint.key, taint.effect))
         if not has_hard_taint:
             toleration_required = False
@@ -844,17 +938,16 @@ def _create_jump_pod_service(
             )
         if not tolerations:
             logger.warning("No appropriate node found, the jump pod may never be scheduled")
-
-    commands = _get_jump_pod_commands(authorized_keys=ssh_public_keys)
+    commands = _get_jump_pod_commands(authorized_keys)
     pod = client.V1Pod(
         metadata=client.V1ObjectMeta(
-            name=pod_name,
-            labels={"app.kubernetes.io/name": pod_name},
+            name=jump_pod_name,
+            labels=labels,
         ),
         spec=client.V1PodSpec(
             containers=[
                 client.V1Container(
-                    name=f"{pod_name}-container",
+                    name=f"{jump_pod_name}-container",
                     image=JUMP_POD_IMAGE,
                     command=["/bin/sh"],
                     args=["-c", " && ".join(commands)],
@@ -872,18 +965,20 @@ def _create_jump_pod_service(
         namespace=namespace,
         body=pod,
     )
-    service_name = _get_jump_pod_service_name(project_name)
     call_api_method(
         api.delete_namespaced_service,
         expected=404,
         namespace=namespace,
-        name=service_name,
+        name=jump_pod_service_name,
     )
     service = client.V1Service(
-        metadata=client.V1ObjectMeta(name=service_name),
+        metadata=client.V1ObjectMeta(
+            name=jump_pod_service_name,
+            labels=labels,
+        ),
         spec=client.V1ServiceSpec(
             type="NodePort",
-            selector={"app.kubernetes.io/name": pod_name},
+            selector=_build_service_selector_from_labels(base_labels),
             ports=[
                 client.V1ServicePort(
                     port=JUMP_POD_SSH_PORT,
@@ -893,18 +988,124 @@ def _create_jump_pod_service(
             ],
         ),
     )
-    return api.create_namespaced_service(
+    api.create_namespaced_service(
         namespace=namespace,
         body=service,
     )
 
 
+def _check_and_configure_jump_pod_service(
+    api: client.CoreV1Api,
+    namespace: str,
+    jump_pod_name: str,
+    jump_pod_service_name: str,
+    jump_pod_hostname: Optional[str],
+    project_ssh_private_key: str,
+    authorized_keys: list[str],
+) -> Optional[SSHConnectionParams]:
+    jump_pod = api.read_namespaced_pod(
+        namespace=namespace,
+        name=jump_pod_name,
+    )
+    jump_pod_phase = PodPhase(get_or_error(get_or_error(jump_pod.status).phase))
+    if jump_pod_phase.is_finished():
+        raise ProvisioningError(f"Jump pod {jump_pod_name} is unexpectedly finished")
+    if not jump_pod_phase.is_running():
+        logger.debug("Jump pod %s is not running yet", jump_pod_name)
+        return None
+
+    if jump_pod_hostname is None:
+        jump_pod_node_name = get_or_error(get_or_error(jump_pod.spec).node_name)
+        cluster_external_ips: list[str] = []
+        for node in api.list_node().items:
+            node_external_ips = [
+                node_address.address
+                for node_address in get_or_error(get_or_error(node.status).addresses)
+                if node_address.type == "ExternalIP"
+            ]
+            if node_external_ips:
+                if get_node_name(node) == jump_pod_node_name:
+                    jump_pod_hostname = node_external_ips[0]
+                    break
+                cluster_external_ips.extend(node_external_ips)
+        if jump_pod_hostname is None:
+            if not cluster_external_ips:
+                raise ProvisioningError(
+                    "Failed to acquire an IP for jump pod automatically."
+                    " Specify proxy_jump.hostname for Kubernetes backend."
+                )
+            jump_pod_hostname = random.choice(cluster_external_ips)
+            logger.info(
+                (
+                    "Jump pod %s is running on node %s which has no external IP,"
+                    " picking a random external IP: %s"
+                ),
+                jump_pod_name,
+                jump_pod_node_name,
+                jump_pod_hostname,
+            )
+
+    jump_pod_service = api.read_namespaced_service(
+        name=jump_pod_service_name,
+        namespace=namespace,
+    )
+    jump_pod_service_ports = get_or_error(jump_pod_service.spec).ports
+    if not jump_pod_service_ports:
+        raise ProvisioningError("Jump pod service %s ports are empty", jump_pod_service_name)
+    if (jump_pod_port := jump_pod_service_ports[0].node_port) is None:
+        raise ProvisioningError("Jump pod service %s port is not set", jump_pod_service_name)
+
+    if authorized_keys:
+        command = get_add_authorized_keys_script(
+            authorized_keys,
+            # The project key, written by _get_jump_pod_commands(), carries no marker, and
+            # marking only some of our entries defeats the purpose of the marker. It is
+            # redundant on the jump pod anyway -- every entry there is ours
+            add_dstack_marker=False,
+            # command= in authorized_keys is equivalent to ForceCommand in sshd_config
+            # By forcing the /bin/false command we only allow proxy jumping, no shell access
+            options='command="/bin/false"',
+        )
+    else:
+        # No keys to add, but the connection itself is still the check that sshd is up
+        command = "true"
+    ssh_exit_status, ssh_output = _run_ssh_command(
+        hostname=jump_pod_hostname,
+        port=jump_pod_port,
+        username=JUMP_POD_USER,
+        ssh_private_key=project_ssh_private_key,
+        command=command,
+    )
+    if ssh_exit_status != 0:
+        logger.debug(
+            "Jump pod %s @ %s:%d, SSH command failed, exit status: %d, output: %s",
+            jump_pod_name,
+            jump_pod_hostname,
+            jump_pod_port,
+            ssh_exit_status,
+            ssh_output,
+        )
+        return None
+
+    logger.debug(
+        "Jump pod %s is available @ %s:%d",
+        jump_pod_name,
+        jump_pod_hostname,
+        jump_pod_port,
+    )
+    return SSHConnectionParams(
+        hostname=jump_pod_hostname,
+        port=jump_pod_port,
+        username=JUMP_POD_USER,
+    )
+
+
 def _get_jump_pod_commands(authorized_keys: list[str]) -> list[str]:
-    authorized_keys_content = "\n".join(authorized_keys).strip()
+    authorized_keys_content = "\n".join(authorized_keys)
     commands = [
         "mkdir -p ~/.ssh",
         "chmod 700 ~/.ssh",
-        f"echo '{authorized_keys_content}' > ~/.ssh/authorized_keys",
+        f"echo {shlex.quote(authorized_keys_content)} > ~/.ssh/authorized_keys",
         "chmod 600 ~/.ssh/authorized_keys",
         # regenerate host keys
         "rm -rf /etc/ssh/ssh_host_*",
@@ -915,38 +1116,260 @@ def _get_jump_pod_commands(authorized_keys: list[str]) -> list[str]:
             " -o LogLevel=ERROR"
             " -o PasswordAuthentication=no"
             " -o AllowTcpForwarding=local"
-            # proxy jumping only, no shell access
-            " -o ForceCommand=/bin/false"
         ),
     ]
     return commands
 
 
-def _wait_for_pod_ready(
+def _create_registry_auth_secret(
+    api: client.CoreV1Api,
+    namespace: str,
+    labels: dict[str, str],
+    secret_name: str,
+    image_name: str,
+    username: str,
+    password: str,
+) -> None:
+    dockerconfigjson = build_dockerconfigjson(
+        image_name=image_name,
+        username=username,
+        password=password,
+    )
+    secret = client.V1Secret(
+        metadata=client.V1ObjectMeta(
+            name=secret_name,
+            labels=labels,
+        ),
+        type="kubernetes.io/dockerconfigjson",
+        string_data={".dockerconfigjson": dockerconfigjson},
+    )
+    api.create_namespaced_secret(
+        namespace=namespace,
+        body=secret,
+    )
+
+
+def _create_job_pod(
+    api: client.CoreV1Api,
+    namespace: str,
+    labels: dict[str, str],
+    pod_name: str,
+    registry_auth_secret_name: Optional[str],
+    run_spec: RunSpec,
+    job_spec: JobSpec,
+    volumes: list[Volume],
+    requirements: Requirements,
+    authorized_keys: list[str],
+) -> None:
+    node_affinity: Optional[client.V1NodeAffinity] = None
+    tolerations: list[client.V1Toleration] = []
+    volumes_: list[client.V1Volume] = []
+    volume_mounts: list[client.V1VolumeMount] = []
+    env_vars: list[client.V1EnvVar] = []
+
+    resources_spec = requirements.resources
+    resource_requests = ResourceRequests.from_resources_spec(resources_spec)
+    resource_limits = ResourceLimits.from_resources_spec(resources_spec)
+    gpu_resource: Optional[AnyKubernetesGPUResource] = None
+    if resource_requests.gpu > 0:
+        gpu_spec = resources_spec.gpu
+        assert gpu_spec is not None
+        gpu_resource, node_affinity, node_taint = _get_pod_spec_parameters_for_gpu(api, gpu_spec)
+        logger.debug("Requesting GPU resource: %s=%d", gpu_resource, resource_requests.gpu)
+        # It should be NoSchedule, but we also add NoExecute toleration just in case.
+        for effect in [TaintEffect.NO_SCHEDULE, TaintEffect.NO_EXECUTE]:
+            tolerations.append(
+                client.V1Toleration(key=node_taint, operator=Operator.EXISTS, effect=effect)
+            )
+    else:
+        # Prevents GPU allocation if NVIDIA_VISIBLE_DEVICES with a value such as "all" is baked
+        # into the image (NVIDIA images and images based on them including dstackai/base)
+        # See https://github.com/NVIDIA/k8s-device-plugin/issues/61
+        env_vars.append(client.V1EnvVar(name="NVIDIA_VISIBLE_DEVICES", value="void"))
+    if (shm_size := resources_spec.shm_size) is not None:
+        shm_volume_name = "dev-shm"
+        volumes_.append(
+            client.V1Volume(
+                name=shm_volume_name,
+                empty_dir=client.V1EmptyDirVolumeSource(
+                    medium="Memory",
+                    size_limit=format_memory(shm_size),
+                ),
+            )
+        )
+        volume_mounts.append(
+            client.V1VolumeMount(
+                name=shm_volume_name,
+                mount_path="/dev/shm",
+            )
+        )
+
+    volume_name_path_map: dict[str, str] = {}
+    mount_points = job_spec.volumes
+    if mount_points is None:
+        # Legacy JobSpec without volumes
+        mount_points = run_spec.configuration.volumes
+    for mount_point in mount_points:
+        if isinstance(mount_point, VolumeMountPoint):
+            if isinstance(mount_point.name, str):
+                volume_names = [mount_point.name]
+            else:
+                volume_names = mount_point.name
+            for volume_name in volume_names:
+                volume_name_path_map[volume_name] = mount_point.path
+        elif isinstance(mount_point, InstanceMountPoint):
+            # "Must be a DNS_LABEL and unique within the pod"
+            volume_name = generate_unique_name(
+                prefix="host-path", max_length=OBJECT_NAME_MAX_LENGTH
+            )
+            volumes_.append(
+                client.V1Volume(
+                    name=volume_name,
+                    host_path=client.V1HostPathVolumeSource(
+                        path=mount_point.instance_path,
+                        type="DirectoryOrCreate",
+                    ),
+                ),
+            )
+            volume_mounts.append(
+                client.V1VolumeMount(
+                    name=volume_name,
+                    mount_path=mount_point.path,
+                )
+            )
+        else:
+            assert False, f"unexpected mount point: {mount_point!r}"
+    for volume in volumes:
+        assert isinstance(volume.configuration, KubernetesVolumeConfiguration)
+        pvc_name = volume.volume_id
+        assert pvc_name is not None, f"missing PVC name: {volume!r}"
+        mount_path = volume_name_path_map.get(volume.name)
+        assert mount_path is not None, f"missing mount path: {volume!r}"
+        volume_name = generate_unique_name(prefix="pvc", max_length=OBJECT_NAME_MAX_LENGTH)
+        volumes_.append(
+            client.V1Volume(
+                name=volume_name,
+                persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                    claim_name=pvc_name,
+                ),
+            ),
+        )
+        volume_mounts.append(
+            client.V1VolumeMount(
+                name=volume_name,
+                mount_path=mount_path,
+                read_only=volume.configuration.read_only,
+                recursive_read_only="IfPossible" if volume.configuration.read_only else None,
+            )
+        )
+
+    pod = client.V1Pod(
+        metadata=client.V1ObjectMeta(
+            name=pod_name,
+            labels=labels,
+        ),
+        spec=client.V1PodSpec(
+            containers=[
+                client.V1Container(
+                    name=f"{pod_name}-container",
+                    image=job_spec.image_name,
+                    command=["/bin/sh"],
+                    args=["-c", " && ".join(get_docker_commands(authorized_keys))],
+                    ports=[
+                        client.V1ContainerPort(
+                            container_port=DSTACK_RUNNER_SSH_PORT,
+                        )
+                    ],
+                    security_context=client.V1SecurityContext(
+                        run_as_user=0,
+                        run_as_group=0,
+                        privileged=job_spec.privileged,
+                        capabilities=client.V1Capabilities(
+                            add=[
+                                # Allow to increase hard resource limits, see getrlimit(2)
+                                "SYS_RESOURCE",
+                            ],
+                        ),
+                    ),
+                    resources=client.V1ResourceRequirements(
+                        requests=resource_requests.to_kubernetes_map(gpu_resource),
+                        limits=resource_limits.to_kubernetes_map(gpu_resource),
+                    ),
+                    volume_mounts=volume_mounts,
+                    env=env_vars,
+                )
+            ],
+            image_pull_secrets=(
+                [client.V1LocalObjectReference(name=registry_auth_secret_name)]
+                if registry_auth_secret_name is not None
+                else None
+            ),
+            affinity=client.V1Affinity(
+                node_affinity=node_affinity,
+            ),
+            tolerations=tolerations,
+            volumes=volumes_,
+        ),
+    )
+    api.create_namespaced_pod(
+        namespace=namespace,
+        body=pod,
+    )
+
+
+def _wait_for_pod_scheduled_or_finished(
     api: client.CoreV1Api,
     namespace: str,
     pod_name: str,
-    timeout_seconds: int = 300,
-):
-    start_time = time.time()
-    while True:
-        pod = call_api_method(
-            api.read_namespaced_pod,
-            expected=404,
-            name=pod_name,
-            namespace=namespace,
-        )
-        if pod is not None:
-            pod_status = get_or_error(pod.status)
-            phase = get_or_error(pod_status.phase)
-            container_statuses = get_or_error(pod_status.container_statuses)
-            if phase == "Running" and all(status.ready for status in container_statuses):
-                return True
-        elapsed_time = time.time() - start_time
-        if elapsed_time >= timeout_seconds:
-            logger.warning("Timeout waiting for pod %s to be ready", pod_name)
-            return False
-        time.sleep(1)
+    timeout_seconds: int,
+) -> tuple[bool, Optional[PodPhase]]:
+    # We wait until container_statuses is populated rather than checking the PodScheduled
+    # condition or spec.node_name. container_statuses is set by the kubelet only after it
+    # has accepted the bound pod and started creating containers, so it implies both that
+    # the scheduler confirmed capacity and that the assigned node is actually Ready and
+    # working on the pod.
+    pod_phase: Optional[PodPhase] = None
+    # Ensure that API's timeoutSeconds fires earlier than the network timeout, which defaults to
+    # our custom ApiClient's constructor parameter, see DEFAULT_REQUEST_TIMEOUT
+    request_timeout = timeout_seconds + 5
+    with watch_events(
+        api.list_namespaced_pod,
+        namespace=namespace,
+        field_selector=f"metadata.name={pod_name}",
+        timeout_seconds=timeout_seconds,
+        _request_timeout=request_timeout,
+    ) as event_iter:
+        for _, pod in event_iter:
+            pod_status = pod.status
+            if pod_status is None:
+                continue
+            if pod_status.phase is not None:
+                pod_phase = PodPhase(pod_status.phase)
+            else:
+                pod_phase = None
+            if pod_status.container_statuses is not None:
+                return True, pod_phase
+            if pod_phase is not None and pod_phase is not PodPhase.PENDING:
+                return True, pod_phase
+    return False, pod_phase
+
+
+def _get_unscheduled_pod_reason_message(
+    api: client.CoreV1Api,
+    namespace: str,
+    pod_name: str,
+) -> tuple[Optional[str], Optional[str]]:
+    pod = call_api_method(
+        api.read_namespaced_pod,
+        expected=404,
+        name=pod_name,
+        namespace=namespace,
+    )
+    if pod is not None and pod.status is not None and pod.status.conditions:
+        for cond in pod.status.conditions:
+            if cond.type == "PodScheduled" and cond.status == "False":
+                return cond.reason, cond.message
+    return None, None
 
 
 def _wait_for_load_balancer_address(
@@ -984,29 +1407,9 @@ def _wait_for_load_balancer_address(
         time.sleep(1)
 
 
-def _add_authorized_key_to_jump_pod(
-    jump_pod_host: str,
-    jump_pod_port: int,
-    ssh_private_key: str,
-    ssh_authorized_key: str,
-):
-    _run_ssh_command(
-        hostname=jump_pod_host,
-        port=jump_pod_port,
-        ssh_private_key=ssh_private_key,
-        command=(
-            f'if grep -qvF "{ssh_authorized_key}" ~/.ssh/authorized_keys; then '
-            f"echo {ssh_authorized_key} >> ~/.ssh/authorized_keys; "
-            "fi"
-        ),
-    )
-
-
-def _get_gateway_commands(
-    authorized_keys: List[str], router: Optional[AnyRouterConfig] = None
-) -> List[str]:
+def _get_gateway_commands(authorized_keys: List[str]) -> List[str]:
     authorized_keys_content = "\n".join(authorized_keys).strip()
-    gateway_commands = " && ".join(get_dstack_gateway_commands(router=router))
+    gateway_commands = " && ".join(get_dstack_gateway_commands())
     quoted_gateway_commands = shlex.quote(gateway_commands)
 
     commands = [
@@ -1033,45 +1436,56 @@ def _get_gateway_commands(
         # regenerate host keys
         "rm -rf /etc/ssh/ssh_host_*",
         "ssh-keygen -A > /dev/null",
-        # start sshd
-        "/usr/sbin/sshd -p 22 -o PermitUserEnvironment=yes",
-        # run gateway
+        # install gateway
         f"su ubuntu -c {quoted_gateway_commands}",
-        "sleep infinity",
+        # start docker-systemctl-replacement as an init replacement (PID 1), which
+        # - starts and supervises enabled services (sshd, nginx, dstack.gateway)
+        # - stops running services on SIGTERM (graceful shutdown)
+        # - reaps orphan processes
+        # See: https://github.com/gdraheim/docker-systemctl-replacement/blob/b18d67e521f0d1cf1d705dbb8e0416bef23e377c/INIT-DAEMON.md
+        "exec systemctl default",
     ]
     return commands
 
 
-def _run_ssh_command(hostname: str, port: int, ssh_private_key: str, command: str):
+def _run_ssh_command(
+    hostname: str, port: int, username: str, ssh_private_key: str, command: str
+) -> tuple[int, bytes]:
     with tempfile.NamedTemporaryFile("w+", 0o600) as f:
         f.write(ssh_private_key)
         f.flush()
-        subprocess.run(
+        proc = subprocess.run(
             [
                 "ssh",
                 "-F",
                 "none",
                 "-o",
                 "StrictHostKeyChecking=no",
+                "-o",
+                # The same timeout as in core.services.ssh.tunnel.SSH_DEFAULT_OPTIONS,
+                # which is used, for example, by server.services.runner.ssh.runner_ssh_tunnel()
+                "ConnectTimeout=3",
                 "-i",
                 f.name,
                 "-p",
                 str(port),
-                f"root@{hostname}",
+                f"{username}@{hostname}",
                 command,
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
+    return proc.returncode, proc.stdout
 
 
-def _get_jump_pod_name(project_name: str) -> str:
-    return f"dstack-{project_name}-ssh-jump-pod"
-
-
-def _get_jump_pod_service_name(project_name: str) -> str:
-    return f"dstack-{project_name}-ssh-jump-pod-service"
+def _build_service_selector_from_labels(labels: dict[str, str]) -> dict[str, str]:
+    label_key = "app.kubernetes.io/instance"
+    return {label_key: labels[label_key]}
 
 
 def _get_pod_service_name(pod_name: str) -> str:
     return f"{pod_name}-service"
+
+
+def _get_registry_auth_secret_name(pod_name: str) -> str:
+    return f"{pod_name}-registry-auth"

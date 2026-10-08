@@ -3,7 +3,7 @@ from typing import List, Optional, Tuple
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dstack._internal.core.models.projects import Project
+from dstack._internal.core.models.projects import Project, ProjectsInfoListOrProjectsList
 from dstack._internal.server.db import get_session
 from dstack._internal.server.models import ProjectModel, UserModel
 from dstack._internal.server.schemas.projects import (
@@ -25,7 +25,7 @@ from dstack._internal.server.security.permissions import (
 )
 from dstack._internal.server.services import fleets, projects
 from dstack._internal.server.utils.routers import (
-    CustomORJSONResponse,
+    CustomJSONResponse,
     get_base_api_additional_responses,
 )
 
@@ -36,14 +36,14 @@ router = APIRouter(
 )
 
 
-@router.post("/list", response_model=List[Project])
+@router.post("/list", summary="List projects", response_model=ProjectsInfoListOrProjectsList)
 async def list_projects(
     body: Optional[ListProjectsRequest] = None,
     session: AsyncSession = Depends(get_session),
     user: UserModel = Depends(Authenticated()),
 ):
     """
-    Returns projects visible to the user, sorted by ascending `created_at`.
+    Returns projects visible to the user.
 
     Returns all accessible projects (member projects for regular users, all non-deleted
     projects for global admins, plus public projects if `include_not_joined` is `True`).
@@ -53,49 +53,62 @@ async def list_projects(
     if body is None:
         # For backward compatibility
         body = ListProjectsRequest()
-    return CustomORJSONResponse(
+    return CustomJSONResponse(
         await projects.list_user_accessible_projects(
-            session=session, user=user, include_not_joined=body.include_not_joined
+            session=session,
+            user=user,
+            include_not_joined=body.include_not_joined,
+            return_total_count=body.return_total_count,
+            name_pattern=body.name_pattern,
+            prev_created_at=body.prev_created_at,
+            prev_id=body.prev_id,
+            limit=body.limit,
+            ascending=body.ascending,
         )
     )
 
 
-@router.post("/list_only_no_fleets", response_model=List[Project])
+@router.post(
+    "/list_only_no_fleets",
+    summary="List projects with no active fleets",
+    response_model=List[Project],
+)
 async def list_only_no_fleets(
     session: AsyncSession = Depends(get_session),
     user: UserModel = Depends(Authenticated()),
 ):
     """
     Returns only projects where the user is a member and that have no active fleets,
-    sorted by ascending `created_at`.
+    neither owned nor imported, sorted by ascending `created_at`.
 
     Active fleets are those with `deleted == False`. Projects with deleted fleets
     (but no active fleets) are included.
 
     `members` and `backends` are always empty - call `/api/projects/{project_name}/get` to retrieve them.
     """
-    return CustomORJSONResponse(
+    return CustomJSONResponse(
         await fleets.list_projects_with_no_active_fleets(session=session, user=user)
     )
 
 
-@router.post("/create", response_model=Project)
+@router.post("/create", summary="Create project", response_model=Project)
 async def create_project(
     body: CreateProjectRequest,
     session: AsyncSession = Depends(get_session),
     user: UserModel = Depends(Authenticated()),
 ):
-    return CustomORJSONResponse(
+    return CustomJSONResponse(
         await projects.create_project(
             session=session,
             user=user,
             project_name=body.project_name,
             is_public=body.is_public,
+            templates_repo=body.templates_repo,
         )
     )
 
 
-@router.post("/delete")
+@router.post("/delete", summary="Delete projects")
 async def delete_projects(
     body: DeleteProjectsRequest,
     session: AsyncSession = Depends(get_session),
@@ -108,17 +121,18 @@ async def delete_projects(
     )
 
 
-@router.post("/{project_name}/get", response_model=Project)
+@router.post("/{project_name}/get", summary="Get project", response_model=Project)
 async def get_project(
     session: AsyncSession = Depends(get_session),
     user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectMemberOrPublicAccess()),
 ):
     _, project = user_project
-    return CustomORJSONResponse(projects.project_model_to_project(project))
+    return CustomJSONResponse(projects.project_model_to_project(project))
 
 
 @router.post(
     "/{project_name}/set_members",
+    summary="Set members",
     response_model=Project,
 )
 async def set_project_members(
@@ -134,11 +148,12 @@ async def set_project_members(
         members=body.members,
     )
     await session.refresh(project)
-    return CustomORJSONResponse(projects.project_model_to_project(project))
+    return CustomJSONResponse(projects.project_model_to_project(project))
 
 
 @router.post(
     "/{project_name}/add_members",
+    summary="Add members",
     response_model=Project,
 )
 async def add_project_members(
@@ -154,11 +169,12 @@ async def add_project_members(
         members=body.members,
     )
     await session.refresh(project)
-    return CustomORJSONResponse(projects.project_model_to_project(project))
+    return CustomJSONResponse(projects.project_model_to_project(project))
 
 
 @router.post(
     "/{project_name}/remove_members",
+    summary="Remove members",
     response_model=Project,
 )
 async def remove_project_members(
@@ -174,11 +190,12 @@ async def remove_project_members(
         usernames=body.usernames,
     )
     await session.refresh(project)
-    return CustomORJSONResponse(projects.project_model_to_project(project))
+    return CustomJSONResponse(projects.project_model_to_project(project))
 
 
 @router.post(
     "/{project_name}/update",
+    summary="Update project",
     response_model=Project,
 )
 async def update_project(
@@ -192,6 +209,8 @@ async def update_project(
         user=user,
         project=project,
         is_public=body.is_public,
+        templates_repo=body.templates_repo,
+        reset_templates_repo=body.reset_templates_repo,
     )
     await session.refresh(project)
-    return CustomORJSONResponse(projects.project_model_to_project(project))
+    return CustomJSONResponse(projects.project_model_to_project(project))

@@ -2,8 +2,10 @@ import { get as _get } from 'lodash';
 import { StatusIndicatorProps } from '@cloudscape-design/components';
 
 import { capitalize } from 'libs';
+import { formatResources } from 'libs/resources';
 
 import { finishedRunStatuses } from '../pages/Runs/constants';
+import { getJobProbesStatuses } from '../pages/Runs/Details/Jobs/List/helpers';
 
 import { IModelExtended } from '../pages/Models/List/types';
 
@@ -50,9 +52,10 @@ export const getStatusIconColor = (
     switch (status) {
         case 'submitted':
         case 'pending':
-            return 'blue';
+        case 'provisioning':
         case 'pulling':
-            return 'green';
+        case 'terminating':
+            return 'blue';
         case 'aborted':
             return 'yellow';
         case 'done':
@@ -75,6 +78,16 @@ export const getRunError = (run: IRun): string | null => {
     return error ? capitalize(error) : null;
 };
 
+export const getRunProbeStatuses = (run: IRun): StatusIndicatorProps.Type[] => {
+    const job = run.jobs[0];
+
+    if (!job) {
+        return [];
+    }
+
+    return getJobProbesStatuses(run.jobs[0]);
+};
+
 export const getRunPriority = (run: IRun): number | null => {
     return run.run_spec.configuration?.priority ?? null;
 };
@@ -88,7 +101,9 @@ export const getExtendedModelFromRun = (run: IRun): IModelExtended | null => {
         project_name: run.project_name,
         run_name: run?.run_spec.run_name ?? 'No run name',
         user: run.user,
-        resources: run.latest_job_submission?.job_provisioning_data?.instance_type?.resources?.description ?? null,
+        resources: run.latest_job_submission?.job_provisioning_data?.instance_type?.resources
+            ? formatResources(run.latest_job_submission.job_provisioning_data.instance_type.resources)
+            : null,
         price: run.latest_job_submission?.job_provisioning_data?.price ?? null,
         submitted_at: run.submitted_at,
         repository: getRepoNameFromRun(run),

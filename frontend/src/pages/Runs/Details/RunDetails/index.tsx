@@ -1,13 +1,20 @@
 import React from 'react';
+import { useListener } from 'react-bus';
 import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router-dom';
-import { get as _get } from 'lodash';
 import { format } from 'date-fns';
 
 import { Box, ColumnLayout, Container, Header, Loader, NavigateLink, StatusIndicator } from 'components';
 
 import { DATE_TIME_FORMAT } from 'consts';
-import { getRunError, getRunPriority, getRunStatusMessage, getStatusIconColor, getStatusIconType } from 'libs/run';
+import {
+    getRunError,
+    getRunPriority,
+    getRunProbeStatuses,
+    getRunStatusMessage,
+    getStatusIconColor,
+    getStatusIconType,
+} from 'libs/run';
 import { ROUTES } from 'routes';
 import { useGetRunQuery } from 'services/run';
 
@@ -22,12 +29,14 @@ import {
     getRunListItemRegion,
     getRunListItemResources,
     getRunListItemSchedule,
-    getRunListItemServiceUrl,
-    getRunListItemSpot,
+    getRunListItemSpotLabelKey,
 } from '../../List/helpers';
+import { RUN_DETAILS_REFRESH_LIST_EVENT } from '../constants';
 import { EventsList } from '../Events/List';
 import { JobList } from '../Jobs/List';
 import { ConnectToRunWithDevEnvConfiguration } from './ConnectToRunWithDevEnvConfiguration';
+import { ConnectToServiceRun } from './ConnectToServiceRun';
+import { ConnectToTaskRun } from './ConnectToTaskRun';
 
 export const RunDetails = () => {
     const { t } = useTranslation();
@@ -35,12 +44,17 @@ export const RunDetails = () => {
     const paramProjectName = params.projectName ?? '';
     const paramRunId = params.runId ?? '';
 
-    const { data: runData, isLoading: isLoadingRun } = useGetRunQuery({
+    const {
+        data: runData,
+        isLoading: isLoadingRun,
+        refetch,
+    } = useGetRunQuery({
         project_name: paramProjectName,
         id: paramRunId,
     });
 
-    const serviceUrl = runData ? getRunListItemServiceUrl(runData) : null;
+    useListener(RUN_DETAILS_REFRESH_LIST_EVENT, refetch);
+
     const schedule = runData ? getRunListItemSchedule(runData) : null;
     const nextTriggeredAt = runData ? runData.next_triggered_at : null;
 
@@ -65,6 +79,14 @@ export const RunDetails = () => {
 
     const statusMessage = getRunStatusMessage(runData);
 
+    const renderRobeStatuses = () => {
+        const statuses = getRunProbeStatuses(runData);
+
+        if (!statuses.length) return '-';
+
+        return statuses.map((statusType, index) => <StatusIndicator key={index} type={statusType} />);
+    };
+
     return (
         <>
             <Container header={<Header variant="h2">{t('common.general')}</Header>}>
@@ -80,12 +102,34 @@ export const RunDetails = () => {
                     </div>
 
                     <div>
-                        <Box variant="awsui-key-label">{t('projects.run.repo')}</Box>
+                        <Box variant="awsui-key-label">{t('projects.run.configuration')}</Box>
+                        <div>{runData.run_spec.configuration_path || '-'}</div>
+                    </div>
+
+                    <div>
+                        <Box variant="awsui-key-label">{t('projects.run.resources')}</Box>
+                        <div>{getRunListItemResources(runData)}</div>
+                    </div>
+
+                    <div>
+                        <Box variant="awsui-key-label">{t('projects.run.status')}</Box>
 
                         <div>
-                            {_get(runData.run_spec.repo_data, 'repo_name', _get(runData.run_spec.repo_data, 'repo_dir', '-'))}
+                            <StatusIndicator
+                                type={getStatusIconType(status, terminationReason)}
+                                colorOverride={getStatusIconColor(status, terminationReason, statusMessage)}
+                            >
+                                {statusMessage}
+                            </StatusIndicator>
                         </div>
                     </div>
+
+                    {runData.jobs.length <= 1 && (
+                        <div>
+                            <Box variant="awsui-key-label">{t('projects.run.probe')}</Box>
+                            <div>{renderRobeStatuses()}</div>
+                        </div>
+                    )}
 
                     <div>
                         <Box variant="awsui-key-label">{t('projects.run.hub_user_name')}</Box>
@@ -93,11 +137,6 @@ export const RunDetails = () => {
                         <div>
                             <NavigateLink href={ROUTES.USER.DETAILS.FORMAT(runData.user)}>{runData.user}</NavigateLink>
                         </div>
-                    </div>
-
-                    <div>
-                        <Box variant="awsui-key-label">{t('projects.run.configuration')}</Box>
-                        <div>{runData.run_spec.configuration_path}</div>
                     </div>
 
                     <div>
@@ -111,30 +150,8 @@ export const RunDetails = () => {
                     </div>
 
                     <div>
-                        <Box variant="awsui-key-label">{t('projects.run.status')}</Box>
-                        <div>
-                            <StatusIndicator
-                                type={getStatusIconType(status, terminationReason)}
-                                colorOverride={getStatusIconColor(status, terminationReason, statusMessage)}
-                            >
-                                {statusMessage}
-                            </StatusIndicator>
-                        </div>
-                    </div>
-
-                    <div>
                         <Box variant="awsui-key-label">{t('projects.run.error')}</Box>
                         <div>{getRunError(runData) ?? '-'}</div>
-                    </div>
-
-                    <div>
-                        <Box variant="awsui-key-label">{t('projects.run.priority')}</Box>
-                        <div>{getRunPriority(runData)}</div>
-                    </div>
-
-                    <div>
-                        <Box variant="awsui-key-label">{t('projects.run.cost')}</Box>
-                        <div>${runData.cost}</div>
                     </div>
 
                     <div>
@@ -143,8 +160,13 @@ export const RunDetails = () => {
                     </div>
 
                     <div>
-                        <Box variant="awsui-key-label">{t('projects.run.resources')}</Box>
-                        <div>{getRunListItemResources(runData)}</div>
+                        <Box variant="awsui-key-label">{t('projects.run.cost')}</Box>
+                        <div>${runData.cost}</div>
+                    </div>
+
+                    <div>
+                        <Box variant="awsui-key-label">{t('projects.run.spot')}</Box>
+                        <div>{t(getRunListItemSpotLabelKey(runData))}</div>
                     </div>
 
                     <div>
@@ -158,26 +180,15 @@ export const RunDetails = () => {
                     </div>
 
                     <div>
-                        <Box variant="awsui-key-label">{t('projects.run.instance_id')}</Box>
-                        <div>{getRunListItemInstanceId(runData)}</div>
+                        <Box variant="awsui-key-label">{t('projects.run.priority')}</Box>
+                        <div>{getRunPriority(runData)}</div>
                     </div>
 
                     <div>
-                        <Box variant="awsui-key-label">{t('projects.run.spot')}</Box>
-                        <div>{getRunListItemSpot(runData)}</div>
+                        <Box variant="awsui-key-label">{t('projects.run.instance_id')}</Box>
+                        <div>{getRunListItemInstanceId(runData)}</div>
                     </div>
                 </ColumnLayout>
-
-                {serviceUrl && (
-                    <ColumnLayout columns={1} variant="text-grid">
-                        <div>
-                            <Box variant="awsui-key-label">{t('projects.run.service_url')}</Box>
-                            <div>
-                                <a href={serviceUrl}>{serviceUrl}</a>
-                            </div>
-                        </div>
-                    </ColumnLayout>
-                )}
 
                 {schedule && (
                     <ColumnLayout columns={4} variant="text-grid">
@@ -196,6 +207,14 @@ export const RunDetails = () => {
             {runData.run_spec.configuration.type === 'dev-environment' && !runIsStopped(runData.status) && (
                 <ConnectToRunWithDevEnvConfiguration run={runData} />
             )}
+
+            {runData.run_spec.configuration.type === 'service' && !runIsStopped(runData.status) && (
+                <ConnectToServiceRun run={runData} />
+            )}
+
+            {runData.run_spec.configuration.type === 'task' &&
+                !runIsStopped(runData.status) &&
+                (runData.jobs[0]?.job_spec?.app_specs?.length ?? 0) > 0 && <ConnectToTaskRun run={runData} />}
 
             {runData.jobs.length > 1 && (
                 <JobList

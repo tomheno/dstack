@@ -1,0 +1,222 @@
+{% set class = "md-header" %}
+{% if "navigation.tabs.sticky" in features %}
+  {% set class = class ~ " md-header--shadow md-header--lifted" %}
+{% elif "navigation.tabs" not in features %}
+  {% set class = class ~ " md-header--shadow" %}
+{% endif %}
+<header class="{{ class }}" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="{{ lang.t('header') }}">
+    {# Two distinct nav controls (note: blog posts carry `hide: navigation` in their meta, but
+       blog-post.html still renders the site nav for the MOBILE drawer — so they're treated separately
+       from genuinely nav-less pages like /terms, /privacy):
+       - cs-nav-toggle: the DESKTOP collapse button. Only useful when there's a left sidebar column,
+         so hide it on blog posts (the article spans the full width) and on hide:navigation pages.
+       - label[for="__drawer"]: the MOBILE drawer hamburger. Keep it on blog posts (their drawer has
+         the site nav) and normal pages; drop it only on hide:navigation pages that DON'T render a
+         drawer (/terms, /privacy), so it never opens an empty dimming overlay. #}
+    {% set is_blog_post = page.config and page.config.date %}
+    {% set hides_nav = page.meta and page.meta.hide and "navigation" in page.meta.hide %}
+    {% if not is_blog_post and not hides_nav %}
+      <button type="button" class="md-header__button cs-nav-toggle" aria-label="Toggle navigation" data-cs-nav-toggle>
+        <svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M15 3H1M15 8H1M15 13H1" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+      </button>
+    {% endif %}
+    <a href="{{ config.extra.homepage | d(nav.homepage.url, true) | url }}" title="{{ config.site_name | e }}" class="md-header__button md-logo" aria-label="{{ config.site_name }}" data-md-component="logo">
+      {% include "partials/logo.html" %}
+    </a>
+    {% if is_blog_post or not hides_nav %}
+      <label class="md-header__button md-icon" for="__drawer">
+        {% set icon = config.theme.icon.menu or "material/menu" %}
+        {% include ".icons/" ~ icon ~ ".svg" %}
+      </label>
+    {% endif %}
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <a href="{{ config.extra.homepage | d(nav.homepage.url, true) | url }}" class="md-ellipsis">
+            {{ config.site_name }}
+          </a>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            {% if page.meta and page.meta.title %}
+              {{ page.meta.title }}
+            {% else %}
+              {{ page.title }}
+            {% endif %}
+          </span>
+        </div>
+      </div>
+    </div>
+    {% if config.theme.palette %}
+      {% if not config.theme.palette is mapping %}
+        {% include "partials/palette.html" %}
+      {% endif %}
+    {% endif %}
+    {% if not config.theme.palette is mapping %}
+      {% include "partials/javascripts/palette.html" %}
+    {% endif %}
+    {#- The palette radios now exist; check the one matching the shared dstack-theme so Material's
+        bundle (which reads the checked radio on load) keeps the right scheme — flash-free. The
+        extrahead already set __palette, so the inline palette JS applied the scheme during parse. -#}
+    <script>
+      try { window.__dstackApplyTheme(localStorage.getItem('dstack-theme') === 'dark', false); } catch (e) {}
+    </script>
+    {% if config.extra.alternate %}
+      {% include "partials/alternate.html" %}
+    {% endif %}
+
+    {% if "material/search" in config.plugins %}
+      <label class="md-header__button md-icon" for="__search">
+        {% set icon = config.theme.icon.search or "material/magnify" %}
+        {% include ".icons/" ~ icon ~ ".svg" %}
+      </label>
+      {% include "partials/search.html" %}
+    {% endif %}
+
+    {# Keep menu descriptions in sync with SiteNavigation.tsx. GetStartedSection.tsx uses a longer dstack description. #}
+    <div class="cs-products-menu">
+      <button type="button" class="cs-products-menu__trigger" id="cs-products-trigger" aria-haspopup="menu" aria-expanded="false" aria-controls="cs-products-popup">
+        Products
+        <span class="cs-products-menu__icon">
+          <svg class="cs-products-menu__caret" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6.5 8 10.5 12 6.5"/></svg>
+        </span>
+      </button>
+      <div class="cs-products-menu__popup" id="cs-products-popup" role="menu" aria-labelledby="cs-products-trigger">
+        <div class="gs-rail">
+          <div class="gs-rail__group">Self-hosted</div>
+          <a class="gs-opt gs-opt--feat" role="menuitem" tabindex="-1" href="/docs/installation">
+            <span class="gs-opt__ic" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>
+            </span>
+            <span class="gs-opt__body">
+              <span class="gs-opt__name">dstack</span>
+              <span class="gs-opt__desc">A unified orchestration interface across GPU clouds, Kubernetes, VMs, and bare-metal.</span>
+            </span>
+          </a>
+          <a class="gs-opt gs-opt--row external-skip" role="menuitem" tabindex="-1" href="/products/factory" target="_blank" rel="noreferrer">
+            <span class="gs-opt__ic" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83z"/><path d="M2 12a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 12"/><path d="M2 17a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 17"/></svg>
+            </span>
+            <span class="gs-opt__body">
+              <span class="gs-opt__name">dstack Factory</span>
+              <span class="gs-opt__desc">A multi-tenant orchestration stack for AI labs, data centers, and AI token factories.</span>
+            </span>
+          </a>
+          <div class="gs-rail__group">Hosted by us</div>
+          <a class="gs-opt gs-opt--row" role="menuitem" tabindex="-1" href="/products/sky" target="_blank" rel="noreferrer">
+            <span class="gs-opt__ic" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>
+            </span>
+            <span class="gs-opt__body">
+              <span class="gs-opt__name">dstack Sky</span>
+              <span class="gs-opt__desc">Unified access to GPU clouds. Better prices and one billing.</span>
+            </span>
+          </a>
+        </div>
+      </div>
+    </div>
+
+    {# Tabs rendered directly in the header (not relocated via JS) to avoid a load flash.
+       base.html's below-header tabs block is suppressed in main.html. #}
+    {% if "navigation.tabs" in features %}
+      {% include "partials/tabs.html" %}
+    {% endif %}
+
+    <!--{% if config.repo_url %}
+      <div class="md-header__source">
+        {% include "partials/source.html" %}
+      </div>
+    {% endif %}-->
+
+    <div class="md-header__buttons">
+      {# Theme toggle, before GitHub — shown only on large screens (on tablet/mobile it lives in the
+         footer, see partials/tx-footer.html). Same .cs-theme-toggle markup + the extra.js click
+         handler, which binds every [data-cs-theme-toggle]. #}
+      <button type="button" class="cs-theme-toggle cs-theme-toggle--header" data-cs-theme-toggle aria-label="Toggle light/dark theme">
+        <span class="cs-theme-toggle__track" aria-hidden="true"><span class="cs-theme-toggle__thumb"></span></span>
+        <svg class="cs-theme-toggle__moon" viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true" focusable="false">
+          <path d="M12.8166 9.79921C12.8417 9.75608 12.7942 9.70771 12.7497 9.73041C11.9008 10.164 10.9392 10.4085 9.92054 10.4085C6.48046 10.4085 3.69172 7.61979 3.69172 4.17971C3.69172 3.16099 3.93628 2.19938 4.36989 1.3504C4.39259 1.30596 4.34423 1.25842 4.3011 1.28351C2.44675 2.36242 1.2002 4.37123 1.2002 6.67119C1.2002 10.1113 3.98893 12.9 7.42901 12.9C9.72893 12.9 11.7377 11.6535 12.8166 9.79921Z" fill="currentColor" stroke="currentColor" stroke-width="2"/>
+        </svg>
+      </button>
+      <a href="https://github.com/dstackai/dstack" target="_blank" class="md-button md-button--primary github external-skip">GitHub</a>
+    </div>
+    <script>
+      (function () {
+        document.addEventListener('click', function (e) {
+          if (e.target.closest('[data-cs-nav-toggle]')) {
+            document.body.classList.toggle('cs-nav-collapsed');
+            // The content column reflows (792↔960), so re-align the right rail's TOC offset.
+            window.dispatchEvent(new Event('resize'));
+          }
+        });
+
+        var productsMenu = document.querySelector('.cs-products-menu');
+        var productsTrigger = productsMenu && productsMenu.querySelector('.cs-products-menu__trigger');
+        if (productsTrigger) {
+          var productsItems = Array.from(productsMenu.querySelectorAll('[role="menuitem"]'));
+          var setProductsOpen = function (open) {
+            productsMenu.classList.toggle('cs-products-menu--open', open);
+            productsTrigger.setAttribute('aria-expanded', String(open));
+          };
+          var focusProduct = function (index) {
+            productsItems.forEach(function (item, itemIndex) {
+              item.tabIndex = itemIndex === index ? 0 : -1;
+            });
+            productsItems[index].focus();
+          };
+          productsTrigger.addEventListener('click', function () {
+            var open = productsTrigger.getAttribute('aria-expanded') !== 'true';
+            setProductsOpen(open);
+            if (open) focusProduct(0);
+            else productsTrigger.focus();
+          });
+          productsMenu.addEventListener('keydown', function (e) {
+            var open = productsTrigger.getAttribute('aria-expanded') === 'true';
+            if (e.target === productsTrigger && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+              e.preventDefault();
+              setProductsOpen(true);
+              focusProduct(e.key === 'ArrowUp' ? productsItems.length - 1 : 0);
+              return;
+            }
+            if (!open) return;
+            if (e.key === 'Escape') {
+              e.preventDefault();
+              e.stopPropagation();
+              setProductsOpen(false);
+              productsTrigger.focus();
+              return;
+            }
+            var index = productsItems.indexOf(document.activeElement);
+            var nextIndex;
+            if (e.key === 'ArrowDown') nextIndex = (index + 1) % productsItems.length;
+            else if (e.key === 'ArrowUp') nextIndex = index < 0 ? productsItems.length - 1 : (index + productsItems.length - 1) % productsItems.length;
+            else if (e.key === 'Home') nextIndex = 0;
+            else if (e.key === 'End') nextIndex = productsItems.length - 1;
+            else return;
+            e.preventDefault();
+            focusProduct(nextIndex);
+          });
+          productsItems.forEach(function (item) {
+            item.addEventListener('click', function () {
+              setProductsOpen(false);
+              productsTrigger.focus();
+            });
+          });
+          productsMenu.addEventListener('focusout', function (e) {
+            if (!productsMenu.contains(e.relatedTarget)) setProductsOpen(false);
+          });
+          document.addEventListener('pointerdown', function (e) {
+            if (!productsMenu.contains(e.target)) setProductsOpen(false);
+          });
+          window.addEventListener('blur', function () { setProductsOpen(false); });
+        }
+      })();
+    </script>
+  </nav>
+  {% if "navigation.tabs.sticky" in features %}
+    {% if "navigation.tabs" in features %}
+      {% include "partials/tabs.html" %}
+    {% endif %}
+  {% endif %}
+</header>

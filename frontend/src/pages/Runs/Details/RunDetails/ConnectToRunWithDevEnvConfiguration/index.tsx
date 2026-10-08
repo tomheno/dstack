@@ -1,25 +1,12 @@
 import React, { FC } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import {
-    Alert,
-    Box,
-    Button,
-    Code,
-    Container,
-    ExpandableSection,
-    Header,
-    Popover,
-    SpaceBetween,
-    StatusIndicator,
-    Tabs,
-    Wizard,
-} from 'components';
+import { Alert, Box, Button, Code, ExpandableSection, Popover, SpaceBetween, StatusIndicator, Tabs, Wizard } from 'components';
 
 import { copyToClipboard } from 'libs';
 
 import { useConfigProjectCliCommand } from 'pages/Project/hooks/useConfigProjectCliComand';
-import { getIDEDisplayName } from 'pages/Runs/CreateDevEnvironment/constants';
+import { getIDEDisplayName } from 'pages/Runs/Launch/constants';
 
 import styles from './styles.module.scss';
 
@@ -28,6 +15,7 @@ const PipInstallCommand = 'pip install dstack -U';
 
 export const ConnectToRunWithDevEnvConfiguration: FC<{ run: IRun }> = ({ run }) => {
     const { t } = useTranslation();
+    const [isExpandedConnectSection, setIsExpandedConnectSection] = React.useState(true);
 
     const getAttachCommand = (runData: IRun) => {
         const attachCommand = `dstack attach ${runData.run_spec.run_name} --logs`;
@@ -54,15 +42,23 @@ export const ConnectToRunWithDevEnvConfiguration: FC<{ run: IRun }> = ({ run }) 
     const [sshCommand, copySSHCommand] = getSSHCommand(run);
 
     const configuration = run.run_spec.configuration as TDevEnvironmentConfiguration;
-    const openInIDEUrl = `${configuration.ide}://vscode-remote/ssh-remote+${run.run_spec.run_name}/${run.run_spec.working_dir || 'workflow'}`;
-    const ideDisplayName = getIDEDisplayName(configuration.ide);
+    const hasIDE = !!configuration.ide;
+    // The IDE deep link is built server-side, per IDE, in JobConnectionInfo.attached_ide_url
+    // (e.g. `zed://ssh/...` for Zed vs `...//vscode-remote/ssh-remote+...` for VS Code forks).
+    // It is set once the job is running and reachable via the SSH config alias created by
+    // `dstack attach`. The UI always talks to a same-version server, so no fallback is needed.
+    const openInIDEUrl = run.jobs[0]?.job_connection_info?.attached_ide_url ?? undefined;
+    const ideDisplayName = hasIDE ? getIDEDisplayName(configuration.ide!) : undefined;
 
     const [configCliCommand, copyCliCommand] = useConfigProjectCliCommand({ projectName: run.project_name });
 
     return (
-        <Container>
-            <Header variant="h2">Connect</Header>
-
+        <ExpandableSection
+            variant="container"
+            headerText="Connect"
+            expanded={isExpandedConnectSection}
+            onChange={({ detail }) => setIsExpandedConnectSection(detail.expanded)}
+        >
             {run.status === 'running' && (
                 <Wizard
                     i18nStrings={{
@@ -76,15 +72,15 @@ export const ConnectToRunWithDevEnvConfiguration: FC<{ run: IRun }> = ({ run }) 
                     }}
                     onNavigate={({ detail }) => setActiveStepIndex(detail.requestedStepIndex)}
                     activeStepIndex={activeStepIndex}
-                    onSubmit={() => window.open(openInIDEUrl, '_blank')}
-                    submitButtonText={`Open in ${ideDisplayName}`}
+                    onSubmit={() => setIsExpandedConnectSection(false)}
+                    submitButtonText="Done"
                     allowSkipTo
                     steps={[
                         {
                             title: 'Attach',
+                            description: 'To access this run, first you need to attach to it.',
                             content: (
                                 <SpaceBetween size="s">
-                                    <Box>To access this run, first you need to attach to it.</Box>
                                     <div className={styles.codeWrapper}>
                                         <Code className={styles.code}>{attachCommand}</Code>
 
@@ -217,52 +213,83 @@ export const ConnectToRunWithDevEnvConfiguration: FC<{ run: IRun }> = ({ run }) 
                             ),
                             isOptional: true,
                         },
-                        {
-                            title: 'Open',
-                            description: `After the CLI is attached, you can open the dev environment in ${ideDisplayName}.`,
-                            content: (
-                                <SpaceBetween size="s">
-                                    <Button
-                                        variant="primary"
-                                        external={true}
-                                        onClick={() => window.open(openInIDEUrl, '_blank')}
-                                    >
-                                        Open in {ideDisplayName}
-                                    </Button>
+                        hasIDE
+                            ? {
+                                  title: 'Open',
+                                  description: `After the CLI is attached, you can open the dev environment in ${ideDisplayName}.`,
+                                  content: (
+                                      <SpaceBetween size="s">
+                                          <Button
+                                              variant="primary"
+                                              external={true}
+                                              disabled={!openInIDEUrl}
+                                              onClick={() => window.open(openInIDEUrl, '_blank')}
+                                          >
+                                              Open in {ideDisplayName}
+                                          </Button>
 
-                                    <ExpandableSection headerText="Need plain SSH?">
-                                        <SpaceBetween size="s">
-                                            <Box />
-                                            <div className={styles.codeWrapper}>
-                                                <Code className={styles.code}>{sshCommand}</Code>
+                                          <ExpandableSection headerText="Need plain SSH?">
+                                              <SpaceBetween size="s">
+                                                  <Box />
+                                                  <div className={styles.codeWrapper}>
+                                                      <Code className={styles.code}>{sshCommand}</Code>
 
-                                                <div className={styles.copy}>
-                                                    <Popover
-                                                        dismissButton={false}
-                                                        position="top"
-                                                        size="small"
-                                                        triggerType="custom"
-                                                        content={
-                                                            <StatusIndicator type="success">
-                                                                {t('common.copied')}
-                                                            </StatusIndicator>
-                                                        }
-                                                    >
-                                                        <Button
-                                                            formAction="none"
-                                                            iconName="copy"
-                                                            variant="normal"
-                                                            onClick={() => copySSHCommand()}
-                                                        />
-                                                    </Popover>
-                                                </div>
-                                            </div>
-                                        </SpaceBetween>
-                                    </ExpandableSection>
-                                </SpaceBetween>
-                            ),
-                            isOptional: true,
-                        },
+                                                      <div className={styles.copy}>
+                                                          <Popover
+                                                              dismissButton={false}
+                                                              position="top"
+                                                              size="small"
+                                                              triggerType="custom"
+                                                              content={
+                                                                  <StatusIndicator type="success">
+                                                                      {t('common.copied')}
+                                                                  </StatusIndicator>
+                                                              }
+                                                          >
+                                                              <Button
+                                                                  formAction="none"
+                                                                  iconName="copy"
+                                                                  variant="normal"
+                                                                  onClick={() => copySSHCommand()}
+                                                              />
+                                                          </Popover>
+                                                      </div>
+                                                  </div>
+                                              </SpaceBetween>
+                                          </ExpandableSection>
+                                      </SpaceBetween>
+                                  ),
+                                  isOptional: true,
+                              }
+                            : {
+                                  title: 'Connect via SSH',
+                                  description: 'After the CLI is attached, you can connect to the dev environment via SSH.',
+                                  content: (
+                                      <div className={styles.codeWrapper}>
+                                          <Code className={styles.code}>{sshCommand}</Code>
+
+                                          <div className={styles.copy}>
+                                              <Popover
+                                                  dismissButton={false}
+                                                  position="top"
+                                                  size="small"
+                                                  triggerType="custom"
+                                                  content={
+                                                      <StatusIndicator type="success">{t('common.copied')}</StatusIndicator>
+                                                  }
+                                              >
+                                                  <Button
+                                                      formAction="none"
+                                                      iconName="copy"
+                                                      variant="normal"
+                                                      onClick={() => copySSHCommand()}
+                                                  />
+                                              </Popover>
+                                          </div>
+                                      </div>
+                                  ),
+                                  isOptional: true,
+                              },
                     ]}
                 />
             )}
@@ -273,6 +300,6 @@ export const ConnectToRunWithDevEnvConfiguration: FC<{ run: IRun }> = ({ run }) 
                     <Alert type="info">Waiting for the run to start.</Alert>
                 </SpaceBetween>
             )}
-        </Container>
+        </ExpandableSection>
     );
 };

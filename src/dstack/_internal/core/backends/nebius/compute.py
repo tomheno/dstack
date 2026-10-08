@@ -3,6 +3,7 @@ import random
 import shlex
 import time
 from collections.abc import Iterable
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from functools import cached_property
 from typing import List, Optional
 
@@ -15,6 +16,7 @@ from dstack._internal.core.backends.base.backend import Compute
 from dstack._internal.core.backends.base.compute import (
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     ComputeWithPlacementGroupSupport,
     ComputeWithPrivilegedSupport,
@@ -39,7 +41,11 @@ from dstack._internal.core.errors import (
     ProvisioningError,
 )
 from dstack._internal.core.models.backends.base import BackendType
-from dstack._internal.core.models.common import CoreModel
+from dstack._internal.core.models.common import (
+    CoreModel,
+    validate_extra_ignore,
+    validate_json_extra_ignore,
+)
 from dstack._internal.core.models.instances import (
     InstanceAvailability,
     InstanceConfiguration,
@@ -57,10 +63,11 @@ from dstack._internal.utils.logging import get_logger
 
 logger = get_logger(__name__)
 CONFIGURABLE_DISK_SIZE = Range[Memory](
-    min=Memory.parse("40GB"),  # min for the ubuntu22.04-cuda12 image
+    min=Memory.parse("40GB"),  # min for the ubuntu24.04-cuda13.0 image
     max=Memory.parse("8192GB"),  # max for the NETWORK_SSD disk type
 )
 WAIT_FOR_DISK_TIMEOUT = 20
+WAIT_FOR_PRICING_POLICY_TIMEOUT = 10
 WAIT_FOR_INSTANCE_TIMEOUT = 30
 WAIT_FOR_INSTANCE_UPDATE_INTERVAL = 2.5
 DELETE_INSTANCE_TIMEOUT = 25
@@ -79,8 +86,12 @@ SUPPORTED_PLATFORMS = [
     "gpu-h100-sxm",
     "gpu-h200-sxm",
     "gpu-b200-sxm",
+    "gpu-b200-sxm-a",
     "gpu-l40s-a",
     "gpu-l40s-d",
+    "gpu-rtx6000",
+    # Fork: the RTX PRO 6000 platform name in uk-south2.
+    "gpu-rtx6000-a",
     "cpu-d3",
     "cpu-e2",
 ]
@@ -90,6 +101,7 @@ class NebiusCompute(
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
     ComputeWithPrivilegedSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     ComputeWithPlacementGroupSupport,
     Compute,
@@ -119,22 +131,36 @@ class NebiusCompute(
             ).metadata.id
         return self._subnet_id_cache[region]
 
-    def get_all_offers_with_availability(self) -> List[InstanceOfferWithAvailability]:
+    def get_all_offers_with_availability(
+        self, unallocated_resources: bool
+    ) -> List[InstanceOfferWithAvailability]:
         offers = get_catalog_offers(
             backend=BackendType.NEBIUS,
             locations=list(self._region_to_project_id),
             extra_filter=_supported_instances,
         )
-        return [
-            InstanceOfferWithAvailability(
-                **offer.dict(),
-                availability=InstanceAvailability.UNKNOWN,
-            )
-            for offer in offers
-        ]
+        offers = _with_on_demand_price(offers)
+        # Fork: the shown spot price becomes the cap, so the catalog order (by spot price)
+        # no longer holds. The server merges the per-backend lists and expects each one
+        # sorted by price. The sort is stable, so spot stays ahead of on-demand on a tie.
+        return sorted(
+            (
+                offer.with_availability(
+                    availability=InstanceAvailability.UNKNOWN,
+                    price=_get_price_adjusted_for_pricing_policy(offer),
+                )
+                for offer in offers
+            ),
+            key=lambda offer: offer.price,
+        )
 
-    def get_offers_modifiers(self, requirements: Requirements) -> Iterable[OfferModifier]:
-        return [get_offers_disk_modifier(CONFIGURABLE_DISK_SIZE, requirements)]
+    def get_offers_modifiers(
+        self, requirements: Requirements, full_offers: bool
+    ) -> Iterable[OfferModifier]:
+        return [
+            get_offers_disk_modifier(CONFIGURABLE_DISK_SIZE, requirements),
+            _get_run_max_price_modifier(requirements),
+        ]
 
     def create_instance(
         self,
@@ -148,6 +174,9 @@ class NebiusCompute(
         # instance.
         instance_name = generate_unique_instance_name(instance_config)
         platform, preset = instance_offer.instance.name.split()
+        offer_backend_data = validate_extra_ignore(
+            NebiusOfferBackendData, instance_offer.backend_data
+        )
         cluster_id = None
         if placement_group:
             assert placement_group.provisioning_data is not None
@@ -169,18 +198,16 @@ class NebiusCompute(
             resource_tags=instance_config.tags,
         )
         labels = resources.filter_invalid_labels(labels)
-        gpus = instance_offer.instance.resources.gpus
         create_disk_op = resources.create_disk(
             sdk=self._sdk,
             name=instance_name,
             project_id=self._region_to_project_id[instance_offer.region],
             size_mib=instance_offer.instance.resources.disk.size_mib,
-            image_family="ubuntu24.04-cuda12"
-            if gpus and gpus[0].name == "B200"
-            else "ubuntu22.04-cuda12",
+            image_family="ubuntu24.04-cuda13.0",
             labels=labels,
         )
         create_instance_op = None
+        create_pricing_policy_op = None
         try:
             logger.debug("Blocking until disk %s is created", create_disk_op.resource_id)
             resources.wait_for_operation(create_disk_op, timeout=WAIT_FOR_DISK_TIMEOUT)
@@ -189,6 +216,19 @@ class NebiusCompute(
                 raise ProvisioningError(
                     f"Create disk operation failed. Message: {raw_op.status.message}."
                     f" Details: {raw_op.status.details}"
+                )
+            if (
+                instance_offer.instance.resources.spot
+                and not offer_backend_data.is_preemptible_flat_rate
+            ):
+                # Prevent the spot price from growing above the cap. Fork: the cap sits just
+                # below the on-demand price of the same type when the catalog has it.
+                create_pricing_policy_op = _create_pricing_policy_with_fallback(
+                    sdk=self._sdk,
+                    name=instance_name,
+                    project_id=self._region_to_project_id[instance_offer.region],
+                    platform=platform,
+                    offer=instance_offer,
                 )
             create_instance_op = resources.create_instance(
                 sdk=self._sdk,
@@ -204,6 +244,11 @@ class NebiusCompute(
                 disk_id=create_disk_op.resource_id,
                 subnet_id=self._get_subnet_id(instance_offer.region),
                 preemptible=instance_offer.instance.resources.spot,
+                pricing_policy_id=(
+                    create_pricing_policy_op.resource_id
+                    if create_pricing_policy_op is not None
+                    else None
+                ),
                 labels=labels,
             )
             _wait_for_instance(self._sdk, create_instance_op)
@@ -220,6 +265,18 @@ class NebiusCompute(
                 except Exception as e:
                     logger.exception(
                         "Could not delete instance %s: %s", create_instance_op.resource_id, e
+                    )
+            if create_pricing_policy_op is not None:
+                try:
+                    with resources.ignore_errors([StatusCode.NOT_FOUND]):
+                        resources.delete_pricing_policy(
+                            self._sdk, create_pricing_policy_op.resource_id
+                        )
+                except Exception as e:
+                    logger.exception(
+                        "Could not delete pricing policy %s: %s",
+                        create_pricing_policy_op.resource_id,
+                        e,
                     )
             try:
                 with resources.ignore_errors([StatusCode.NOT_FOUND]):
@@ -239,7 +296,14 @@ class NebiusCompute(
             ssh_port=22,
             username="ubuntu",
             dockerized=True,
-            backend_data=NebiusInstanceBackendData(boot_disk_id=create_disk_op.resource_id).json(),
+            backend_data=NebiusInstanceBackendData(
+                boot_disk_id=create_disk_op.resource_id,
+                pricing_policy_id=(
+                    create_pricing_policy_op.resource_id
+                    if create_pricing_policy_op is not None
+                    else None
+                ),
+            ).model_dump_json(),
         )
 
     def update_provisioning_data(
@@ -277,6 +341,9 @@ class NebiusCompute(
                 )
         with resources.ignore_errors([StatusCode.NOT_FOUND]):
             resources.delete_disk(self._sdk, backend_data_parsed.boot_disk_id)
+        if backend_data_parsed.pricing_policy_id is not None:
+            with resources.ignore_errors([StatusCode.NOT_FOUND]):
+                resources.delete_pricing_policy(self._sdk, backend_data_parsed.pricing_policy_id)
 
     def create_placement_group(
         self,
@@ -284,8 +351,8 @@ class NebiusCompute(
         master_instance_offer: InstanceOffer,
     ) -> PlacementGroupProvisioningData:
         assert placement_group.configuration.placement_strategy == PlacementStrategy.CLUSTER
-        master_instance_offer_backend_data: NebiusOfferBackendData = (
-            NebiusOfferBackendData.__response__.parse_obj(master_instance_offer.backend_data)
+        master_instance_offer_backend_data = validate_extra_ignore(
+            NebiusOfferBackendData, master_instance_offer.backend_data
         )
         fabrics = list(master_instance_offer_backend_data.fabrics)
         if self.config.fabrics is not None:
@@ -307,7 +374,7 @@ class NebiusCompute(
             )
         return PlacementGroupProvisioningData(
             backend=BackendType.NEBIUS,
-            backend_data=placement_group_backend_data.json(),
+            backend_data=placement_group_backend_data.model_dump_json(),
         )
 
     def delete_placement_group(self, placement_group: PlacementGroup) -> None:
@@ -330,8 +397,8 @@ class NebiusCompute(
         placement_group_backend_data = NebiusPlacementGroupBackendData.load(
             placement_group.provisioning_data.backend_data
         )
-        instance_offer_backend_data: NebiusOfferBackendData = (
-            NebiusOfferBackendData.__response__.parse_obj(instance_offer.backend_data)
+        instance_offer_backend_data = validate_extra_ignore(
+            NebiusOfferBackendData, instance_offer.backend_data
         )
         return (
             placement_group_backend_data.cluster is None
@@ -341,11 +408,12 @@ class NebiusCompute(
 
 class NebiusInstanceBackendData(CoreModel):
     boot_disk_id: str
+    pricing_policy_id: str | None = None
 
     @classmethod
     def load(cls, raw: Optional[str]) -> "NebiusInstanceBackendData":
         assert raw is not None
-        return cls.__response__.parse_raw(raw)
+        return validate_json_extra_ignore(cls, raw)
 
 
 class NebiusClusterBackendData(CoreModel):
@@ -354,12 +422,12 @@ class NebiusClusterBackendData(CoreModel):
 
 
 class NebiusPlacementGroupBackendData(CoreModel):
-    cluster: Optional[NebiusClusterBackendData]
+    cluster: Optional[NebiusClusterBackendData] = None
 
     @classmethod
     def load(cls, raw: Optional[str]) -> "NebiusPlacementGroupBackendData":
         assert raw is not None
-        return cls.__response__.parse_raw(raw)
+        return validate_json_extra_ignore(cls, raw)
 
 
 def _wait_for_instance(sdk: SDK, op: SDKOperation[Operation]) -> None:
@@ -399,3 +467,156 @@ def _wait_for_instance(sdk: SDK, op: SDKOperation[Operation]) -> None:
 def _supported_instances(offer: InstanceOffer) -> bool:
     platform, _ = offer.instance.name.split()
     return platform in SUPPORTED_PLATFORMS
+
+
+def _get_price_adjusted_for_pricing_policy(offer: InstanceOffer) -> float:
+    if (
+        not offer.instance.resources.spot
+        or validate_extra_ignore(
+            NebiusOfferBackendData, offer.backend_data
+        ).is_preemptible_flat_rate
+    ):
+        return offer.price
+    cap, _ = _get_pricing_policy_cap(offer)
+    return float(cap * _get_pricing_policy_price_units(offer))
+
+
+# Nebius accepts a pricing policy bid up to this much (USD per GPU-hour) below the current
+# on-demand price, and answers OUT_OF_RANGE above it.
+NEBIUS_MAX_BID_BELOW_ON_DEMAND = Decimal("0.010")
+
+
+def _with_on_demand_price(offers: List[InstanceOffer]) -> List[InstanceOffer]:
+    """Fork (operator decision 2026-10-08): store on each spot offer its catalog spot price
+    and the on-demand price of the same instance type in the same region. The pricing policy
+    then caps the spot price just below the on-demand price, not at the current spot price,
+    so Nebius does not preempt the VM for price while spot stays below on-demand."""
+    on_demand_prices = {
+        (offer.instance.name, offer.region): offer.price
+        for offer in offers
+        if not offer.instance.resources.spot
+    }
+    result = []
+    for offer in offers:
+        if offer.instance.resources.spot:
+            extra = {"spot_price": offer.price}
+            on_demand_price = on_demand_prices.get((offer.instance.name, offer.region))
+            if on_demand_price is not None:
+                extra["on_demand_price"] = on_demand_price
+            offer = offer.model_copy(update={"backend_data": {**offer.backend_data, **extra}})
+        result.append(offer)
+    return result
+
+
+def _get_run_max_price_modifier(requirements: Requirements) -> OfferModifier:
+    """Fork: on a spot offer that has no on-demand price, record the run's `max_price` so
+    the pricing policy caps the spot price at it. The shown price does not change, so the
+    offer order and the `max_price` filter stay as they are."""
+
+    def modifier(offer: InstanceOfferWithAvailability) -> Optional[InstanceOfferWithAvailability]:
+        if not offer.instance.resources.spot or requirements.max_price is None:
+            return offer
+        data = validate_extra_ignore(NebiusOfferBackendData, offer.backend_data)
+        if data.is_preemptible_flat_rate or data.on_demand_price is not None:
+            return offer
+        return offer.model_copy(
+            update={
+                "backend_data": {**offer.backend_data, "run_max_price": requirements.max_price}
+            }
+        )
+
+    return modifier
+
+
+def _get_spot_price_cap(offer: InstanceOffer) -> Decimal:
+    # Upstream behavior: the cap is the catalog spot price. Pricing policies allow at most
+    # 3 decimal places. Round upward.
+    spot_price = validate_extra_ignore(NebiusOfferBackendData, offer.backend_data).spot_price
+    price = Decimal(str(spot_price if spot_price is not None else offer.price))
+    price = price / _get_pricing_policy_price_units(offer)
+    return price.quantize(Decimal("0.001"), rounding=ROUND_CEILING)
+
+
+def _get_pricing_policy_cap(offer: InstanceOffer) -> tuple[Decimal, str]:
+    """Return the per-GPU pricing policy cap of a spot offer and its source. Fork order: just
+    below the on-demand price of the same type and region, else the run's `max_price`, else
+    the spot price (upstream). A cap is never below the spot price cap."""
+    data = validate_extra_ignore(NebiusOfferBackendData, offer.backend_data)
+    units = _get_pricing_policy_price_units(offer)
+    spot_cap = _get_spot_price_cap(offer)
+    if data.on_demand_price is not None:
+        cap = (
+            Decimal(str(data.on_demand_price)) / units - NEBIUS_MAX_BID_BELOW_ON_DEMAND
+        ).quantize(Decimal("0.001"), rounding=ROUND_FLOOR)
+        if cap >= spot_cap:
+            return cap, "on-demand price"
+    if data.run_max_price is not None:
+        cap = (Decimal(str(data.run_max_price)) / units).quantize(
+            Decimal("0.001"), rounding=ROUND_FLOOR
+        )
+        if cap >= spot_cap:
+            return cap, "run max_price"
+    return spot_cap, "spot price"
+
+
+def _is_out_of_range(code: object) -> bool:
+    if code == StatusCode.OUT_OF_RANGE:
+        return True
+    value = getattr(code, "value", code)
+    if isinstance(value, tuple):
+        value = value[0]
+    return value == StatusCode.OUT_OF_RANGE.value[0]
+
+
+def _create_pricing_policy_with_fallback(
+    sdk: SDK, name: str, project_id: str, platform: str, offer: InstanceOffer
+) -> SDKOperation[Operation]:
+    """Create the pricing policy of a spot VM at its cap. If Nebius refuses the cap as out of
+    range (for example after an on-demand price change that the catalog does not show yet),
+    retry once with the spot price cap, the upstream behavior."""
+    cap, source = _get_pricing_policy_cap(offer)
+    attempts = [(name, cap, source)]
+    spot_cap = _get_spot_price_cap(offer)
+    if cap != spot_cap:
+        attempts.append((f"{name}-spot", spot_cap, "spot price, after OUT_OF_RANGE"))
+    for index, (policy_name, max_price, cap_source) in enumerate(attempts):
+        is_last = index == len(attempts) - 1
+        logger.info(
+            "Nebius spot cap for %s (%s, %s): %s per GPU-hour, source: %s",
+            name,
+            offer.instance.name,
+            offer.region,
+            max_price,
+            cap_source,
+        )
+        try:
+            op = resources.create_pricing_policy(
+                sdk=sdk,
+                name=policy_name,
+                project_id=project_id,
+                platform=platform,
+                max_price=str(max_price),
+            )
+        except RequestError as e:
+            if not is_last and _is_out_of_range(e.status.code):
+                logger.warning("Nebius refused the cap %s as out of range: %s", max_price, e)
+                continue
+            raise
+        resources.wait_for_operation(op, timeout=WAIT_FOR_PRICING_POLICY_TIMEOUT)
+        if op.successful():
+            return op
+        raw_op = op.raw()
+        if not is_last and _is_out_of_range(raw_op.status.code):
+            logger.warning(
+                "Nebius refused the cap %s as out of range: %s", max_price, raw_op.status.message
+            )
+            continue
+        raise ProvisioningError(
+            f"Create pricing policy operation failed. Message: {raw_op.status.message}."
+            f" Details: {raw_op.status.details}"
+        )
+    raise ProvisioningError("Create pricing policy: no cap left to try")
+
+
+def _get_pricing_policy_price_units(offer: InstanceOffer) -> int:
+    return len(offer.instance.resources.gpus) or 1

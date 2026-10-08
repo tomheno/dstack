@@ -1,0 +1,99 @@
+from typing import Annotated
+
+from fastapi import APIRouter, Depends
+from packaging.version import Version
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from dstack._internal.core.models.exports import Export, ListExportsResponse
+from dstack._internal.server.compatibility.exports import patch_list_exports_response
+from dstack._internal.server.db import get_session
+from dstack._internal.server.models import ProjectModel, UserModel
+from dstack._internal.server.schemas.exports import (
+    CreateExportRequest,
+    DeleteExportRequest,
+    UpdateExportRequest,
+)
+from dstack._internal.server.security.permissions import ProjectAdmin, ProjectMember
+from dstack._internal.server.services import exports as exports_services
+from dstack._internal.server.utils.routers import (
+    get_base_api_additional_responses,
+    get_client_version,
+)
+
+project_router = APIRouter(
+    prefix="/api/project/{project_name}/exports",
+    tags=["exports"],
+    responses=get_base_api_additional_responses(),
+)
+
+
+@project_router.post("/create", summary="Create export", response_model=Export)
+async def create_export(
+    body: CreateExportRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    user_project: Annotated[tuple[UserModel, ProjectModel], Depends(ProjectAdmin())],
+):
+    user, project = user_project
+    return await exports_services.create_export(
+        session=session,
+        project=project,
+        user=user,
+        name=body.name,
+        is_global=body.is_global,
+        importer_project_names=body.importer_projects,
+        exported_fleet_names=body.exported_fleets,
+        exported_gateway_names=body.exported_gateways,
+    )
+
+
+@project_router.post("/update", summary="Update export", response_model=Export)
+async def update_export(
+    body: UpdateExportRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    user_project: Annotated[tuple[UserModel, ProjectModel], Depends(ProjectAdmin())],
+):
+    user, project = user_project
+    return await exports_services.update_export(
+        session=session,
+        project=project,
+        user=user,
+        name=body.name,
+        set_global=body.set_global,
+        unset_global=body.unset_global,
+        add_importer_project_names=body.add_importer_projects,
+        remove_importer_project_names=body.remove_importer_projects,
+        add_exported_fleet_names=body.add_exported_fleets,
+        remove_exported_fleet_names=body.remove_exported_fleets,
+        add_exported_gateway_names=body.add_exported_gateways,
+        remove_exported_gateway_names=body.remove_exported_gateways,
+    )
+
+
+@project_router.post("/delete", summary="Delete export")
+async def delete_export(
+    body: DeleteExportRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    user_project: Annotated[tuple[UserModel, ProjectModel], Depends(ProjectAdmin())],
+):
+    _, project = user_project
+    await exports_services.delete_export(
+        session=session,
+        project=project,
+        name=body.name,
+    )
+
+
+@project_router.post("/list", summary="List exports")
+async def list_exports(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    user_project: Annotated[tuple[UserModel, ProjectModel], Depends(ProjectMember())],
+    client_version: Annotated[Version | None, Depends(get_client_version)],
+) -> ListExportsResponse | list[Export]:
+    """Returns a bare list for clients older than 0.22.0, otherwise a `ListExportsResponse`."""
+    _, project = user_project
+    response = await exports_services.list_exports(
+        session=session,
+        project=project,
+    )
+    response = patch_list_exports_response(response, client_version)
+    return response

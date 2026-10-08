@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Outlet, useNavigate, useParams } from 'react-router-dom';
+import { product } from 'product';
 
-import { ConfirmationDialog, ContentLayout, SpaceBetween, Tabs } from 'components';
+import { Box, ConfirmationDialog, ContentLayout, Tabs } from 'components';
 import { DetailsHeader } from 'components';
 
 import { useNotifications /* usePermissionGuard*/ } from 'hooks';
@@ -13,8 +14,11 @@ import { useDeleteUsersMutation, useGetUserQuery } from 'services/user';
 // import { GlobalUserRole } from '../../../types';
 import { UserDetailsTabTypeEnum } from './types';
 
+import styles from './styles.module.scss';
+
 export { Settings as UserSettings } from './Settings';
 export { Billing as UserBilling } from './Billing';
+export { Events as UserEvents } from './Events';
 export { UserProjectList as UserProjects } from './Projects';
 
 export const UserDetails: React.FC = () => {
@@ -63,24 +67,26 @@ export const UserDetails: React.FC = () => {
             label: t('users.settings'),
             id: UserDetailsTabTypeEnum.SETTINGS,
             href: ROUTES.USER.DETAILS.FORMAT(paramUserName),
-            content: <Outlet />,
         },
         {
             label: t('users.projects'),
             id: UserDetailsTabTypeEnum.PROJECTS,
             href: ROUTES.USER.PROJECTS.FORMAT(paramUserName),
-            content: <Outlet />,
         },
-        process.env.UI_VERSION === 'sky' && {
+        product.hasEvents && {
+            label: t('users.events'),
+            id: UserDetailsTabTypeEnum.EVENTS,
+            href: ROUTES.USER.EVENTS.FORMAT(paramUserName),
+        },
+        product.hasBilling && {
             label: t('billing.title'),
             id: UserDetailsTabTypeEnum.BILLING,
             href: ROUTES.USER.BILLING.LIST.FORMAT(paramUserName),
-            content: <Outlet />,
         },
     ].filter(Boolean);
 
     return (
-        <>
+        <div className={styles.page}>
             <ContentLayout
                 header={
                     <DetailsHeader
@@ -90,12 +96,18 @@ export const UserDetails: React.FC = () => {
                     />
                 }
             >
-                <SpaceBetween size="l">
-                    <Tabs variant="container" withNavigation tabs={tabs} />
-                </SpaceBetween>
+                <Tabs withNavigation tabs={tabs} />
+
+                <Outlet />
             </ContentLayout>
 
-            <ConfirmationDialog visible={showDeleteConfirm} onDiscard={toggleDeleteConfirm} onConfirm={deleteUserHandler} />
-        </>
+            <ConfirmationDialog
+                visible={showDeleteConfirm}
+                content={<Box variant="span">{t('confirm_dialog.message')}</Box>}
+                onDiscard={toggleDeleteConfirm}
+                onConfirm={deleteUserHandler}
+                confirmButtonLabel={t('common.delete')}
+            />
+        </div>
     );
 };

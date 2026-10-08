@@ -1,14 +1,16 @@
 import datetime
+import uuid
 from enum import Enum
 from typing import Dict, Optional, Union
 
-from pydantic import Field, validator
+from pydantic import Field, RootModel, field_validator
 from typing_extensions import Annotated, Literal
 
 from dstack._internal.core.models.backends.base import BackendType
-from dstack._internal.core.models.common import CoreModel
-from dstack._internal.core.models.routers import AnyRouterConfig
+from dstack._internal.core.models.common import ApplyAction, CoreModel
 from dstack._internal.utils.tags import tags_validator
+
+GATEWAY_REPLICAS_DEFAULT = 1
 
 
 class GatewayStatus(str, Enum):
@@ -16,6 +18,14 @@ class GatewayStatus(str, Enum):
     PROVISIONING = "provisioning"
     RUNNING = "running"
     FAILED = "failed"
+
+
+class GatewayReplicaStatus(str, Enum):
+    SUBMITTED = "submitted"
+    PROVISIONING = "provisioning"
+    RUNNING = "running"
+    TERMINATING = "terminating"
+    TERMINATED = "terminated"
 
 
 class LetsEncryptGatewayCertificate(CoreModel):
@@ -26,29 +36,75 @@ class LetsEncryptGatewayCertificate(CoreModel):
 
 class ACMGatewayCertificate(CoreModel):
     type: Annotated[
-        Literal["acm"], Field(description="Certificates by AWS Certificate Manager (ACM)")
+        Literal["acm"],
+        Field(
+            description=(
+                "Certificates by AWS Certificate Manager (ACM)."
+                " Implies `load_balancer: { type: alb }`"
+            )
+        ),
     ] = "acm"
     arn: Annotated[
         str, Field(description="The ARN of the wildcard ACM certificate for the domain")
     ]
 
 
+class GCPCertificateManagerGatewayCertificate(CoreModel):
+    type: Annotated[
+        Literal["gcp-cm"],
+        Field(
+            description=(
+                "Certificates by Google Cloud Certificate Manager."
+                " Requires `load_balancer: { type: alb }`"
+            )
+        ),
+    ] = "gcp-cm"
+    name: Annotated[
+        str,
+        Field(
+            description=(
+                "The full resource name of the Certificate Manager certificate for the domain,"
+                " e.g. `projects/my-project/locations/europe-west9/certificates/my-certificate`"
+            )
+        ),
+    ]
+
+
 # TODO: Allow setting up custom ACME certificate (e.g. ZeroSSL) via GatewayConfiguration
 
-AnyGatewayCertificate = Union[LetsEncryptGatewayCertificate, ACMGatewayCertificate]
+AnyGatewayCertificate = Union[
+    LetsEncryptGatewayCertificate,
+    ACMGatewayCertificate,
+    GCPCertificateManagerGatewayCertificate,
+]
 
 
-class GatewayCertificate(CoreModel):
-    __root__: Annotated[
-        AnyGatewayCertificate,
-        Field(discriminator="type"),
-    ]
+class GatewayCertificate(RootModel[Annotated[AnyGatewayCertificate, Field(discriminator="type")]]):
+    pass
+
+
+class ALBGatewayLoadBalancer(CoreModel):
+    type: Annotated[Literal["alb"], Field(description="Application Load Balancer")] = "alb"
+
+
+AnyGatewayLoadBalancer = Union[ALBGatewayLoadBalancer]
 
 
 class GatewayConfiguration(CoreModel):
     type: Literal["gateway"] = "gateway"
     name: Annotated[Optional[str], Field(description="The gateway name")] = None
-    default: Annotated[bool, Field(description="Make the gateway default")] = False
+    default: Annotated[
+        Optional[bool],
+        Field(
+            description=(
+                "Whether the gateway is the project's default. Can be updated in-place."
+                " If unset when creating a new gateway,"
+                " the gateway will become the default unless there is already a default gateway."
+                " If unset when updating the gateway in-place,"
+                " the gateway's default status will not change"
+            )
+        ),
+    ] = None
     backend: Annotated[BackendType, Field(description="The gateway backend")]
     region: Annotated[str, Field(description="The gateway region")]
     instance_type: Annotated[
@@ -61,18 +117,45 @@ class GatewayConfiguration(CoreModel):
             min_length=1,
         ),
     ] = None
-    router: Annotated[
-        Optional[AnyRouterConfig],
-        Field(description="The router configuration"),
-    ] = None
     domain: Annotated[
-        Optional[str], Field(description="The gateway domain, e.g. `example.com`")
+        Optional[str],
+        Field(
+            description=(
+                "The gateway wildcard domain name, e.g. `example.com`."
+                " Service domain names are constructed as `<run name>.<gateway domain`."
+                " The domain name can use the `${{ run.project_name }}` variable"
+                " to include the service’s project name."
+                " Can be updated in-place. Updates do not affect existing services"
+            )
+        ),
     ] = None
     public_ip: Annotated[bool, Field(description="Allocate public IP for the gateway")] = True
+    load_balancer: Annotated[
+        Optional[AnyGatewayLoadBalancer],
+        Field(
+            discriminator="type",
+            description=(
+                "The load balancer configuration."
+                " Set to `type: alb` to front the gateway with an Application Load Balancer"
+                " (supported for the `aws` and `gcp` backends)"
+            ),
+        ),
+    ] = None
     certificate: Annotated[
         Optional[AnyGatewayCertificate],
-        Field(description="The SSL certificate configuration. Defaults to `type: lets-encrypt`"),
+        Field(
+            discriminator="type",
+            description="The SSL certificate configuration."
+            " Set to `null` to disable. Defaults to `type: lets-encrypt`",
+        ),
     ] = LetsEncryptGatewayCertificate()
+    replicas: Annotated[
+        Optional[int],
+        Field(
+            description=f"The number of gateway replicas. Defaults to `{GATEWAY_REPLICAS_DEFAULT}`",
+            ge=1,
+        ),
+    ] = None
     tags: Annotated[
         Optional[Dict[str, str]],
         Field(
@@ -84,7 +167,7 @@ class GatewayConfiguration(CoreModel):
         ),
     ] = None
 
-    _validate_tags = validator("tags", pre=True, allow_reuse=True)(tags_validator)
+    _validate_tags = field_validator("tags", mode="before")(tags_validator)
 
 
 class GatewaySpec(CoreModel):
@@ -92,35 +175,68 @@ class GatewaySpec(CoreModel):
     configuration_path: Optional[str] = None
 
 
+class GatewayReplica(CoreModel):
+    hostname: Optional[str] = None
+    replica_num: int
+    backend: Optional[BackendType] = None
+    region: Optional[str] = None
+    created_at: datetime.datetime
+    status: GatewayReplicaStatus
+    status_message: Optional[str] = None
+
+
 class Gateway(CoreModel):
+    id: uuid.UUID
     name: str
+    project_name: str
     configuration: GatewayConfiguration
     created_at: datetime.datetime
     status: GatewayStatus
-    status_message: Optional[str]
-    # The ip address / hostname the user should set up the domain for.
-    # Could be the same as ip_address but also different, e.g. gateway behind ALB.
-    hostname: Optional[str]
-    # The ip address of the gateway instance
-    ip_address: Optional[str]
-    instance_id: Optional[str]
-    wildcard_domain: Optional[str]
+    status_message: Optional[str] = None
+    hostname: Optional[str] = None
+    """Hostname of the load balancer.
+    Unset if there is no load balancer, in which case users are expected to point the gateway's
+    wildcard domain name to `replicas[i].hostname`.
+    """
+    wildcard_domain: Optional[str] = None
     default: bool
-    # TODO: Deprecated configuration fields duplicated on top-level
-    # for backward compatibility with 0.19.x clients that expect them required.
-    # Remove after 0.21
+    replicas: list[GatewayReplica] = []
+    # TODO: remove `backend` and `region` in 0.22.
     backend: Optional[BackendType] = None
+    """Never set since 0.21, use `configuration.backend`. Kept because pre-0.21 clients echo it
+    back inside `current_resource` on apply, and requests reject extra fields.
+    """
     region: Optional[str] = None
+    """Never set since 0.21, use `configuration.region`. See `backend`."""
+    ip_address: Optional[str] = None
+    """Deprecated in favor of `replicas[i].hostname`, only set for pre-0.20.25 clients."""
+    instance_id: Optional[str] = None
+    """Deprecated, unused, kept for pre-0.20.25 clients."""
 
 
 class GatewayPlan(CoreModel):
     project_name: str
     user: str
     spec: GatewaySpec
+    effective_spec: GatewaySpec
     current_resource: Optional[Gateway] = None
+    action: ApplyAction
 
 
-class GatewayComputeConfiguration(CoreModel):
+class ApplyGatewayPlanInput(CoreModel):
+    spec: GatewaySpec
+    current_resource: Annotated[
+        Optional[Gateway],
+        Field(
+            description=(
+                "The expected current resource."
+                " If the resource has changed, the apply fails unless `force: true`."
+            )
+        ),
+    ] = None
+
+
+class GatewayReplicaConfiguration(CoreModel):
     project_name: str
     instance_name: str
     backend: BackendType
@@ -128,15 +244,30 @@ class GatewayComputeConfiguration(CoreModel):
     instance_type: Optional[str] = None
     public_ip: bool
     ssh_key_pub: str
-    certificate: Optional[AnyGatewayCertificate] = None
+    certificate: Annotated[Optional[AnyGatewayCertificate], Field(discriminator="type")] = None
     tags: Optional[Dict[str, str]] = None
-    router: Optional[AnyRouterConfig] = None
 
 
-class GatewayProvisioningData(CoreModel):
+class GatewayReplicaProvisioningData(CoreModel):
     instance_id: str
-    ip_address: str  # TODO: rename, Kubernetes uses domain names
+    # TODO: rename `ip_address`; Kubernetes uses domain names here.
+    ip_address: str
     region: str
     availability_zone: Optional[str] = None
-    hostname: Optional[str] = None
-    backend_data: Optional[str] = None  # backend-specific data in json
+    backend_data: Optional[str] = None
+    """`backend_data` stores backend-specific data in JSON."""
+
+
+class GatewayLoadBalancerConfiguration(CoreModel):
+    project_name: str
+    gateway_name: str
+    region: str
+    public_ip: bool
+    certificate: Optional[AnyGatewayCertificate] = None
+    tags: Optional[Dict[str, str]] = None
+
+
+class GatewayLoadBalancerData(CoreModel):
+    hostname: str
+    backend_data: str
+    """Backend-specific JSON"""

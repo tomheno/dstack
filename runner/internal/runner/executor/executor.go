@@ -1,0 +1,1008 @@
+package executor
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/dstackai/ansistrip"
+	"github.com/prometheus/procfs"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
+
+	"github.com/dstackai/dstack/runner/internal/common/consts"
+	"github.com/dstackai/dstack/runner/internal/common/log"
+	"github.com/dstackai/dstack/runner/internal/common/types"
+	"github.com/dstackai/dstack/runner/internal/common/utils"
+	"github.com/dstackai/dstack/runner/internal/runner/connections"
+	cap "github.com/dstackai/dstack/runner/internal/runner/linux/capabilities"
+	linuxuser "github.com/dstackai/dstack/runner/internal/runner/linux/user"
+	"github.com/dstackai/dstack/runner/internal/runner/schemas"
+	"github.com/dstackai/dstack/runner/internal/runner/ssh"
+)
+
+// TODO: Tune these parameters for optimal experience/performance
+const (
+	// Output is flushed when the cursor doesn't move for this duration
+	AnsiStripFlushInterval = 500 * time.Millisecond
+
+	// Output is flushed regardless of cursor activity after this maximum delay
+	AnsiStripMaxDelay = 3 * time.Second
+
+	// Maximum buffer size for ansistrip
+	MaxBufferSize = 32 * 1024 // 32KB
+
+	// intrChar is the terminal's INTR character (Ctrl-C) in the default configuration.
+	intrChar = 0x03
+	// intrWriteTimeout bounds how long writing INTR to the pty master may block.
+	intrWriteTimeout = 5 * time.Second
+)
+
+type ConnectionTracker interface {
+	GetNoConnectionsSecs() int64
+	Track(ticker <-chan time.Time)
+	Stop()
+}
+
+type RunExecutor struct {
+	tempDir     string
+	dstackDir   string
+	currentUser linuxuser.User
+	sshd        ssh.SshdManager
+
+	fileArchiveDir string
+	repoBlobDir    string
+
+	runnerLogFile     *os.File
+	runnerLogStripper *ansistrip.Writer
+	runnerLogger      *logrus.Entry
+
+	run             schemas.Run
+	jobSpec         schemas.JobSpec
+	jobSubmission   schemas.JobSubmission
+	clusterInfo     schemas.ClusterInfo
+	secrets         map[string]string
+	repoCredentials *schemas.RepoCredentials
+	repoDir         string
+	repoBlobPath    string
+	// If the user is not specified in the JobSpec, jobUser should point to currentUser
+	jobUser       *linuxuser.User
+	jobWorkingDir string
+
+	mu              *sync.RWMutex
+	state           string
+	jobStateHistory []schemas.JobStateEvent
+	jobLogs         *appendWriter
+	jobWsLogs       *appendWriter
+	runnerLogs      *appendWriter
+	setupDone       bool
+	finalized       bool
+	finalizeOnce    sync.Once
+	timestamp       *MonotonicTimestamp
+
+	// How long after the job is asked to stop before SIGHUP goes to its session, and before
+	// SIGKILL does. Both are measured from the interrupt.
+	hupDelay  time.Duration
+	killDelay time.Duration
+	// How long output may go on being copied after the command has exited, before the pty
+	// master is closed. Only reached when the job leaves processes holding the terminal open.
+	logsDrainDelay    time.Duration
+	connectionTracker ConnectionTracker
+}
+
+func NewRunExecutor(tempDir string, dstackDir string, currentUser linuxuser.User, sshd ssh.SshdManager) (*RunExecutor, error) {
+	mu := &sync.RWMutex{}
+	timestamp := NewMonotonicTimestamp()
+
+	proc, err := procfs.NewDefaultFS()
+	if err != nil {
+		return nil, fmt.Errorf("initialize procfs: %w", err)
+	}
+	connectionTracker := connections.NewConnectionTracker(connections.ConnectionTrackerConfig{
+		Port:            uint64(sshd.Port()),
+		MinConnDuration: 10 * time.Second, // shorter connections are likely from dstack-server
+		Procfs:          proc,
+	})
+
+	return &RunExecutor{
+		tempDir:     tempDir,
+		dstackDir:   dstackDir,
+		currentUser: currentUser,
+		sshd:        sshd,
+
+		fileArchiveDir: filepath.Join(tempDir, "file_archives"),
+		repoBlobDir:    filepath.Join(tempDir, "repo_blobs"),
+
+		mu:              mu,
+		state:           WaitSubmit,
+		jobStateHistory: make([]schemas.JobStateEvent, 0),
+		jobLogs:         newAppendWriter(mu, timestamp),
+		jobWsLogs:       newAppendWriter(mu, timestamp),
+		runnerLogs:      newAppendWriter(mu, timestamp),
+		timestamp:       timestamp,
+
+		hupDelay:          5 * time.Second,
+		killDelay:         10 * time.Second,
+		logsDrainDelay:    2 * time.Second,
+		connectionTracker: connectionTracker,
+	}, nil
+}
+
+// Setup prepares the executor for Run: it configures runner logging and resolves the job user
+// and working dir. It must be called exactly once, after SetJob, and Run must not be called if
+// it fails -- a failed Setup finalizes the executor itself, so the caller only has to skip Run.
+//
+// Setup must not execute long-running operations, as it is called synchronously in the /api/run
+// method.
+func (ex *RunExecutor) Setup(ctx context.Context) (err error) {
+	defer func() {
+		if err != nil {
+			ex.Finalize(ctx)
+		}
+	}()
+
+	// logging is required for the subsequent setJob{User,WorkingDir} calls
+	runnerLogFile, err := log.CreateAppendFile(filepath.Join(ex.tempDir, consts.RunnerLogFileName))
+	if err != nil {
+		ex.SetJobState(ctx, schemas.JobStateFailed)
+		return fmt.Errorf("create runner log file: %w", err)
+	}
+	ex.runnerLogFile = runnerLogFile
+	ex.runnerLogStripper = ansistrip.NewWriter(ex.runnerLogs, AnsiStripFlushInterval, AnsiStripMaxDelay, MaxBufferSize)
+	runnerLogWriter := io.MultiWriter(ex.runnerLogFile, os.Stdout, ex.runnerLogStripper)
+	runnerLogLevel := log.DefaultEntry.Logger.Level
+	ex.runnerLogger = log.NewEntry(runnerLogWriter, int(runnerLogLevel))
+	ctx = log.WithLogger(ctx, ex.runnerLogger)
+	log.Info(ctx, "Logging configured", "log_level", runnerLogLevel.String())
+
+	// jobUser and jobWorkingDir are required for JobInfo()
+	if err := ex.setJobUser(ctx); err != nil {
+		ex.SetJobStateWithTerminationReason(
+			ctx,
+			schemas.JobStateFailed,
+			types.TerminationReasonExecutorError,
+			fmt.Sprintf("Failed to set job user (%s)", err),
+		)
+		return fmt.Errorf("set job user: %w", err)
+	}
+	if err := ex.setJobWorkingDir(ctx); err != nil {
+		ex.SetJobStateWithTerminationReason(
+			ctx,
+			schemas.JobStateFailed,
+			types.TerminationReasonExecutorError,
+			fmt.Sprintf("Failed to set job working dir (%s)", err),
+		)
+		return fmt.Errorf("set job working dir: %w", err)
+	}
+
+	ex.setupDone = true
+	return nil
+}
+
+// JobInfo must be called after a successful Setup
+func (ex *RunExecutor) JobInfo() (string, string) {
+	return ex.jobUser.Username, ex.jobWorkingDir
+}
+
+// Run must be called after SetJob, WriteRepoBlob and a successful Setup. It finalizes the
+// executor before returning, so the caller does not have to.
+func (ex *RunExecutor) Run(ctx context.Context) (err error) {
+	if !ex.setupDone {
+		return errors.New("not set up")
+	}
+	if ex.finalized {
+		return errors.New("already finished")
+	}
+	defer ex.Finalize(ctx)
+
+	jobLogFile, err := log.CreateAppendFile(filepath.Join(ex.tempDir, consts.RunnerJobLogFileName))
+	if err != nil {
+		ex.SetJobState(ctx, schemas.JobStateFailed)
+		return fmt.Errorf("create job log file: %w", err)
+	}
+	defer func() { _ = jobLogFile.Close() }()
+
+	defer func() {
+		// recover goes before Finalize(), which closes runnerLogFile, to keep the log
+		if r := recover(); r != nil {
+			log.Error(ctx, "Executor PANIC", "err", r)
+			ex.SetJobState(ctx, schemas.JobStateFailed)
+			err = fmt.Errorf("recovered: %v", r)
+		}
+	}()
+	defer func() {
+		if err != nil {
+			// TODO: refactor error handling and logs
+			log.Error(ctx, consts.ExecutorFailedSignature, "err", err)
+		}
+	}()
+
+	ctx = log.WithLogger(ctx, ex.runnerLogger)
+	log.Info(ctx, "Run job")
+
+	// setJobUser sets User.HomeDir to "/" if the original home dir is not set or not accessible,
+	// in that case we skip home dir provisioning
+	if ex.jobUser.HomeDir == "/" {
+		log.Info(ctx, "Skipping home dir provisioning")
+	} else {
+		// All home dir-related errors are considered non-fatal
+		cleanupGitCredentials, err := ex.setupGitCredentials(ctx)
+		if err != nil {
+			log.Error(ctx, "Failed to set up Git credentials", "err", err)
+		} else {
+			defer cleanupGitCredentials()
+		}
+		if err := ex.setupClusterSsh(ctx); err != nil {
+			log.Error(ctx, "Failed to set up cluster SSH", "err", err)
+		}
+	}
+
+	if err := ex.setupRepo(ctx); err != nil {
+		ex.SetJobStateWithTerminationReason(
+			ctx,
+			schemas.JobStateFailed,
+			types.TerminationReasonContainerExitedWithError,
+			fmt.Sprintf("Failed to set up the repo (%s)", err),
+		)
+		return fmt.Errorf("setup repo: %w", err)
+	}
+
+	if err := ex.setupFiles(ctx); err != nil {
+		ex.SetJobStateWithTerminationReason(
+			ctx,
+			schemas.JobStateFailed,
+			types.TerminationReasonExecutorError,
+			fmt.Sprintf("Failed to set up files (%s)", err),
+		)
+		return fmt.Errorf("setup files: %w", err)
+	}
+
+	connectionTrackerTicker := time.NewTicker(2500 * time.Millisecond)
+	go ex.connectionTracker.Track(connectionTrackerTicker.C)
+	defer ex.connectionTracker.Stop()
+
+	ex.SetJobState(ctx, schemas.JobStateRunning)
+	timeoutCtx := ctx
+	var cancelTimeout context.CancelFunc
+	if ex.jobSpec.MaxDuration != 0 {
+		timeoutCtx, cancelTimeout = context.WithTimeout(ctx, time.Duration(ex.jobSpec.MaxDuration)*time.Second)
+		defer cancelTimeout()
+	}
+	if err := ex.execJob(timeoutCtx, jobLogFile); err != nil {
+		select {
+		case <-ctx.Done():
+			log.Error(ctx, "Job canceled")
+			ex.SetJobState(ctx, schemas.JobStateTerminated)
+			return fmt.Errorf("job canceled: %w", err)
+		default:
+		}
+
+		select {
+		case <-timeoutCtx.Done():
+			log.Error(ctx, "Max duration exceeded", "max_duration", ex.jobSpec.MaxDuration)
+			ex.SetJobStateWithTerminationReason(
+				ctx,
+				schemas.JobStateTerminated,
+				types.TerminationReasonMaxDurationExceeded,
+				"Max duration exceeded",
+			)
+			return fmt.Errorf("max duration exceeded: %w", err)
+		default:
+		}
+
+		if errors.Is(err, ErrLogQuotaExceeded) {
+			log.Error(ctx, "Log quota exceeded", "quota", ex.jobLogs.quota)
+			ex.SetJobStateWithTerminationReason(
+				ctx,
+				schemas.JobStateFailed,
+				types.TerminationReasonLogQuotaExceeded,
+				fmt.Sprintf("Job log output exceeded the hourly quota of %d bytes", ex.jobLogs.quota),
+			)
+			return fmt.Errorf("log quota exceeded: %w", err)
+		}
+
+		// todo fail reason?
+		log.Error(ctx, "Exec failed", "err", err)
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) {
+			ex.SetJobStateWithExitStatus(ctx, schemas.JobStateFailed, exitError.ExitCode())
+		} else {
+			ex.SetJobState(ctx, schemas.JobStateFailed)
+		}
+		return fmt.Errorf("exec job failed: %w", err)
+	}
+
+	ex.SetJobStateWithExitStatus(ctx, schemas.JobStateDone, 0)
+	return nil
+}
+
+func (ex *RunExecutor) SetJob(body schemas.SubmitBody) {
+	ex.run = body.Run
+	ex.jobSubmission = body.JobSubmission
+	ex.jobSpec = body.JobSpec
+	ex.clusterInfo = body.ClusterInfo
+	ex.secrets = body.Secrets
+	ex.repoCredentials = body.RepoCredentials
+	ex.jobLogs.SetQuota(body.LogQuotaHour)
+}
+
+func (ex *RunExecutor) SetJobState(ctx context.Context, state schemas.JobState) {
+	ex.SetJobStateWithTerminationReason(ctx, state, "", "")
+}
+
+func (ex *RunExecutor) SetJobStateWithTerminationReason(
+	ctx context.Context, state schemas.JobState, terminationReason types.TerminationReason, terminationMessage string,
+) {
+	ex.mu.Lock()
+	ex.jobStateHistory = append(
+		ex.jobStateHistory,
+		schemas.JobStateEvent{
+			State:              state,
+			Timestamp:          ex.timestamp.Next(),
+			TerminationReason:  terminationReason,
+			TerminationMessage: terminationMessage,
+		},
+	)
+	ex.mu.Unlock()
+	if terminationReason != "" {
+		ctx = log.AppendArgsCtx(ctx, "termination_reason", terminationReason, "termination_message", terminationMessage)
+	}
+	log.Info(ctx, "Job state changed", "new", state)
+}
+
+func (ex *RunExecutor) SetJobStateWithExitStatus(
+	ctx context.Context, state schemas.JobState, exitStatus int,
+) {
+	ex.mu.Lock()
+	ex.jobStateHistory = append(
+		ex.jobStateHistory,
+		schemas.JobStateEvent{
+			State:      state,
+			Timestamp:  ex.timestamp.Next(),
+			ExitStatus: &exitStatus,
+		},
+	)
+	ex.mu.Unlock()
+	log.Info(ctx, "Job state changed", "new", state)
+}
+
+func (ex *RunExecutor) SetRunnerState(state string) {
+	ex.state = state
+}
+
+// Finalize closes runner logging and marks the state it serves as final. Setup and Run call it
+// themselves, so callers only need it as a safeguard; it is idempotent, and concurrent calls
+// block until the first one has finished.
+func (ex *RunExecutor) Finalize(ctx context.Context) {
+	ex.finalizeOnce.Do(func() {
+		// finalizeOnce keeps Finalize idempotent; ex.finalized is what the Run gate reports on
+		ex.finalized = true
+		if ex.runnerLogFile != nil {
+			if err := ex.runnerLogFile.Close(); err != nil {
+				log.Error(ctx, "Failed to close runnerLogFile", "err", err)
+			}
+		}
+		if ex.runnerLogStripper != nil {
+			// Close() flushes the buffered logs synchronously, and the flush takes ex.mu, so
+			// it must not be called with the lock held
+			if err := ex.runnerLogStripper.Close(); err != nil {
+				log.Error(ctx, "Failed to close runnerLogStripper", "err", err)
+			}
+		}
+		// Only now that the last logs have been flushed does WaitLogsFinished hold: it tells
+		// /api/pull that the state it serves is final
+		ex.mu.Lock()
+		ex.SetRunnerState(WaitLogsFinished)
+		ex.mu.Unlock()
+	})
+}
+
+// setJobWorkingDir must be called from Run after setJobUser
+func (ex *RunExecutor) setJobWorkingDir(ctx context.Context) error {
+	var err error
+	if ex.jobSpec.WorkingDir == nil {
+		ex.jobWorkingDir, err = os.Getwd()
+		if err != nil {
+			return fmt.Errorf("get working directory: %w", err)
+		}
+	} else {
+		ex.jobWorkingDir, err = utils.ExpandPath(*ex.jobSpec.WorkingDir, "", ex.jobUser.HomeDir)
+		if err != nil {
+			return fmt.Errorf("expand working dir path: %w", err)
+		}
+		if !path.IsAbs(ex.jobWorkingDir) {
+			return fmt.Errorf("working dir must be absolute: %s", ex.jobWorkingDir)
+		}
+	}
+	log.Trace(ctx, "Job working dir", "path", ex.jobWorkingDir)
+	return nil
+}
+
+// setupClusterSsh must be called from Run after setJobUser
+func (ex *RunExecutor) setupClusterSsh(ctx context.Context) error {
+	if ex.jobSpec.SSHKey == nil || len(ex.clusterInfo.JobIPs) < 2 {
+		return nil
+	}
+
+	sshDir, err := prepareUserSshDir(ex.jobUser)
+	if err != nil {
+		return fmt.Errorf("prepare user ssh dir: %w", err)
+	}
+
+	privatePath := filepath.Join(sshDir, "dstack_job")
+	privateFile, err := os.OpenFile(privatePath, os.O_TRUNC|os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("open private key file: %w", err)
+	}
+	defer privateFile.Close()
+	if err := os.Chown(privatePath, ex.jobUser.Uid, ex.jobUser.Uid); err != nil {
+		return fmt.Errorf("chown private key: %w", err)
+	}
+	if _, err := privateFile.WriteString(ex.jobSpec.SSHKey.Private); err != nil {
+		return fmt.Errorf("write private key: %w", err)
+	}
+
+	// TODO: move job hosts config to ~/.dstack/ssh/config.d/current_job.conf
+	// and add "Include ~/.dstack/ssh/config.d/*.conf" directive to ~/.ssh/config if not present
+	// instead of appending job hosts config directly (don't bloat user's ssh_config)
+	configPath := filepath.Join(sshDir, "config")
+	configFile, err := os.OpenFile(configPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("open SSH config: %w", err)
+	}
+	defer configFile.Close()
+	if err := os.Chown(configPath, ex.jobUser.Uid, ex.jobUser.Gid); err != nil {
+		return fmt.Errorf("chown SSH config: %w", err)
+	}
+	configBuffer := new(bytes.Buffer)
+	for _, ip := range ex.clusterInfo.JobIPs {
+		fmt.Fprintf(configBuffer, "\nHost %s\n", ip)
+		fmt.Fprintf(configBuffer, "    Port %d\n", ex.sshd.Port())
+		configBuffer.WriteString("    StrictHostKeyChecking no\n")
+		configBuffer.WriteString("    UserKnownHostsFile /dev/null\n")
+		fmt.Fprintf(configBuffer, "    IdentityFile %s\n", privatePath)
+	}
+	if _, err := configFile.Write(configBuffer.Bytes()); err != nil {
+		return fmt.Errorf("write SSH config: %w", err)
+	}
+
+	if err := ex.sshd.AddAuthorizedKeys(ctx, ex.jobSpec.SSHKey.Public); err != nil {
+		return fmt.Errorf("add authorized key: %w", err)
+	}
+
+	return nil
+}
+
+func (ex *RunExecutor) getRepoData() schemas.RepoData {
+	if ex.jobSpec.RepoData == nil {
+		// jobs submitted before 0.19.17 do not have jobSpec.RepoData
+		return ex.run.RunSpec.RepoData
+	}
+	return *ex.jobSpec.RepoData
+}
+
+func (ex *RunExecutor) execJob(ctx context.Context, jobLogFile io.Writer) error {
+	nodeRank := ex.jobSpec.JobNum
+	nodesNum := ex.jobSpec.JobsPerReplica
+	gpusPerNodeNum := ex.clusterInfo.GPUSPerJob
+	gpusNum := 0
+	if len(ex.clusterInfo.GPUSPerNode) > 0 {
+		for _, n := range ex.clusterInfo.GPUSPerNode {
+			gpusNum += n
+		}
+	} else {
+		// Old servers omit gpus_per_node; fall back to homogeneous math.
+		gpusNum = nodesNum * gpusPerNodeNum
+	}
+
+	mpiHostfilePath := filepath.Join(ex.dstackDir, "mpi/hostfile")
+
+	jobEnvs := map[string]string{
+		"DSTACK_RUN_ID":         ex.run.Id,
+		"DSTACK_JOB_ID":         ex.jobSubmission.Id,
+		"DSTACK_RUN_NAME":       ex.run.RunSpec.RunName,
+		"DSTACK_REPO_ID":        ex.run.RunSpec.RepoId,
+		"DSTACK_REPO_DIR":       ex.repoDir,
+		"DSTACK_WORKING_DIR":    ex.jobWorkingDir,
+		"DSTACK_NODES_IPS":      strings.Join(ex.clusterInfo.JobIPs, "\n"),
+		"DSTACK_MASTER_NODE_IP": ex.clusterInfo.MasterJobIP,
+		"DSTACK_NODE_RANK":      strconv.Itoa(nodeRank),
+		"DSTACK_NODES_NUM":      strconv.Itoa(nodesNum),
+		"DSTACK_GPUS_PER_NODE":  strconv.Itoa(gpusPerNodeNum),
+		"DSTACK_GPUS_NUM":       strconv.Itoa(gpusNum),
+		"DSTACK_MPI_HOSTFILE":   mpiHostfilePath,
+	}
+
+	// The command gets a context of its own so that stopping the job from inside the executor,
+	// when the log quota is exceeded, takes the same path as a stop from outside without
+	// cancelling the caller's context -- which Run reads to tell why the job stopped.
+	cmdCtx, cancelCmd := context.WithCancel(ctx)
+	defer cancelCmd()
+
+	cmd := exec.CommandContext(cmdCtx, ex.jobSpec.Commands[0], ex.jobSpec.Commands[1:]...)
+	// WaitDelay is deliberately left unset. It kills cmd.Process alone, which is the wrapper
+	// shell, and everything the job started would go on running; terminateSession does it.
+	cmd.WaitDelay = 0
+
+	if err := utils.MkdirAll(ctx, ex.jobWorkingDir, ex.jobUser.Uid, ex.jobUser.Gid, 0o755); err != nil {
+		return fmt.Errorf("create working directory: %w", err)
+	}
+	cmd.Dir = ex.jobWorkingDir
+
+	// CAP_SET{UID,GID} for startCommand() -> Cmd.Start() -> set{uid,gid,groups} syscalls during fork-exec
+	// CAP_CHOWN for startCommand() -> os.Chown(pts.Name())
+	if missing, err := cap.Check(cap.SETUID, cap.SETGID, cap.CHOWN); err != nil {
+		log.Error(
+			ctx, "Failed to check capabilities, won't try to set process credentials",
+			"err", err, "user", ex.currentUser,
+		)
+	} else if len(missing) > 0 {
+		log.Info(
+			ctx, "Required capabilities are missing, cannot set process credentials",
+			"missing", missing, "user", ex.currentUser,
+		)
+	} else {
+		log.Trace(ctx, "Using credentials", "user", ex.jobUser)
+		if cmd.SysProcAttr == nil {
+			cmd.SysProcAttr = &syscall.SysProcAttr{}
+		}
+		creds, err := ex.jobUser.ProcessCredentials()
+		if err != nil {
+			return fmt.Errorf("prepare process credentials: %w", err)
+		}
+		cmd.SysProcAttr.Credential = creds
+	}
+
+	envMap := NewEnvMap(ParseEnvList(os.Environ()), jobEnvs, ex.secrets)
+	// `env` interpolation feature is postponed to some future release
+	envMap.Update(ex.jobSpec.Env, false)
+	sanitizeEnv(ctx, envMap)
+
+	const profilePath = "/etc/profile"
+	dstackProfilePath := path.Join(ex.dstackDir, "profile")
+	if err := writeDstackProfile(ctx, envMap, dstackProfilePath); err != nil {
+		log.Warning(ctx, "failed to write dstack_profile", "path", dstackProfilePath, "err", err)
+	} else if err := includeDstackProfile(profilePath, dstackProfilePath); err != nil {
+		log.Warning(ctx, "failed to include dstack_profile", "path", profilePath, "err", err)
+	}
+
+	slots := ex.clusterInfo.GPUSPerNode
+	if len(slots) == 0 {
+		// Old servers omit gpus_per_node; fall back to homogeneous per-node GPU count.
+		slots = make([]int, len(ex.clusterInfo.JobIPs))
+		for i := range slots {
+			slots[i] = gpusPerNodeNum
+		}
+	}
+	if err := writeMpiHostfile(ctx, ex.clusterInfo.JobIPs, slots, mpiHostfilePath); err != nil {
+		return fmt.Errorf("write MPI hostfile: %w", err)
+	}
+
+	// Configure process resource limits
+	// TODO: Make rlimits customizable in the run configuration. Currently, we only set max locked memory
+	// to unlimited to fix the issue with InfiniBand/RDMA: "Cannot allocate memory".
+	// See: https://github.com/ofiwg/libfabric/issues/6437
+	// See: https://github.com/openucx/ucx/issues/8229
+	// Note: we already set RLIMIT_MEMLOCK to unlimited in the shim if we've detected IB devices
+	// (see configureHpcNetworkingIfAvailable() function), but, as it's on the shim side, it only works
+	// with VM-based backends.
+	if ok, err := cap.Has(cap.SYS_RESOURCE); err != nil {
+		log.Error(ctx, "Failed to check capabilities, won't try to set resource limits", "err", err)
+	} else if !ok {
+		log.Info(ctx, "Required capability is missing, cannot set resource limits", "missing", cap.SYS_RESOURCE)
+	} else {
+		rlimitMemlock := unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY}
+		if err := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &rlimitMemlock); err != nil {
+			log.Error(ctx, "Failed to set resource limits", "err", err)
+		}
+	}
+
+	// HOME must be added after writeDstackProfile to avoid overriding the correct per-user value set by sshd
+	envMap["HOME"] = ex.jobUser.HomeDir
+	cmd.Env = envMap.Render()
+
+	log.Trace(ctx, "Starting exec", "cmd", cmd.String(), "working_dir", cmd.Dir, "env", cmd.Env)
+
+	ptm, err := startCommand(cmd)
+	if err != nil {
+		return fmt.Errorf("start command: %w", err)
+	}
+	defer func() { _ = ptm.Close() }()
+
+	stripper := ansistrip.NewWriter(ex.jobLogs, AnsiStripFlushInterval, AnsiStripMaxDelay, MaxBufferSize)
+	logger := io.MultiWriter(jobLogFile, ex.jobWsLogs, stripper)
+
+	copyDone := make(chan error, 1)
+	go func() {
+		_, copyErr := io.Copy(logger, ptm)
+		copyDone <- copyErr
+	}()
+
+	stopQuotaWatch := watchLogQuota(cancelCmd, ex.jobLogs.QuotaExceeded())
+	defer stopQuotaWatch()
+
+	// Staged in the background so that it runs while cmd.Wait is still blocked on a job that
+	// is not going away on its own. Setsid in startCommand made the shell a session leader, so
+	// its pid is the session id of everything the job goes on to start.
+	jobDone := make(chan struct{})
+	terminated := make(chan struct{})
+	go func() {
+		defer close(terminated)
+		select {
+		case <-cmdCtx.Done():
+			ex.terminateSession(ctx, cmd.Process.Pid)
+		case <-jobDone:
+			// The job reached its own end. Whatever it left running is about to lose the
+			// terminal, and soon after the container, without being told either way, so hang
+			// up and let it exit on its own terms. Nothing is waited for here: the job
+			// succeeded, so there is nothing left to enforce.
+			if pids := hangUpSession(cmd.Process.Pid); len(pids) > 0 {
+				log.Info(ctx, "Processes still running after the job finished, sent SIGHUP", "pids", pids)
+			}
+		}
+	}()
+
+	waitErr := cmd.Wait()
+	close(jobDone)
+	<-terminated // the job's own processes may outlive the shell that started them
+
+	copyErr := ex.finishOutputCopy(ctx, ptm, copyDone)
+
+	// Flush the ansistrip buffer — may also trigger quota exceeded.
+	_ = stripper.Close()
+
+	select {
+	case <-ex.jobLogs.QuotaExceeded():
+		return ErrLogQuotaExceeded
+	default:
+	}
+	if copyErr != nil && !isPtyError(copyErr) {
+		return fmt.Errorf("copy command output: %w", copyErr)
+	}
+	if waitErr != nil {
+		return fmt.Errorf("wait for command: %w", waitErr)
+	}
+	return nil
+}
+
+// finishOutputCopy waits for the output copy to finish, bounding how long it may run after
+// the command has exited.
+//
+// A read on the pty master returns EIO only once every process holding the slave has closed
+// it. A job that leaves a process behind -- a `cmd &` job, a daemon -- would otherwise keep
+// the copy running forever, and with it the executor: the job state would never be reported
+// and the run would hang until the container is destroyed. Give the output the command has
+// already written a moment to drain, then close the master, which unblocks the read.
+func (ex *RunExecutor) finishOutputCopy(ctx context.Context, ptm *os.File, copyDone <-chan error) error {
+	select {
+	case copyErr := <-copyDone:
+		return copyErr
+	case <-time.After(ex.logsDrainDelay):
+	}
+	log.Warning(ctx, "The job left processes holding the terminal open, stopped reading output")
+	_ = ptm.Close()
+	<-copyDone // fails with os.ErrClosed, which is what closing the master is for
+	return nil
+}
+
+// watchLogQuota stops the job if it exceeds its log quota. Output keeps being copied until the
+// command exits, so a full pty buffer cannot keep it from exiting.
+//
+// Cancelling is the same request an external stop makes, so a job that ignores the interrupt is
+// escalated and killed off the same way rather than through a second, blunter path.
+//
+// The quota signal is out-of-band (via channel) because the ansistrip writer is async and
+// swallows downstream write errors.
+func watchLogQuota(stopJob context.CancelFunc, quotaExceeded <-chan struct{}) (stop func()) {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-quotaExceeded:
+			stopJob()
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
+}
+
+// setupGitCredentials must be called from Run after setJobUser
+func (ex *RunExecutor) setupGitCredentials(ctx context.Context) (func(), error) {
+	if ex.repoCredentials == nil {
+		return func() {}, nil
+	}
+
+	switch ex.repoCredentials.GetProtocol() {
+	case "ssh":
+		if ex.repoCredentials.PrivateKey == nil {
+			return nil, fmt.Errorf("private key is missing")
+		}
+		sshDir, err := prepareUserSshDir(ex.jobUser)
+		if err != nil {
+			return nil, fmt.Errorf("prepare user ssh dir: %w", err)
+		}
+		keyPath := filepath.Join(sshDir, "id_rsa")
+		if _, err := os.Stat(keyPath); err == nil {
+			return nil, fmt.Errorf("private key already exists")
+		}
+		log.Info(ctx, "Writing private key", "path", keyPath)
+		if err := os.WriteFile(keyPath, []byte(*ex.repoCredentials.PrivateKey), 0o600); err != nil {
+			return nil, fmt.Errorf("write private key: %w", err)
+		}
+		if err := os.Chown(keyPath, ex.jobUser.Uid, ex.jobUser.Gid); err != nil {
+			return nil, fmt.Errorf("chown private key: %w", err)
+		}
+		return func() {
+			log.Info(ctx, "Removing private key", "path", keyPath)
+			_ = os.Remove(keyPath)
+		}, nil
+	case "https":
+		if ex.repoCredentials.OAuthToken == nil {
+			return func() {}, nil
+		}
+		hostsPath := filepath.Join(ex.jobUser.HomeDir, ".config/gh/hosts.yml")
+		if _, err := os.Stat(hostsPath); err == nil {
+			return nil, fmt.Errorf("hosts.yml file already exists")
+		}
+		if err := utils.MkdirAll(ctx, filepath.Dir(hostsPath), ex.jobUser.Uid, ex.jobUser.Gid, 0o700); err != nil {
+			return nil, fmt.Errorf("create gh config directory: %w", err)
+		}
+		log.Info(ctx, "Writing OAuth token", "path", hostsPath)
+		cloneURL, err := url.Parse(ex.repoCredentials.CloneURL)
+		if err != nil {
+			return nil, fmt.Errorf("parse clone URL: %w", err)
+		}
+		ghHost := fmt.Sprintf("%s:\n  oauth_token: \"%s\"\n", cloneURL.Hostname(), *ex.repoCredentials.OAuthToken)
+		if err := os.WriteFile(hostsPath, []byte(ghHost), 0o600); err != nil {
+			return nil, fmt.Errorf("write OAuth token: %w", err)
+		}
+		if err := os.Chown(hostsPath, ex.jobUser.Uid, ex.jobUser.Gid); err != nil {
+			return nil, fmt.Errorf("chown OAuth token: %w", err)
+		}
+		return func() {
+			log.Info(ctx, "Removing OAuth token", "path", hostsPath)
+			_ = os.Remove(hostsPath)
+		}, nil
+	}
+	return nil, fmt.Errorf("unknown protocol %s", ex.repoCredentials.GetProtocol())
+}
+
+// openPty opens a new pty pair.
+//
+// The master is opened non-blocking so that Go registers it with the runtime poller. A
+// blocking os.File never reaches the poller, and closing one does not interrupt a Read already
+// in flight -- the close is deferred until that read returns, which may be never. execJob
+// relies on closing the master to stop reading output.
+func openPty() (*os.File, *os.File, error) {
+	ptmFd, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open pty master: %w", err)
+	}
+	ptm := os.NewFile(uintptr(ptmFd), "/dev/ptmx")
+
+	if err := unix.IoctlSetPointerInt(ptmFd, unix.TIOCSPTLCK, 0); err != nil {
+		_ = ptm.Close()
+		return nil, nil, fmt.Errorf("unlock pty slave: %w", err)
+	}
+	ptsNum, err := unix.IoctlGetInt(ptmFd, unix.TIOCGPTN)
+	if err != nil {
+		_ = ptm.Close()
+		return nil, nil, fmt.Errorf("get pty slave number: %w", err)
+	}
+	ptsName := fmt.Sprintf("/dev/pts/%d", ptsNum)
+	pts, err := os.OpenFile(ptsName, os.O_RDWR|unix.O_NOCTTY, 0)
+	if err != nil {
+		_ = ptm.Close()
+		return nil, nil, fmt.Errorf("open pty slave: %w", err)
+	}
+	return ptm, pts, nil
+}
+
+func isPtyError(err error) bool {
+	/* read /dev/ptmx: input/output error */
+	var e *os.PathError
+	return errors.As(err, &e) && errors.Is(e.Err, syscall.EIO)
+}
+
+// A simplified copypasta of creack/pty Start->StartWithSize->StartWithAttrs
+// with two additions:
+// * controlling terminal is properly set (cmd.Extrafiles, Cmd.SysProcAttr.Ctty)
+// * owner of slave pty is changed to the child process uid
+func startCommand(cmd *exec.Cmd) (*os.File, error) {
+	ptm, pts, err := openPty()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = pts.Close() }()
+
+	cmd.Stdout = pts
+	cmd.Stderr = pts
+	cmd.Stdin = pts
+	cmd.ExtraFiles = []*os.File{pts}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	// see https://github.com/creack/pty/issues/96#issuecomment-624372400
+	cmd.SysProcAttr.Ctty = 3 // cmd.ExtraFiles[0]
+	cmd.SysProcAttr.Setctty = true
+	cmd.SysProcAttr.Setsid = true
+
+	if cmd.SysProcAttr.Credential != nil {
+		// Initially, /dev/pts/N is owned by the user who open()'ed /dev/ptmx (runner_uid)
+		// If the runner started by root, we can chown to any user
+		// If the runner started by non-root, we can chown only to the same user (noop)
+		// In the latter case, the situation when runner_uid != 0 and
+		// runner_uid != job_uid should be already handled outside this function
+		uid := cmd.SysProcAttr.Credential.Uid
+		if err := os.Chown(pts.Name(), int(uid), -1); err != nil {
+			_ = ptm.Close()
+			return nil, fmt.Errorf("chown pty slave: %w", err)
+		}
+	}
+
+	// Cancel must be set before Start, which installs the goroutine that calls it.
+	cmd.Cancel = func() error { return interruptJob(ptm) }
+
+	if err := cmd.Start(); err != nil {
+		_ = ptm.Close()
+		return nil, fmt.Errorf("start command: %w", err)
+	}
+	return ptm, nil
+}
+
+// interruptJob asks the job to stop the way Ctrl-C does. Writing the terminal's INTR character
+// to the pty master makes the line discipline raise SIGINT in the terminal's foreground process
+// group -- the command the shell is currently running, together with everything sharing its
+// process group.
+//
+// Signalling cmd.Process reaches the wrong process instead. The server runs commands under
+// `sh -i -c`, and an interactive shell turns on job control, which puts the job in a process
+// group of its own, while the shell ignores SIGINT for as long as it is waiting for that job.
+// The signal reached neither, so nothing stopped the job until WaitDelay expired and SIGKILL
+// went to the shell alone.
+//
+// The job may still ignore this: a program that puts the terminal in raw mode clears ISIG, and
+// the INTR character then delivers no signal at all. WaitDelay stays the backstop.
+func interruptJob(ptm *os.File) error {
+	// The master is pollable (see openPty), so a deadline is honoured here. Without one, a job
+	// that never reads its stdin could fill the terminal's input buffer and block this write
+	// indefinitely -- and Cmd only starts the WaitDelay timer once Cancel has returned.
+	if err := ptm.SetWriteDeadline(time.Now().Add(intrWriteTimeout)); err != nil {
+		return fmt.Errorf("set INTR write deadline: %w", err)
+	}
+	defer func() { _ = ptm.SetWriteDeadline(time.Time{}) }()
+
+	if _, err := ptm.Write([]byte{intrChar}); err != nil {
+		if isPtyError(err) || errors.Is(err, os.ErrClosed) {
+			// The terminal is gone, so the job is gone with it. Reporting the process as
+			// already done keeps Wait returning the command's own exit status rather than
+			// replacing it with the context error.
+			return fmt.Errorf("write INTR: %w", errors.Join(err, os.ErrProcessDone))
+		}
+		return fmt.Errorf("write INTR: %w", err)
+	}
+	return nil
+}
+
+func prepareUserSshDir(user *linuxuser.User) (string, error) {
+	sshDir := filepath.Join(user.HomeDir, ".ssh")
+	info, err := os.Stat(sshDir)
+	if err == nil {
+		if !info.IsDir() {
+			return "", fmt.Errorf("not a directory: %s", sshDir)
+		}
+		if err := os.Chmod(sshDir, 0o700); err != nil {
+			return "", fmt.Errorf("chmod ssh dir: %w", err)
+		}
+	} else if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(sshDir, 0o700); err != nil {
+			return "", fmt.Errorf("create ssh dir: %w", err)
+		}
+	} else {
+		return "", err
+	}
+	if err := os.Chown(sshDir, user.Uid, user.Gid); err != nil {
+		return "", fmt.Errorf("chown ssh dir: %w", err)
+	}
+	return sshDir, nil
+}
+
+func writeMpiHostfile(ctx context.Context, ips []string, slots []int, path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create MPI hostfile directory: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open MPI hostfile: %w", err)
+	}
+	defer file.Close()
+	nonEmptyIps := []string{}
+	for _, ip := range ips {
+		if ip != "" {
+			nonEmptyIps = append(nonEmptyIps, ip)
+		}
+	}
+	if len(nonEmptyIps) == len(ips) {
+		if len(slots) != len(ips) {
+			return fmt.Errorf(
+				"gpus_per_node length %d != job_ips length %d",
+				len(slots), len(ips),
+			)
+		}
+		for i, ip := range nonEmptyIps {
+			if slots[i] == 0 {
+				// CPU node: the number of slots defaults to the number of processor cores on that host
+				// See: https://docs.open-mpi.org/en/main/launching-apps/scheduling.html#calculating-the-number-of-slots
+				_, err = fmt.Fprintf(file, "%s\n", ip)
+			} else {
+				_, err = fmt.Fprintf(file, "%s slots=%d\n", ip, slots[i])
+			}
+			if err != nil {
+				return fmt.Errorf("write MPI hostfile line: %w", err)
+			}
+		}
+	} else {
+		log.Info(ctx, "creating empty MPI hostfile: no internal IPs assigned")
+	}
+	return nil
+}
+
+func writeDstackProfile(ctx context.Context, env map[string]string, pth string) error {
+	if err := os.MkdirAll(path.Dir(pth), 0o755); err != nil {
+		return fmt.Errorf("create dstack profile directory: %w", err)
+	}
+	file, err := os.OpenFile(pth, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open dstack profile: %w", err)
+	}
+	defer file.Close()
+	for key, value := range env {
+		switch key {
+		case "HOSTNAME", "USER", "HOME", "SHELL", "SHLVL", "PWD", "_":
+			continue
+		}
+		// `export not-an-identifier=value` is a syntax error that either pollutes stderr on
+		// every login or, depending on the shell, aborts the profile altogether.
+		if !isShellIdentifier(key) {
+			log.Warning(ctx, "Skipped env variable, name is not a valid shell identifier", "var", key)
+			continue
+		}
+		line := fmt.Sprintf("export %s='%s'\n", key, strings.ReplaceAll(value, `'`, `'"'"'`))
+		if _, err = file.WriteString(line); err != nil {
+			return fmt.Errorf("write dstack profile: %w", err)
+		}
+	}
+	if _, err = file.WriteString("cd \"$DSTACK_WORKING_DIR\"\n"); err != nil {
+		return fmt.Errorf("write dstack profile: %w", err)
+	}
+	if err = os.Chmod(pth, 0o644); err != nil {
+		return fmt.Errorf("chmod dstack profile: %w", err)
+	}
+	return nil
+}
+
+func includeDstackProfile(profilePath string, dstackProfilePath string) error {
+	file, err := os.OpenFile(profilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open profile file: %w", err)
+	}
+	defer file.Close()
+	if _, err = fmt.Fprintf(file, "\n. '%s'\n", dstackProfilePath); err != nil {
+		return fmt.Errorf("write profile include: %w", err)
+	}
+	if err = os.Chmod(profilePath, 0o644); err != nil {
+		return fmt.Errorf("chmod profile file: %w", err)
+	}
+	return nil
+}

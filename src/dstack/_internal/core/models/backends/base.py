@@ -8,41 +8,51 @@ class BackendType(str, enum.Enum):
         AWS (BackendType): Amazon Web Services
         AZURE (BackendType): Microsoft Azure
         CLOUDRIFT (BackendType): CloudRift
+        CRUSOE (BackendType): Crusoe
         CUDO (BackendType): Cudo
         DATACRUNCH (BackendType): DataCrunch (for backward compatibility)
+        DAYTONA (BackendType): Daytona
         DIGITALOCEAN (BackendType): DigitalOcean
         DSTACK (BackendType): dstack Sky
         GCP (BackendType): Google Cloud Platform
         HOTAISLE (BackendType): Hot Aisle
+        JARVISLABS (BackendType): JarvisLabs
         KUBERNETES (BackendType): Kubernetes
         LAMBDA (BackendType): Lambda Cloud
         NEBIUS (BackendType): Nebius AI Cloud
         OCI (BackendType): Oracle Cloud Infrastructure
         RUNPOD (BackendType): Runpod Cloud
+        SEEWEB (BackendType): Seeweb Cloud Server GPU
         TENSORDOCK (BackendType): TensorDock Marketplace
         VASTAI (BackendType): Vast.ai Marketplace
         VERDA (BackendType): Verda Cloud
         VULTR (BackendType): Vultr
+        SLURM (BackendType): Slurm
     """
 
     AMDDEVCLOUD = "amddevcloud"
     AWS = "aws"
     AZURE = "azure"
     CLOUDRIFT = "cloudrift"
+    CRUSOE = "crusoe"
     CUDO = "cudo"
-    DATACRUNCH = "datacrunch"  # BackendType for backward compatibility
+    DATACRUNCH = "datacrunch"
+    """`DATACRUNCH` is kept as a `BackendType` for backward compatibility."""
+    DAYTONA = "daytona"
     DIGITALOCEAN = "digitalocean"
     DSTACK = "dstack"
     GCP = "gcp"
     HOTAISLE = "hotaisle"
+    JARVISLABS = "jarvislabs"
     KUBERNETES = "kubernetes"
     LAMBDA = "lambda"
-    LOCAL = "local"
-    REMOTE = "remote"  # TODO: replace for LOCAL
+    REMOTE = "remote"
     NEBIUS = "nebius"
     OCI = "oci"
     RUNPOD = "runpod"
+    SEEWEB = "seeweb"
     TENSORDOCK = "tensordock"
     VASTAI = "vastai"
     VERDA = "verda"
     VULTR = "vultr"
+    SLURM = "slurm"

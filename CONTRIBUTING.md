@@ -2,18 +2,24 @@
 
 We appreciate your interest in contributing to `dstack`! This document will help you get up to speed with `dstack` codebase and guide you through the contribution process.
 
-## AI Assistance Notice
+## Who can contribute
 
-If you are using any kind of AI assistance while contributing to `dstack`,
-**this must be disclosed in the pull request**, along with the extent to
-which AI assistance was used.
-As an exception, tab-completions and trivial PRs don't need to be disclosed.
+We'd be happy to see your contribution if you are a `dstack` user, a partner integrating with `dstack`, or any other person genuinely interested in `dstack`.
 
-An example disclosure:
+## Using AI assistance
 
-> This PR was written primarily by Claude Code.
+You may use AI assistance when contributing to `dstack`. However, we expect you, the human contributor, to initiate and validate the contribution, ensuring it meets the same standard as something you'd write by hand.
 
-Failure to disclose this, makes it difficult to determine how much scrutiny to apply to the contribution. Please be respectful to maintainers and disclose AI assistance.
+Contributions made entirely without a human in the loop (e.g., PRs filed by an autonomous agent against open issues) are discouraged and will be declined.
+
+## Accepted changes
+
+* Bug fixes that address a bug you've hit while using `dstack`. Include steps to reproduce in the linked issue or the PR.
+* New features that improve `dstack` for you. Before submitting a feature PR, please describe your use case and proposal in a GitHub issue to discuss it with the core team.
+* Minor fixes such as typos.
+* [Examples](examples).
+
+Existing open issues are typically picked up by the core team — please only contribute to one if it actually affects how you use `dstack`.
 
 ## Set up your development environment
 
@@ -29,13 +35,6 @@ If you make a non-trivial change to `dstack`, we recommend you learn about `dsta
 2. Fork the repo.
 3. Commit your changes.
 4. Open a PR. [Link the PR to the issue](https://docs.github.com/en/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue) (if you are solving one).
-
-### Accepted changes
-
-* Bug fixes that address a clearly defined bug. Include steps to reproduce in the linked issue or the PR.
-* New features. Before submitting a feature PR, create an issue with a proposal to discuss it with the core team and other interested parties.
-* Minor fixes such as typos.
-* [Examples](examples).
 
 ### Before pushing your changes
 
@@ -61,6 +60,36 @@ Use the `--runpostgres` flag to run the tests against Postgres as well:
 
 ```shell
 uv run pytest src/tests --runpostgres
+```
+
+Alternatively, you can run tests via [tox](https://tox.wiki/) inside an isolated environment ensuring that the `dstack` package itself is built correctly and all requirements are specified and correct. tox and [just](https://just.systems/) must be already installed.
+
+* Run tests in the default environment:
+
+  ```shell
+  just tox::test-default
+  ```
+
+  The Python version of the default environment is configured via the `.python-version` file in the repo root directory. Note, the same file [is used by uv](https://docs.astral.sh/uv/concepts/python-versions/#python-version-files).
+
+* Run tests against all currently supported Python versions:
+
+  ```shell
+  just tox::test-supported
+  ```
+
+* Run tests in the _current_ environment:
+
+  ```shell
+  just tox::test-current
+  ```
+
+  It saves about 30-60 seconds at the cost of Python environment isolation (defeating the core purpose of tox) — no packages are built or installed, and, as a consequence, all dependencies must be already installed, but, unlike the plain pytest command, the process environment variables are still isolated.
+
+It's possible to pass pytest arguments after the `--` separator (the arguments _before_ the separator are `tox run` arguments):
+
+```shell
+just tox::test-default -- -vvv --last-failed
 ```
 
 ## Add a new backend

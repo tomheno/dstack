@@ -1,23 +1,25 @@
+import contextlib
 import re
 from dataclasses import dataclass
 from typing import List, Optional
 
+import gpuhunt
 import requests
 from dxf import DXF
 from dxf.exceptions import DXFError
-from pydantic import Field, ValidationError, validator
+from pydantic import Field, ValidationError, field_validator
 from typing_extensions import Annotated
 
 from dstack._internal.core.errors import DockerRegistryError
-from dstack._internal.core.models.common import (
-    CoreModel,
-    FrozenCoreModel,
-    RegistryAuth,
-)
+from dstack._internal.core.models.common import CoreModel, RegistryAuth, validate_json_extra_ignore
+from dstack._internal.server import settings as server_settings
 from dstack._internal.server.utils.common import join_byte_stream_checked
+from dstack._internal.utils.docker import (
+    LEGACY_DEFAULT_REGISTRY,
+    is_default_registry,
+    parse_image_name,
+)
 
-DEFAULT_PLATFORM = "linux/amd64"
-DEFAULT_REGISTRY = "index.docker.io"
 MAX_CONFIG_OBJECT_SIZE = 2**22  # 4 MiB
 REGISTRY_REQUEST_TIMEOUT = 20
 
@@ -34,20 +36,13 @@ class DXFAuthAdapter:
         )
 
 
-class DockerImage(FrozenCoreModel):
-    image: str
-    registry: Optional[str] = None
-    repo: str
-    tag: str
-    digest: Optional[str] = None
-
-
 class ImageConfig(CoreModel):
     user: Annotated[Optional[str], Field(alias="User")] = None
     entrypoint: Annotated[Optional[List[str]], Field(alias="Entrypoint")] = None
     cmd: Annotated[Optional[List[str]], Field(alias="Cmd")] = None
 
-    @validator("user")
+    @field_validator("user")
+    @classmethod
     def normalize_user(cls, v: Optional[str]) -> Optional[str]:
         # If USER is not set, the corresponding field may be missing or set to an empty string
         if v == "":
@@ -56,9 +51,12 @@ class ImageConfig(CoreModel):
 
 
 class ImageConfigObject(CoreModel):
+    architecture: str
+    os: str
     config: ImageConfig = ImageConfig()
 
-    @validator("config", pre=True)
+    @field_validator("config", mode="before")
+    @classmethod
     def config_set_default_if_null(cls, value):
         return ImageConfig() if value is None else value
 
@@ -71,84 +69,94 @@ class ImageManifest(CoreModel):
     config: ImageManifestConfigField
 
 
-def get_image_config(image_name: str, registry_auth: Optional[RegistryAuth]) -> ImageConfigObject:
+def get_image_config_and_cpu_architectures(
+    image_name: str, registry_auth: Optional[RegistryAuth]
+) -> tuple[ImageConfigObject, set[gpuhunt.CPUArchitecture]]:
     image = parse_image_name(image_name)
 
+    registry = image.registry
+    if registry is None or is_default_registry(registry):
+        registry = LEGACY_DEFAULT_REGISTRY
+
     registry_client = DXF(
-        host=image.registry or DEFAULT_REGISTRY,
+        host=registry,
         repo=image.repo,
         auth=DXFAuthAdapter(registry_auth),  # type: ignore[assignment]
         timeout=REGISTRY_REQUEST_TIMEOUT,
     )
 
     with registry_client:
+        cpu_architectures: Optional[set[gpuhunt.CPUArchitecture]] = None
         try:
-            manifest_resp = registry_client.get_manifest(
-                alias=image.digest or image.tag, platform=DEFAULT_PLATFORM
-            )
-            manifest = ImageManifest.__response__.parse_raw(manifest_resp)
+            # FIXME: get_manifest() makes N+1 requests when platform is not specified and alias
+            # points to an image index, where N is a number of images in the index,
+            # e.g., debian has 8 os/architecture[/variant] combinations
+            manifest_resp = registry_client.get_manifest(alias=image.digest or image.tag)
+            if isinstance(manifest_resp, dict):
+                # Image index (OCI) aka Manifest list (Docker) -- multi os/arch higher-level object
+                manifests: dict[gpuhunt.CPUArchitecture, ImageManifest] = {}
+                for platform, manifest_raw in manifest_resp.items():
+                    # os/architecture[/variant]
+                    os_name, architecture, *_ = platform.split("/")
+                    if not _os_supported(os_name):
+                        continue
+                    cpu_arch = _cpu_arch_from_string(architecture)
+                    if cpu_arch is not None:
+                        manifests[cpu_arch] = validate_json_extra_ignore(
+                            ImageManifest, manifest_raw
+                        )
+                # ImageConfigs (User/Cmd/Entrypoint) may be different for different images
+                # within the same index; we assume that it's not the case but at least pick
+                # the manifest deterministically
+                for cpu_arch in [gpuhunt.CPUArchitecture.X86, gpuhunt.CPUArchitecture.ARM]:
+                    with contextlib.suppress(KeyError):
+                        manifest = manifests[cpu_arch]
+                        break
+                else:
+                    raise _no_supported_platforms_error(image_name)
+                cpu_architectures = set(manifests)
+            else:
+                # Image manifest -- one specific os/arch combination
+                manifest = validate_json_extra_ignore(ImageManifest, manifest_resp)
+
             config_stream = registry_client.pull_blob(manifest.config.digest)
             config_resp = join_byte_stream_checked(config_stream, MAX_CONFIG_OBJECT_SIZE)  # type: ignore[arg-type]
             if config_resp is None:
                 raise DockerRegistryError(
                     f"Image config object exceeds the size limit of {MAX_CONFIG_OBJECT_SIZE} bytes"
                 )
-            return ImageConfigObject.__response__.parse_raw(config_resp)
+            image_config = validate_json_extra_ignore(ImageConfigObject, config_resp)
+
+            if cpu_architectures is None:
+                cpu_arch = _cpu_arch_from_string(image_config.architecture)
+                if not _os_supported(image_config.os) or cpu_arch is None:
+                    raise _no_supported_platforms_error(image_name)
+                cpu_architectures = {cpu_arch}
+
+            return image_config, cpu_architectures
 
         except (DXFError, requests.RequestException, ValidationError) as e:
             raise DockerRegistryError(e)
 
 
-def parse_image_name(image: str) -> DockerImage:
-    """
-    :param image: docker image name
-    :return: registry host, repo, tag, digest
-
-    >>> parse_image_name("ubuntu:22.04")
-    DockerImage(registry=None, repo='library/ubuntu', tag='22.04', digest=None)
-    >>> parse_image_name("dstackai/miniforge:py3.9-0.2")
-    DockerImage(registry=None, repo='dstackai/miniforge', tag='py3.9-0.2', digest=None)
-    >>> parse_image_name("ghcr.io/dstackai/miniforge")
-    DockerImage(registry='ghcr.io', repo='dstackai/miniforge', tag='latest', digest=None)
-    >>> parse_image_name("dstackai/miniforge@sha256:a4ba18a847a172a248d68faf6689e69fae4779b90b250211b79a26d21ddd6a15")
-    DockerImage(registry=None, repo='dstackai/miniforge', tag='latest', digest='sha256:a4ba18a847a172a248d68faf6689e69fae4779b90b250211b79a26d21ddd6a15')
-    """
-
-    digest = None
-    if "@" in image.split("/")[-1]:
-        image, digest = image.rsplit("@", maxsplit=1)
-
-    tag = "latest"
-    if ":" in image.split("/")[-1]:  # avoid detecting port as a tag
-        image, tag = image.rsplit(":", maxsplit=1)
-
-    registry = None
-    components = image.split("/")
-    if len(components) == 1:  # default registry, official image
-        repo = "library/" + components[0]
-    elif not is_host(components[0]):  # default registry, custom image
-        repo = "/".join(components)
-    else:  # custom registry
-        registry = components[0]
-        repo = "/".join(components[1:])
-
-    return DockerImage(image=image, registry=registry, repo=repo, tag=tag, digest=digest)
-
-
-def is_host(s: str) -> bool:
-    """
-    >>> is_host("localhost")
-    True
-    >>> is_host("localhost:5000")
-    True
-    >>> is_host("ghcr.io")
-    True
-    >>> is_host("127.0.0.1")
-    True
-    >>> is_host("dstackai")
-    False
-    """
-    return s == "localhost" or ":" in s or "." in s
+def apply_server_docker_defaults(
+    image_name: str,
+    registry_auth: Optional[RegistryAuth],
+) -> tuple[str, Optional[RegistryAuth]]:
+    if parse_image_name(image_name).registry is not None:
+        return image_name, registry_auth
+    if server_settings.SERVER_DEFAULT_DOCKER_REGISTRY is not None:
+        image_name = f"{server_settings.SERVER_DEFAULT_DOCKER_REGISTRY}/{image_name}"
+    if (
+        registry_auth is None
+        and server_settings.SERVER_DEFAULT_DOCKER_REGISTRY_USERNAME is not None
+        and server_settings.SERVER_DEFAULT_DOCKER_REGISTRY_PASSWORD is not None
+    ):
+        registry_auth = RegistryAuth(
+            username=server_settings.SERVER_DEFAULT_DOCKER_REGISTRY_USERNAME,
+            password=server_settings.SERVER_DEFAULT_DOCKER_REGISTRY_PASSWORD,
+        )
+    return image_name, registry_auth
 
 
 DOCKER_TARGET_PATH_PATTERN = re.compile(r"^(/[^/\0]*)+/?$")
@@ -160,3 +168,19 @@ def is_valid_docker_volume_target(path: str) -> bool:
     if path.endswith("/") and path != "/":
         return False
     return DOCKER_TARGET_PATH_PATTERN.match(path) is not None
+
+
+def _cpu_arch_from_string(architecture: str) -> Optional[gpuhunt.CPUArchitecture]:
+    if architecture == "amd64":
+        return gpuhunt.CPUArchitecture.X86
+    if architecture == "arm64":
+        return gpuhunt.CPUArchitecture.ARM
+    return None
+
+
+def _os_supported(os_name: str) -> bool:
+    return os_name == "linux"
+
+
+def _no_supported_platforms_error(image_name: str) -> DockerRegistryError:
+    return DockerRegistryError(f"No supported OS/architectures found: {image_name!r}")

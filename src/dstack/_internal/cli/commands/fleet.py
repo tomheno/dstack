@@ -14,7 +14,7 @@ from dstack._internal.cli.utils.common import (
 )
 from dstack._internal.cli.utils.fleet import get_fleets_table, print_fleets_table
 from dstack._internal.core.errors import CLIError, ResourceNotExistsError
-from dstack._internal.utils.json_utils import pydantic_orjson_dumps_with_indent
+from dstack._internal.core.models.common import EntityReference
 
 
 class FleetCommand(APIBaseCommand):
@@ -49,6 +49,7 @@ class FleetCommand(APIBaseCommand):
         )
         delete_parser.add_argument(
             "name",
+            type=EntityReference.parse,
             help="The name of the fleet",
         ).completer = FleetNameCompleter()  # type: ignore[attr-defined]
         delete_parser.add_argument(
@@ -73,6 +74,7 @@ class FleetCommand(APIBaseCommand):
             "name",
             nargs="?",
             metavar="NAME",
+            type=EntityReference.parse,
             help="The name of the fleet",
         ).completer = FleetNameCompleter()  # type: ignore[attr-defined]
         name_group.add_argument(
@@ -93,50 +95,62 @@ class FleetCommand(APIBaseCommand):
         args.subfunc(args)
 
     def _list(self, args: argparse.Namespace):
-        fleets = self.api.client.fleets.list(self.api.project)
+        fleets = self.api.client.fleets.list(self.api.project, include_imported=True)
         if not args.watch:
-            print_fleets_table(fleets, verbose=args.verbose)
+            print_fleets_table(fleets, current_project=self.api.project, verbose=args.verbose)
             return
 
         try:
             with Live(console=console, refresh_per_second=LIVE_TABLE_REFRESH_RATE_PER_SEC) as live:
                 while True:
-                    live.update(get_fleets_table(fleets, verbose=args.verbose))
+                    live.update(
+                        get_fleets_table(
+                            fleets, current_project=self.api.project, verbose=args.verbose
+                        )
+                    )
                     time.sleep(LIVE_TABLE_PROVISION_INTERVAL_SECS)
-                    fleets = self.api.client.fleets.list(self.api.project)
+                    fleets = self.api.client.fleets.list(self.api.project, include_imported=True)
         except KeyboardInterrupt:
             pass
 
     def _delete(self, args: argparse.Namespace):
+        if args.name.project is not None:
+            console.print(
+                "The [code]<project>/<fleet>[/] format is not supported for fleet names."
+                " Can only delete fleets or instances owned by the current project"
+            )
+            exit(1)
+        name = args.name.name
+
         try:
-            self.api.client.fleets.get(project_name=self.api.project, name=args.name)
+            self.api.client.fleets.get(project_name=self.api.project, name=name)
         except ResourceNotExistsError:
-            console.print(f"Fleet [code]{args.name}[/] does not exist")
+            console.print(f"Fleet [code]{name}[/] does not exist")
             exit(1)
 
         if not args.instances:
-            if not args.yes and not confirm_ask(f"Delete the fleet [code]{args.name}[/]?"):
+            if not args.yes and not confirm_ask(f"Delete the fleet [code]{name}[/]?"):
                 console.print("\nExiting...")
                 return
 
             with console.status("Deleting fleet..."):
-                self.api.client.fleets.delete(project_name=self.api.project, names=[args.name])
+                self.api.client.fleets.delete(project_name=self.api.project, names=[name])
 
-            console.print(f"Fleet [code]{args.name}[/] deleted")
+            console.print(f"Fleet [code]{name}[/] deleted")
             return
 
         if not args.yes and not confirm_ask(
-            f"Delete the fleet [code]{args.name}[/] instances [code]{args.instances}[/]?"
+            f"Delete the fleet [code]{name}[/] instances [code]{args.instances}[/]?"
         ):
             console.print("\nExiting...")
             return
 
         with console.status("Deleting fleet instances..."):
             self.api.client.fleets.delete_instances(
-                project_name=self.api.project, name=args.name, instance_nums=args.instances
+                project_name=self.api.project, name=name, instance_nums=args.instances
             )
 
-        console.print(f"Fleet [code]{args.name}[/] instances deleted")
+        console.print(f"Fleet [code]{name}[/] instances deleted")
 
     def _get(self, args: argparse.Namespace):
         # TODO: Implement non-json output format
@@ -153,9 +167,12 @@ class FleetCommand(APIBaseCommand):
                     project_name=self.api.project, fleet_id=fleet_id
                 )
             else:
-                fleet = self.api.client.fleets.get(project_name=self.api.project, name=args.name)
+                fleet = self.api.client.fleets.get(
+                    project_name=args.name.project or self.api.project,
+                    name=args.name.name,
+                )
         except ResourceNotExistsError:
             console.print(f"Fleet [code]{args.name or args.id}[/] not found")
             exit(1)
 
-        print(pydantic_orjson_dumps_with_indent(fleet.dict(), default=None))
+        print(fleet.model_dump_json(indent=2))

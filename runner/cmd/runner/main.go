@@ -1,3 +1,7 @@
+//go:build linux
+
+// dstack-runner is supported only in Linux environments.
+
 package main
 
 import (
@@ -14,16 +18,17 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v3"
 
-	"github.com/dstackai/dstack/runner/consts"
-	"github.com/dstackai/dstack/runner/internal/executor"
-	linuxuser "github.com/dstackai/dstack/runner/internal/linux/user"
-	"github.com/dstackai/dstack/runner/internal/log"
+	"github.com/dstackai/dstack/runner/internal/common/consts"
+	"github.com/dstackai/dstack/runner/internal/common/log"
 	"github.com/dstackai/dstack/runner/internal/runner/api"
-	"github.com/dstackai/dstack/runner/internal/ssh"
+	"github.com/dstackai/dstack/runner/internal/runner/executor"
+	linuxuser "github.com/dstackai/dstack/runner/internal/runner/linux/user"
+	"github.com/dstackai/dstack/runner/internal/runner/ssh"
 )
 
 // Version is a build-time variable. The value is overridden by ldflags.
-var Version string
+// The "latest" default marks a dev build; the server treats it as the newest version.
+var Version = "latest"
 
 func main() {
 	os.Exit(mainInner())
@@ -31,21 +36,22 @@ func main() {
 
 func mainInner() int {
 	var tempDir string
+	var httpAddress string
 	var httpPort int
 	var sshPort int
 	var sshAuthorizedKeys []string
-	var logLevel int
+	var sshLogLevel string
+	var logLevel string
 
 	cmd := &cli.Command{
 		Name:    "dstack-runner",
 		Usage:   "configure and start dstack-runner",
 		Version: Version,
 		Flags: []cli.Flag{
-			&cli.IntFlag{
+			&cli.StringFlag{
 				Name:        "log-level",
-				Value:       2,
-				DefaultText: "4 (Info)",
-				Usage:       "log verbosity level: 2 (Error), 3 (Warning), 4 (Info), 5 (Debug), 6 (Trace)",
+				Value:       "info",
+				Usage:       "log verbosity level: fatal, error, warning, info, debug, trace",
 				Destination: &logLevel,
 			},
 		},
@@ -60,6 +66,13 @@ func mainInner() int {
 						Value:       consts.RunnerTempDir,
 						Destination: &tempDir,
 						TakesFile:   true,
+					},
+					&cli.StringFlag{
+						Name:        "http-address",
+						Usage:       "Set a http bind address",
+						Value:       "",
+						DefaultText: "all interfaces",
+						Destination: &httpAddress,
 					},
 					&cli.IntFlag{
 						Name:        "http-port",
@@ -78,9 +91,25 @@ func mainInner() int {
 						Usage:       "dstack server or user authorized key. May be specified multiple times",
 						Destination: &sshAuthorizedKeys,
 					},
+					&cli.StringFlag{
+						Name:        "ssh-log-level",
+						Value:       "INFO",
+						Usage:       "ssh LogLevel, see sshd_config(5)",
+						Destination: &sshLogLevel,
+					},
+					// --home-dir is not used since 0.20.4, but the flag was retained as no-op
+					// for compatibility with pre-0.20.4 shims; remove the flag eventually
+					&cli.StringFlag{
+						Name:   "home-dir",
+						Hidden: true,
+					},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
-					return start(ctx, tempDir, httpPort, sshPort, sshAuthorizedKeys, logLevel, Version)
+					logLvl, err := log.ParseLevel(logLevel)
+					if err != nil {
+						return err
+					}
+					return start(ctx, logLvl, tempDir, httpAddress, httpPort, sshPort, sshAuthorizedKeys, sshLogLevel)
 				},
 			},
 		},
@@ -97,7 +126,12 @@ func mainInner() int {
 	return 0
 }
 
-func start(ctx context.Context, tempDir string, httpPort int, sshPort int, sshAuthorizedKeys []string, logLevel int, version string) error {
+func start(
+	ctx context.Context,
+	logLevel int, tempDir string,
+	httpAddress string, httpPort int,
+	sshPort int, sshAuthorizedKeys []string, sshLogLevel string,
+) error {
 	if err := os.MkdirAll(tempDir, 0o755); err != nil {
 		return fmt.Errorf("create temp directory: %w", err)
 	}
@@ -165,7 +199,7 @@ func start(ctx context.Context, tempDir string, httpPort int, sshPort int, sshAu
 	}
 
 	sshd := ssh.NewSshd("/usr/sbin/sshd")
-	if err := sshd.Prepare(ctx, dstackSshDir, sshPort, "INFO"); err != nil {
+	if err := sshd.Prepare(ctx, dstackSshDir, sshPort, sshLogLevel); err != nil {
 		return fmt.Errorf("prepare sshd: %w", err)
 	}
 	if err := sshd.AddAuthorizedKeys(ctx, sshAuthorizedKeys...); err != nil {
@@ -185,7 +219,7 @@ func start(ctx context.Context, tempDir string, httpPort int, sshPort int, sshAu
 		return fmt.Errorf("create executor: %w", err)
 	}
 
-	server, err := api.NewServer(ctx, fmt.Sprintf(":%d", httpPort), version, ex)
+	server, err := api.NewServer(ctx, fmt.Sprintf("%s:%d", httpAddress, httpPort), Version, ex)
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
 	}

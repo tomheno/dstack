@@ -1,8 +1,10 @@
+import re
 import secrets
 import uuid
+from datetime import datetime
 from typing import Awaitable, Callable, List, Optional, Tuple
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import and_, delete, literal_column, or_, select, update
 from sqlalchemy import func as safunc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import QueryableAttribute, joinedload, load_only
@@ -19,11 +21,17 @@ from dstack._internal.core.models.projects import (
     MemberPermissions,
     Project,
     ProjectHookConfig,
+    ProjectsInfoList,
+    ProjectsInfoListOrProjectsList,
 )
 from dstack._internal.core.models.runs import RunStatus
 from dstack._internal.core.models.users import GlobalRole, ProjectRole
+from dstack._internal.server.const import GLOBAL_EXPORTS_LOCK_NAMESPACE
+from dstack._internal.server.db import get_db, is_db_postgres, is_db_sqlite
 from dstack._internal.server.models import (
+    ExportModel,
     FleetModel,
+    ImportModel,
     MemberModel,
     ProjectModel,
     RunModel,
@@ -32,13 +40,18 @@ from dstack._internal.server.models import (
 )
 from dstack._internal.server.schemas.projects import MemberSetting
 from dstack._internal.server.services import events, users
+from dstack._internal.server.services import templates as templates_service
 from dstack._internal.server.services.backends import (
     get_backend_config_without_creds_from_backend_model,
 )
+from dstack._internal.server.services.locking import (
+    get_locker,
+    string_to_lock_id,
+)
 from dstack._internal.server.services.permissions import get_default_permissions
 from dstack._internal.server.settings import DEFAULT_PROJECT_NAME
+from dstack._internal.utils import crypto
 from dstack._internal.utils.common import get_current_datetime, run_async
-from dstack._internal.utils.crypto import generate_rsa_key_pair_bytes
 from dstack._internal.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -62,57 +75,92 @@ async def get_or_create_default_project(
     return default_project, True
 
 
-async def list_user_projects(
-    session: AsyncSession,
-    user: UserModel,
-) -> List[Project]:
-    """
-    Returns projects where the user is a member or all projects for global admins.
-    """
-    projects = await list_user_project_models(
-        session=session,
-        user=user,
-    )
-    projects = sorted(projects, key=lambda p: p.created_at)
-    return [
-        project_model_to_project(p, include_backends=False, include_members=False)
-        for p in projects
-    ]
-
-
 async def list_user_accessible_projects(
     session: AsyncSession,
     user: UserModel,
     include_not_joined: bool,
-) -> List[Project]:
+    return_total_count: bool,
+    name_pattern: Optional[str],
+    prev_created_at: Optional[datetime],
+    prev_id: Optional[uuid.UUID],
+    limit: int,
+    ascending: bool,
+) -> ProjectsInfoListOrProjectsList:
     """
     Returns all projects accessible to the user:
+    - All projects for global admins
     - Projects where user is a member (public or private)
     - if `include_not_joined`: Public projects where user is NOT a member
     """
-    if user.global_role == GlobalRole.ADMIN:
-        projects = await list_project_models(session=session)
-    else:
-        projects = await list_member_project_models(session=session, user=user)
+    filters = [ProjectModel.deleted == False]
+    if name_pattern:
+        name_pattern = name_pattern.replace("_", "/_")
+        filters.append(ProjectModel.name.ilike(f"%{name_pattern}%", escape="/"))
+    stmt = select(ProjectModel).where(*filters)
+    if user.global_role != GlobalRole.ADMIN:
+        stmt = stmt.outerjoin(
+            MemberModel,
+            onclause=and_(
+                MemberModel.project_id == ProjectModel.id,
+                MemberModel.user_id == user.id,
+            ),
+        )
         if include_not_joined:
-            public_projects = await list_public_non_member_project_models(
-                session=session, user=user
+            stmt = stmt.where(
+                or_(
+                    ProjectModel.is_public == True,
+                    MemberModel.user_id.is_not(None),
+                )
             )
-            projects += public_projects
-
-    projects = sorted(projects, key=lambda p: p.created_at)
-    return [
+        else:
+            stmt = stmt.where(MemberModel.user_id.is_not(None))
+    pagination_filters = []
+    if prev_created_at is not None:
+        if ascending:
+            if prev_id is None:
+                pagination_filters.append(ProjectModel.created_at > prev_created_at)
+            else:
+                pagination_filters.append(
+                    or_(
+                        ProjectModel.created_at > prev_created_at,
+                        and_(
+                            ProjectModel.created_at == prev_created_at, ProjectModel.id < prev_id
+                        ),
+                    )
+                )
+        else:
+            if prev_id is None:
+                pagination_filters.append(ProjectModel.created_at < prev_created_at)
+            else:
+                pagination_filters.append(
+                    or_(
+                        ProjectModel.created_at < prev_created_at,
+                        and_(
+                            ProjectModel.created_at == prev_created_at, ProjectModel.id > prev_id
+                        ),
+                    )
+                )
+    order_by = (ProjectModel.created_at.desc(), ProjectModel.id)
+    if ascending:
+        order_by = (ProjectModel.created_at.asc(), ProjectModel.id.desc())
+    total_count = None
+    if return_total_count:
+        res = await session.execute(stmt.with_only_columns(safunc.count(literal_column("1"))))
+        total_count = res.scalar_one()
+    res = await session.execute(
+        stmt.where(*pagination_filters)
+        .order_by(*order_by)
+        .limit(limit)
+        .options(joinedload(ProjectModel.owner))
+    )
+    project_models = res.unique().scalars().all()
+    projects = [
         project_model_to_project(p, include_backends=False, include_members=False)
-        for p in projects
+        for p in project_models
     ]
-
-
-async def list_projects(session: AsyncSession) -> List[Project]:
-    projects = await list_project_models(session=session)
-    return [
-        project_model_to_project(p, include_backends=False, include_members=False)
-        for p in projects
-    ]
+    if total_count is None:
+        return projects
+    return ProjectsInfoList(total_count=total_count, projects=projects)
 
 
 async def get_project_by_name(
@@ -130,6 +178,7 @@ async def create_project(
     user: UserModel,
     project_name: str,
     is_public: bool = False,
+    templates_repo: Optional[str] = None,
     config: Optional[ProjectHookConfig] = None,
 ) -> Project:
     user_permissions = users.get_user_permissions(user)
@@ -146,6 +195,7 @@ async def create_project(
         owner=user,
         project_name=project_name,
         is_public=is_public,
+        templates_repo=templates_repo,
     )
     await add_project_member(
         session=session,
@@ -171,12 +221,26 @@ async def update_project(
     session: AsyncSession,
     user: UserModel,
     project: ProjectModel,
-    is_public: bool,
+    is_public: Optional[bool] = None,
+    templates_repo: Optional[str] = None,
+    reset_templates_repo: bool = False,
 ):
     updated_fields = []
-    if is_public != project.is_public:
+    if is_public is not None and is_public != project.is_public:
         project.is_public = is_public
         updated_fields.append(f"is_public={is_public}")
+
+    update_templates_repo, new_templates_repo = await _resolve_new_templates_repo(
+        project=project,
+        templates_repo=templates_repo,
+        reset_templates_repo=reset_templates_repo,
+    )
+    if update_templates_repo:
+        templates_service.invalidate_templates_cache(
+            project.id, project.templates_repo, new_templates_repo
+        )
+        project.templates_repo = new_templates_repo
+        updated_fields.append(f"templates_repo={new_templates_repo}")
     events.emit(
         session,
         f"Project updated. Updated fields: {', '.join(updated_fields) or '<none>'}",
@@ -221,6 +285,7 @@ async def delete_projects(
         # so there can be dangling active resources due to race conditions.
         await _check_project_has_active_resources(session=session, project_id=p.id)
 
+    project_ids = {p.id for p in projects}
     timestamp = str(int(get_current_datetime().timestamp()))
     updates = []
     for p in projects:
@@ -239,6 +304,8 @@ async def delete_projects(
             targets=[events.Target.from_model(p)],
         )
     await session.execute(update(ProjectModel), updates)
+    await session.execute(delete(ExportModel).where(ExportModel.project_id.in_(project_ids)))
+    await session.execute(delete(ImportModel).where(ImportModel.project_id.in_(project_ids)))
     await session.commit()
 
 
@@ -406,14 +473,25 @@ async def list_user_project_models(
     session: AsyncSession,
     user: UserModel,
     only_names: bool = False,
+    include_members: bool = False,
+    project_names: Optional[List[str]] = None,
 ) -> List[ProjectModel]:
     load_only_attrs = []
     if only_names:
         load_only_attrs += [ProjectModel.id, ProjectModel.name]
     if user.global_role == GlobalRole.ADMIN:
-        return await list_project_models(session=session, load_only_attrs=load_only_attrs)
+        return await list_project_models(
+            session=session,
+            load_only_attrs=load_only_attrs,
+            include_members=include_members,
+            project_names=project_names,
+        )
     return await list_member_project_models(
-        session=session, user=user, load_only_attrs=load_only_attrs
+        session=session,
+        user=user,
+        load_only_attrs=load_only_attrs,
+        include_members=include_members,
+        project_names=project_names,
     )
 
 
@@ -422,6 +500,7 @@ async def list_member_project_models(
     user: UserModel,
     include_members: bool = False,
     load_only_attrs: Optional[List[QueryableAttribute]] = None,
+    project_names: Optional[List[str]] = None,
 ) -> List[ProjectModel]:
     """
     List project models for a user where they are a member.
@@ -431,35 +510,15 @@ async def list_member_project_models(
         options.append(joinedload(ProjectModel.members))
     if load_only_attrs:
         options.append(load_only(*load_only_attrs))
-    res = await session.execute(
-        select(ProjectModel)
-        .where(
-            MemberModel.project_id == ProjectModel.id,
-            MemberModel.user_id == user.id,
-            ProjectModel.deleted == False,
-        )
-        .options(*options)
-    )
+    filters = [
+        MemberModel.project_id == ProjectModel.id,
+        MemberModel.user_id == user.id,
+        ProjectModel.deleted == False,
+    ]
+    if project_names is not None:
+        filters.append(ProjectModel.name.in_(project_names))
+    res = await session.execute(select(ProjectModel).where(*filters).options(*options))
     return list(res.scalars().unique().all())
-
-
-async def list_public_non_member_project_models(
-    session: AsyncSession,
-    user: UserModel,
-) -> List[ProjectModel]:
-    """
-    List public project models where user is NOT a member.
-    """
-    res = await session.execute(
-        select(ProjectModel).where(
-            ProjectModel.deleted == False,
-            ProjectModel.is_public == True,
-            ProjectModel.id.notin_(
-                select(MemberModel.project_id).where(MemberModel.user_id == user.id)
-            ),
-        )
-    )
-    return list(res.scalars().all())
 
 
 async def list_user_owned_project_models(
@@ -478,14 +537,19 @@ async def list_user_owned_project_models(
 async def list_project_models(
     session: AsyncSession,
     load_only_attrs: Optional[List[QueryableAttribute]] = None,
+    include_members: bool = False,
+    project_names: Optional[List[str]] = None,
 ) -> List[ProjectModel]:
     options = []
+    if include_members:
+        options.append(joinedload(ProjectModel.members))
     if load_only_attrs:
         options.append(load_only(*load_only_attrs))
-    res = await session.execute(
-        select(ProjectModel).where(ProjectModel.deleted == False).options(*options)
-    )
-    return list(res.scalars().all())
+    filters = [ProjectModel.deleted == False]
+    if project_names is not None:
+        filters.append(ProjectModel.name.in_(project_names))
+    res = await session.execute(select(ProjectModel).where(*filters).options(*options))
+    return list(res.scalars().unique().all())
 
 
 # TODO: Do not load ProjectModel.backends and ProjectModel.members by default when getting project
@@ -502,6 +566,7 @@ async def get_project_model_by_name(
     res = await session.execute(
         select(ProjectModel)
         .where(*filters)
+        .options(joinedload(ProjectModel.owner))
         .options(joinedload(ProjectModel.backends))
         .options(joinedload(ProjectModel.members))
     )
@@ -518,22 +583,7 @@ async def get_project_model_by_name_or_error(
             ProjectModel.name == project_name,
             ProjectModel.deleted == False,
         )
-        .options(joinedload(ProjectModel.backends))
-        .options(joinedload(ProjectModel.members))
-    )
-    return res.unique().scalar_one()
-
-
-async def get_project_model_by_id_or_error(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-) -> ProjectModel:
-    res = await session.execute(
-        select(ProjectModel)
-        .where(
-            ProjectModel.id == project_id,
-            ProjectModel.deleted == False,
-        )
+        .options(joinedload(ProjectModel.owner))
         .options(joinedload(ProjectModel.backends))
         .options(joinedload(ProjectModel.members))
     )
@@ -541,10 +591,16 @@ async def get_project_model_by_id_or_error(
 
 
 async def create_project_model(
-    session: AsyncSession, owner: UserModel, project_name: str, is_public: bool = False
+    session: AsyncSession,
+    owner: UserModel,
+    project_name: str,
+    is_public: bool = False,
+    templates_repo: Optional[str] = None,
 ) -> ProjectModel:
+    validate_project_name(project_name)
+    templates_repo = await _normalize_templates_repo_url(templates_repo)
     private_bytes, public_bytes = await run_async(
-        generate_rsa_key_pair_bytes, f"{project_name}@dstack"
+        crypto.generate_rsa_key_pair_bytes, f"{project_name}@dstack"
     )
     project = ProjectModel(
         id=uuid.uuid4(),
@@ -553,15 +609,32 @@ async def create_project_model(
         ssh_private_key=private_bytes.decode(),
         ssh_public_key=public_bytes.decode(),
         is_public=is_public,
+        templates_repo=templates_repo,
     )
-    session.add(project)
-    events.emit(
-        session,
-        "Project created",
-        actor=events.UserActor.from_user(owner),
-        targets=[events.Target.from_model(project)],
+
+    if is_db_sqlite():
+        # Start new transaction to see committed changes after lock
+        await session.commit()
+    elif is_db_postgres():
+        await session.execute(
+            select(safunc.pg_advisory_xact_lock(string_to_lock_id(GLOBAL_EXPORTS_LOCK_NAMESPACE)))
+        )
+    global_exports_lock, _ = get_locker(get_db().dialect_name).get_lockset(
+        GLOBAL_EXPORTS_LOCK_NAMESPACE
     )
-    await session.commit()
+
+    async with global_exports_lock:
+        res = await session.execute(select(ExportModel.id).where(ExportModel.is_global == True))
+        for export_id in res.scalars().all():
+            session.add(ImportModel(project=project, export_id=export_id))
+        session.add(project)
+        events.emit(
+            session,
+            "Project created",
+            actor=events.UserActor.from_user(owner),
+            targets=[events.Target.from_model(project)],
+        )
+        await session.commit()
     return project
 
 
@@ -631,6 +704,11 @@ def project_model_to_project(
         backends=backends,
         members=members,
         is_public=project_model.is_public,
+        **(
+            {"templates_repo": project_model.templates_repo}
+            if project_model.templates_repo is not None
+            else {}
+        ),
     )
 
 
@@ -644,9 +722,57 @@ def get_member_permissions(member_model: MemberModel) -> MemberPermissions:
             and member_model.project_role != ProjectRole.ADMIN
         ):
             can_manage_ssh_fleets = False
+    can_manage_secrets = (
+        user_model.global_role == GlobalRole.ADMIN
+        or member_model.project_role == ProjectRole.ADMIN
+        or (
+            member_model.project_role == ProjectRole.MANAGER
+            and default_permissions.allow_managers_manage_secrets
+        )
+    )
     return MemberPermissions(
         can_manage_ssh_fleets=can_manage_ssh_fleets,
+        can_manage_secrets=can_manage_secrets,
     )
+
+
+def validate_project_name(project_name: str):
+    if not is_valid_project_name(project_name):
+        raise ServerClientError("Project name should match regex '^[a-zA-Z0-9-_]{1,50}$'")
+
+
+def is_valid_project_name(project_name: str) -> bool:
+    return re.match("^[a-zA-Z0-9-_]{1,50}$", project_name) is not None
+
+
+async def _normalize_templates_repo_url(templates_repo: Optional[str]) -> Optional[str]:
+    if templates_repo is None:
+        return None
+    templates_repo = templates_repo.strip()
+    if templates_repo == "":
+        return None
+    try:
+        await run_async(templates_service.validate_templates_repo_access, templates_repo)
+    except ValueError as e:
+        raise ServerClientError(str(e))
+    return templates_repo
+
+
+async def _resolve_new_templates_repo(
+    project: ProjectModel,
+    templates_repo: Optional[str],
+    reset_templates_repo: bool,
+) -> Tuple[bool, Optional[str]]:
+    if reset_templates_repo:
+        return project.templates_repo is not None, None
+    if templates_repo is None:
+        return False, None
+    normalized_templates_repo = await _normalize_templates_repo_url(templates_repo)
+    if normalized_templates_repo is None:
+        return False, None
+    if normalized_templates_repo == project.templates_repo:
+        return False, None
+    return True, normalized_templates_repo
 
 
 _CREATE_PROJECT_HOOKS = []

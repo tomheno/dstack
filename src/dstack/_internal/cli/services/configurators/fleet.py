@@ -34,10 +34,11 @@ from dstack._internal.core.models.fleets import (
     InstanceGroupPlacement,
 )
 from dstack._internal.core.models.instances import InstanceStatus, SSHKey
-from dstack._internal.core.services.diff import diff_models
+from dstack._internal.core.services.diff import copy_model, diff_models
 from dstack._internal.utils.common import local_time
 from dstack._internal.utils.logging import get_logger
-from dstack._internal.utils.ssh import convert_ssh_key_to_pem, generate_public_key, pkey_from_str
+from dstack._internal.utils.nested_list import NestedList, NestedListItem
+from dstack._internal.utils.ssh import resolve_ssh_key
 from dstack.api.utils import load_profile
 
 logger = get_logger(__name__)
@@ -85,14 +86,10 @@ class FleetConfigurator(ApplyEnvVarsConfiguratorMixin, BaseApplyConfigurator[Fle
                 )
             confirm_message += "Create the fleet?"
         else:
+            effective_spec = plan.get_effective_spec()
+            diff = _render_fleet_spec_diff(plan.current_resource.spec, effective_spec)
             action_message += f"Found fleet [code]{plan.spec.configuration.name}[/]."
-            if plan.action == ApplyAction.CREATE:
-                delete_fleet_name = plan.current_resource.name
-                action_message += (
-                    " Configuration changes detected. Cannot update the fleet in-place"
-                )
-                confirm_message += "Re-create the fleet?"
-            elif plan.current_resource.spec == plan.effective_spec:
+            if plan.current_resource.spec == effective_spec:
                 if command_args.yes and not command_args.force:
                     # --force is required only with --yes,
                     # otherwise we may ask for force apply interactively.
@@ -103,8 +100,26 @@ class FleetConfigurator(ApplyEnvVarsConfiguratorMixin, BaseApplyConfigurator[Fle
                 delete_fleet_name = plan.current_resource.name
                 action_message += " No configuration changes detected."
                 confirm_message += "Re-create the fleet?"
+            elif plan.action == ApplyAction.CREATE:
+                delete_fleet_name = plan.current_resource.name
+                if diff is not None:
+                    # TODO: Highlight only the fields that block in-place update instead of
+                    # showing the full detected diff here.
+                    action_message += (
+                        f" Detected changes that [error]cannot[/] be updated in-place:\n{diff}"
+                    )
+                else:
+                    action_message += (
+                        " Configuration changes detected. Cannot update the fleet in-place."
+                    )
+                confirm_message += "Re-create the fleet?"
             else:
-                action_message += " Configuration changes detected."
+                if diff is not None:
+                    action_message += (
+                        f" Detected changes that [code]can[/] be updated in-place:\n{diff}"
+                    )
+                else:
+                    action_message += " Configuration changes detected."
                 confirm_message += "Update the fleet in-place?"
 
         console.print(action_message)
@@ -141,7 +156,7 @@ class FleetConfigurator(ApplyEnvVarsConfiguratorMixin, BaseApplyConfigurator[Fle
                 f"Provisioning [code]{fleet.name}[/]...", console=console
             ) as live:
                 while not _finished_provisioning(fleet):
-                    table = get_fleets_table([fleet])
+                    table = get_fleets_table([fleet], current_project=self.api.project)
                     live.update(table)
                     time.sleep(LIVE_TABLE_PROVISION_INTERVAL_SECS)
                     fleet = self.api.client.fleets.get(self.api.project, fleet.name)
@@ -159,6 +174,7 @@ class FleetConfigurator(ApplyEnvVarsConfiguratorMixin, BaseApplyConfigurator[Fle
                 [fleet],
                 verbose=_fleet_has_failed_instances(fleet),
                 format_date=local_time,
+                current_project=self.api.project,
             )
         )
         if _fleet_has_failed_instances(fleet):
@@ -242,7 +258,7 @@ class FleetConfigurator(ApplyEnvVarsConfiguratorMixin, BaseApplyConfigurator[Fle
                 f"Provisioning [code]{fleet.name}[/]...", console=console
             ) as live:
                 while not _finished_provisioning(fleet):
-                    table = get_fleets_table([fleet])
+                    table = get_fleets_table([fleet], current_project=self.api.project)
                     live.update(table)
                     time.sleep(LIVE_TABLE_PROVISION_INTERVAL_SECS)
                     fleet = self.api.client.fleets.get(self.api.project, fleet.name)
@@ -260,6 +276,7 @@ class FleetConfigurator(ApplyEnvVarsConfiguratorMixin, BaseApplyConfigurator[Fle
                 [fleet],
                 verbose=_fleet_has_failed_instances(fleet),
                 format_date=local_time,
+                current_project=self.api.project,
             )
         )
         if _fleet_has_failed_instances(fleet):
@@ -337,22 +354,53 @@ def _preprocess_spec(spec: FleetSpec):
 def _resolve_ssh_key(ssh_key_path: Optional[str]) -> Optional[SSHKey]:
     if ssh_key_path is None:
         return None
-    ssh_key_path_obj = Path(ssh_key_path).expanduser()
     try:
-        private_key = convert_ssh_key_to_pem(ssh_key_path_obj.read_text())
-        try:
-            pub_key = ssh_key_path_obj.with_suffix(".pub").read_text()
-        except FileNotFoundError:
-            pub_key = generate_public_key(pkey_from_str(private_key))
-        return SSHKey(public=pub_key, private=private_key)
+        public_key, _, private_key, _ = resolve_ssh_key(ssh_key_path)
     except OSError as e:
-        logger.debug("Got OSError: %s", repr(e))
-        console.print(f"[error]Unable to read the SSH key at {ssh_key_path}[/]")
-        exit()
+        raise CLIError(f"Unable to read the SSH key at {ssh_key_path}") from e
     except ValueError as e:
-        logger.debug("Key type is not supported", repr(e))
-        console.print("[error]Key type is not supported[/]")
-        exit()
+        raise CLIError(f"Unsupported or invalid SSH key at {ssh_key_path}") from e
+    if private_key is None:
+        raise CLIError(f"Expected a private key at {ssh_key_path}, got a public key")
+    return SSHKey(public=public_key, private=private_key)
+
+
+def _render_fleet_spec_diff(old_spec: FleetSpec, new_spec: FleetSpec) -> Optional[str]:
+    old_spec = copy_model(old_spec)
+    new_spec = copy_model(new_spec)
+    changed_spec_fields = list(diff_models(old_spec, new_spec))
+    if not changed_spec_fields:
+        return None
+
+    nested_list = NestedList()
+    for spec_field in changed_spec_fields:
+        if spec_field == "merged_profile":
+            continue
+        if spec_field == "configuration":
+            item = NestedListItem(
+                "Configuration properties:",
+                children=[
+                    NestedListItem(field)
+                    for field in diff_models(old_spec.configuration, new_spec.configuration)
+                ],
+            )
+        elif spec_field == "profile":
+            item = NestedListItem(
+                "Profile properties:",
+                children=[
+                    NestedListItem(field)
+                    for field in diff_models(old_spec.profile, new_spec.profile)
+                ],
+            )
+        elif spec_field == "configuration_path":
+            item = NestedListItem("Configuration path")
+        else:
+            item = NestedListItem(spec_field.replace("_", " ").capitalize())
+        nested_list.children.append(item)
+
+    if not nested_list.children:
+        return None
+    return nested_list.render()
 
 
 def _print_plan_header(plan: FleetPlan):

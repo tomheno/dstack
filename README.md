@@ -2,8 +2,8 @@
 <h2>
   <a target="_blank" href="https://dstack.ai">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/dstackai/dstack/master/docs/assets/images/dstack-logo-dark.svg"/>
-      <img alt="dstack" src="https://raw.githubusercontent.com/dstackai/dstack/master/docs/assets/images/dstack-logo.svg" width="350px"/>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/dstackai/dstack/master/mkdocs/assets/images/dstack-logo-dark.svg"/>
+      <img alt="dstack" src="https://raw.githubusercontent.com/dstackai/dstack/master/mkdocs/assets/images/dstack-logo.svg" width="350px"/>
     </picture>
   </a>
 </h2>
@@ -18,63 +18,42 @@
 
 It streamlines development, training, and inference, and is compatible with any hardware, open-source tools, and frameworks.
 
-#### Hardware
+#### Accelerators
 
-`dstack` supports `NVIDIA`, `AMD`, `Google TPU`, `Intel Gaudi`, and `Tenstorrent` accelerators out of the box.
+`dstack` supports `NVIDIA`, `AMD`, `Google TPU`, and `Tenstorrent` accelerators out of the box.
 
 ## Latest news ✨
-- [2025/12] [dstack 0.20.0: Fleet-first UX, Events, and more](https://github.com/dstackai/dstack/releases/tag/0.20.0)
-- [2025/11] [dstack 0.19.38: Routers, SGLang Model Gateway integration](https://github.com/dstackai/dstack/releases/tag/0.19.38)
-- [2025/10] [dstack 0.19.31: Kubernetes, GCP A4 spot](https://github.com/dstackai/dstack/releases/tag/0.19.31)
-- [2025/08] [dstack 0.19.26: Repos](https://github.com/dstackai/dstack/releases/tag/0.19.26)
-- [2025/08] [dstack 0.19.22: Service probes, GPU health-checks, Tenstorrent Galaxy](https://github.com/dstackai/dstack/releases/tag/0.19.22)
-- [2025/07] [dstack 0.19.21: Scheduled tasks](https://github.com/dstackai/dstack/releases/tag/0.19.21)
-- [2025/07] [dstack 0.19.17: Secrets, Files, Rolling deployment](https://github.com/dstackai/dstack/releases/tag/0.19.17)
+- [2026/08] [dstack 0.21.0: Pydantic v2, Gateway replicas](https://github.com/dstackai/dstack/releases/tag/0.21.0)
+- [2026/07] [dstack 0.20.29: Presets — agent-driven inference optimization (experimental)](https://dstack.ai/docs/concepts/presets/)
+- [2026/07] [dstack 0.20.27: Slurm backend](https://github.com/dstackai/dstack/releases/tag/0.20.27)
+- [2026/05] [dstack 0.20.21: Kubernetes multiple clusters](https://github.com/dstackai/dstack/releases/tag/0.20.21)
+- [2026/05] [dstack 0.20.20: NVIDIA Dynamo integration](https://github.com/dstackai/dstack/releases/tag/0.20.20)
+- [2026/04] [dstack 0.20.17: Kubernetes volumes](https://github.com/dstackai/dstack/releases/tag/0.20.17)
+- [2026/02] [dstack 0.20.10: PD disaggregation support](https://github.com/dstackai/dstack/releases/tag/0.20.10)
+- [2026/01] [dstack 0.20.7: Replica groups](https://github.com/dstackai/dstack/releases/tag/0.20.7)
 
 ## How does it work?
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://dstack.ai/static-assets/static-assets/images/dstack-architecture-diagram-v11-dark.svg"/>
-  <img src="https://dstack.ai/static-assets/static-assets/images/dstack-architecture-diagram-v11.svg" width="750" />
+  <source media="(prefers-color-scheme: dark)" srcset="https://dstack.ai/static-assets/static-assets/images/dstack-architecture-diagram-dark.svg"/>
+  <img src="https://dstack.ai/static-assets/static-assets/images/dstack-architecture-diagram.svg" width="750" />
 </picture>
 
-### Installation
+### Launch the server
 
-> Before using `dstack` through CLI or API, set up a `dstack` server. If you already have a running `dstack` server, you only need to [set up the CLI](#set-up-the-cli).
+> Before using `dstack` through CLI or API, set up a `dstack` server. If you already have a running `dstack` server, you only need to [install the CLI](#install-the-cli).
 
-#### Set up the server
-
-##### Configure backends
-
-To orchestrate compute across cloud providers or existing Kubernetes clusters, you need to configure backends.
-
-Backends can be set up in `~/.dstack/server/config.yml` or through the [project settings page](https://dstack.ai/docs/concepts/projects#backends) in the UI.
-
-For more details, see [Backends](https://dstack.ai/docs/concepts/backends).
+To orchestrate compute across GPU clouds or Kubernetes clusters, you need to [configure backends](https://dstack.ai/docs/concepts/backends).
 
 > When using `dstack` with on-prem servers, backend configuration isn’t required. Simply create [SSH fleets](https://dstack.ai/docs/concepts/fleets#ssh-fleets) once the server is up.
 
-##### Start the server
-
-You can install the server on Linux, macOS, and Windows (via WSL 2). It requires Git and
+The server can be installed on Linux, macOS, and Windows (via WSL 2). It requires Git and
 OpenSSH.
-
-##### uv
 
 ```shell
 $ uv tool install "dstack[all]" -U
-```
-
-##### pip
-
-```shell
-$ pip install "dstack[all]" -U
-```
-
-Once it's installed, go ahead and start the server.
-
-```shell
 $ dstack server
+
 Applying ~/.dstack/server/config.yml...
 
 The admin token is "bbae0f28-d3dd-4820-bf61-8f4bb40815da"
@@ -84,25 +63,16 @@ The server is running at http://127.0.0.1:3000/
 > For more details on server configuration options, see the
 [Server deployment](https://dstack.ai/docs/guides/server-deployment) guide.
 
+### Install the CLI
 
-<details><summary>Set up the CLI</summary>
+<details><summary>If the CLI is not installed with the server</summary>
 
-#### Set up the CLI
-
-Once the server is up, you can access it via the `dstack` CLI. 
+Once the server is up, you can access it via the `dstack` CLI.
 
 The CLI can be installed on Linux, macOS, and Windows. It requires Git and OpenSSH.
 
-##### uv
-
 ```shell
 $ uv tool install dstack -U
-```
-
-##### pip
-
-```shell
-$ pip install dstack -U
 ```
 
 To point the CLI to the `dstack` server, configure it
@@ -113,28 +83,38 @@ $ dstack project add \
     --name main \
     --url http://127.0.0.1:3000 \
     --token bbae0f28-d3dd-4820-bf61-8f4bb40815da
-    
+
 Configuration is updated at ~/.dstack/config.yml
 ```
 
 </details>
 
+### Install agent skills
+
+Install [`dstack` skills](https://skills.sh/dstackai/dstack/dstack) to help AI agents use the CLI and edit configuration files.
+
+```shell
+$ npx skills add dstackai/dstack
+```
+
+AI agents like Claude, Codex, and Cursor can now create and manage fleets and submit workloads on your behalf.
+
 ### Define configurations
 
 `dstack` supports the following configurations:
    
-* [Dev environments](https://dstack.ai/docs/dev-environments) &mdash; for interactive development using a desktop IDE
-* [Tasks](https://dstack.ai/docs/tasks) &mdash; for scheduling jobs (incl. distributed jobs) or running web apps
-* [Services](https://dstack.ai/docs/services) &mdash; for deployment of models and web apps (with auto-scaling and authorization)
-* [Fleets](https://dstack.ai/docs/fleets) &mdash; for managing cloud and on-prem clusters
-* [Volumes](https://dstack.ai/docs/concepts/volumes) &mdash; for managing persisted volumes
-* [Gateways](https://dstack.ai/docs/concepts/gateways) &mdash; for configuring the ingress traffic and public endpoints
+* [Fleets](https://dstack.ai/docs/concepts/fleets) &mdash; Provision and manage clusters across clouds, Kubernetes, and on-prem
+* [Dev environments](https://dstack.ai/docs/concepts/dev-environments) &mdash; Launch dev environments to be accessed by agents or from your IDE
+* [Tasks](https://dstack.ai/docs/concepts/tasks) &mdash; Run training, batch or other jobs across a single node or clusters
+* [Services](https://dstack.ai/docs/concepts/services) &mdash; Deploy model inference as secure and scalable endpoints
+* [Presets](https://dstack.ai/docs/concepts/presets) &mdash; Agent-driven inference optimization (experimental)
+* [Volumes](https://dstack.ai/docs/concepts/volumes) &mdash; Managing instance and network volumes for persisting data
 
 Configuration can be defined as YAML files within your repo.
 
 ### Apply configurations
 
-Apply the configuration either via the `dstack apply` CLI command or through a programmatic API.
+Apply the configuration via the `dstack apply` CLI command, a programmatic API, or through [AI agent skills](#install-ai-agent-skills).
 
 `dstack` automatically manages provisioning, job queuing, auto-scaling, networking, volumes, run failures,
 out-of-capacity errors, port-forwarding, and more &mdash; across clouds and on-prem clusters.

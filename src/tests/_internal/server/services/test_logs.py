@@ -50,8 +50,8 @@ class TestFileLogStorage:
             / "runner.log"
         )
         assert runner_log_path.read_text() == (
-            '{"timestamp":"2023-10-06T10:01:53.234000+00:00","log_source":"stdout","message":"Hello"}\n'
-            '{"timestamp":"2023-10-06T10:01:53.235000+00:00","log_source":"stdout","message":"World"}\n'
+            '{"timestamp":"2023-10-06T10:01:53.234000Z","log_source":"stdout","message":"Hello"}\n'
+            '{"timestamp":"2023-10-06T10:01:53.235000Z","log_source":"stdout","message":"World"}\n'
         )
 
     @pytest.mark.asyncio
@@ -798,8 +798,8 @@ class TestPollLogsRequestValidation:
 class TestCloudWatchLogStorage:
     FAKE_NOW = datetime(2023, 10, 6, 10, 1, 54, tzinfo=timezone.utc)
 
-    @freeze_time(FAKE_NOW)
     @pytest_asyncio.fixture
+    @freeze_time(FAKE_NOW)
     async def project(self, test_db, session: AsyncSession) -> ProjectModel:
         project = await create_project(session=session, name="test-proj")
         return project

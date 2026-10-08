@@ -8,6 +8,7 @@ from dstack._internal.core.backends.base.backend import Compute
 from dstack._internal.core.backends.base.compute import (
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     ComputeWithPrivilegedSupport,
     generate_unique_instance_name,
@@ -37,6 +38,7 @@ class VultrCompute(
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
     ComputeWithPrivilegedSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     Compute,
 ):
@@ -45,7 +47,9 @@ class VultrCompute(
         self.config = config
         self.api_client = VultrApiClient(config.creds.api_key)
 
-    def get_all_offers_with_availability(self) -> List[InstanceOfferWithAvailability]:
+    def get_all_offers_with_availability(
+        self, unallocated_resources: bool
+    ) -> List[InstanceOfferWithAvailability]:
         offers = get_catalog_offers(
             backend=BackendType.VULTR,
             requirements=None,
@@ -53,9 +57,7 @@ class VultrCompute(
             extra_filter=_supported_instances,
         )
         offers = [
-            InstanceOfferWithAvailability(
-                **offer.dict(), availability=InstanceAvailability.AVAILABLE
-            )
+            offer.with_availability(availability=InstanceAvailability.AVAILABLE)
             for offer in offers
         ]
         return offers
@@ -117,7 +119,7 @@ class VultrCompute(
         try:
             self.api_client.terminate_instance(instance_id=instance_id, plan_type=plan_type)
         except requests.HTTPError as e:
-            raise BackendError(e.response.text)
+            raise BackendError(e.response.text if e.response is not None else str(e))
 
     def update_provisioning_data(
         self,

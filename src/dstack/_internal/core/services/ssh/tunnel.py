@@ -5,7 +5,7 @@ import shlex
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Literal, Optional, Union
+from typing import Dict, Iterable, List, Literal, NoReturn, Optional, Union
 
 from dstack._internal.core.errors import SSHError
 from dstack._internal.core.models.instances import SSHConnectionParams
@@ -70,6 +70,7 @@ class SSHTunnel:
         ssh_config_path: Union[PathLike, Literal["none"]] = "none",
         port: Optional[int] = None,
         ssh_proxies: Iterable[tuple[SSHConnectionParams, Optional[FilePathOrContent]]] = (),
+        batch_mode: bool = False,
     ):
         """
         :param forwarded_sockets: Connections to the specified local sockets will be
@@ -79,6 +80,17 @@ class SSHTunnel:
         :param ssh_proxies: pairs of SSH connections params and optional identities,
             in order from outer to inner. If an identity is `None`, the `identity` param
             is used instead.
+        :param batch_mode: If enabled, "user interaction such as password prompts and host key
+            confirmation requests will be disabled", see `ssh_config(5)`, `BatchMode`.
+            Although this is probably the desired behavior in all use cases, the default value
+            is `False` for gradual adoption.
+            Note, this option is only applied to the `destination` and `ssh_proxies`. If you
+            configured `destination` with `ProxyJump` in the `ssh_config_path` config, the proxy
+            jump connection will ignore this option -- in that case, you should replace `ProxyJump`
+            with explicit `ProxyCommand=ssh [...] -o BatchMode=yes` in your config.
+            Control commands (`check`, `close`, `exec`) always run in batch mode, since they
+            only talk to the local master and must not prompt if ssh falls back to a direct
+            connection.
         """
         self.destination = destination
         self.forwarded_sockets = list(forwarded_sockets)
@@ -101,6 +113,7 @@ class SSHTunnel:
                     proxy_identity, f"proxy_identity_{proxy_index}"
                 )
             self.ssh_proxies.append((proxy_params, proxy_identity_path))
+        self.batch_mode = batch_mode
         self.log_path = normalize_path(os.path.join(temp_dir.name, "tunnel.log"))
         self.ssh_client_info = get_ssh_client_info()
         self.ssh_exec_path = str(self.ssh_client_info.path)
@@ -145,6 +158,14 @@ class SSHTunnel:
             command += ["-p", str(self.port)]
         for k, v in self.options.items():
             command += ["-o", f"{k}={v}"]
+        if self.batch_mode:
+            command += ["-o", "BatchMode=yes"]
+            if "serveraliveinterval" not in map(str.lower, self.options):
+                # Revert Debian-specific patch effect:
+                # > The default is 0, indicating that these messages will not be sent
+                # > to the server, or 300 if the BatchMode option is set (Debian-specific).
+                # https://salsa.debian.org/ssh-team/openssh/-/blob/d87b69641b533b892b87e2eea02dbee796682d64/debian/patches/keepalive-extensions.patch#L69-77
+                command += ["-o", "ServerAliveInterval=0"]
         if proxy_command := self._get_proxy_command():
             command += ["-o", proxy_command]
         for socket_pair in self.forwarded_sockets:
@@ -155,13 +176,13 @@ class SSHTunnel:
         return command
 
     def close_command(self) -> List[str]:
-        return [self.ssh_exec_path, "-S", self.control_sock_path, "-O", "exit", self.destination]
+        return [*self._control_command_prefix(), "-O", "exit", self.destination]
 
     def check_command(self) -> List[str]:
-        return [self.ssh_exec_path, "-S", self.control_sock_path, "-O", "check", self.destination]
+        return [*self._control_command_prefix(), "-O", "check", self.destination]
 
     def exec_command(self) -> List[str]:
-        return [self.ssh_exec_path, "-S", self.control_sock_path, self.destination]
+        return [*self._control_command_prefix(), self.destination]
 
     def open(self) -> None:
         # We cannot use `stderr=subprocess.PIPE` here since the forked process (daemon) does not
@@ -181,9 +202,8 @@ class SSHTunnel:
             raise SSHError(msg) from e
         if r.returncode == 0:
             return
-        stderr = self._read_log_file()
-        logger.debug("SSH tunnel failed: %s", stderr)
-        raise get_ssh_error(stderr)
+        log_output = self._read_log_file()
+        self._raise_ssh_error_from_log_output(log_output)
 
     async def aopen(self) -> None:
         await run_async(self._remove_log_file)
@@ -199,9 +219,8 @@ class SSHTunnel:
             raise SSHError(msg) from e
         if proc.returncode == 0:
             return
-        stderr = await run_async(self._read_log_file)
-        logger.debug("SSH tunnel failed: %s", stderr)
-        raise get_ssh_error(stderr)
+        log_output = await run_async(self._read_log_file)
+        self._raise_ssh_error_from_log_output(log_output)
 
     def close(self) -> None:
         if not os.path.exists(self.control_sock_path):
@@ -209,9 +228,17 @@ class SSHTunnel:
                 "Control socket does not exist, it seems that ssh process has already exited"
             )
             return
-        proc = subprocess.run(
-            self.close_command(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-        )
+        try:
+            proc = subprocess.run(
+                self.close_command(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=SSH_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("Failed to close SSH tunnel in %d seconds", SSH_TIMEOUT)
+            return
         if proc.returncode:
             logger.error(
                 "Failed to close SSH tunnel, exit status: %d, output: %s",
@@ -225,31 +252,52 @@ class SSHTunnel:
                 "Control socket does not exist, it seems that ssh process has already exited"
             )
             return
-        proc = await asyncio.create_subprocess_exec(
-            *self.close_command(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-        )
-        await proc.wait()
-        if proc.returncode:
+        try:
+            returncode, stdout, stderr = await _arun(self.close_command(), SSH_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error("Failed to close SSH tunnel in %d seconds", SSH_TIMEOUT)
+            return
+        if returncode:
             logger.error(
                 "Failed to close SSH tunnel, exit status: %d, output: %s",
-                proc.returncode,
-                proc.stdout,
+                returncode,
+                stdout + stderr,
             )
 
-    async def acheck(self) -> bool:
-        proc = await asyncio.create_subprocess_exec(
-            *self.check_command(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        await proc.wait()
-        ok = proc.returncode == 0
-        return ok
+    def check(self) -> bool:
+        try:
+            proc = subprocess.run(
+                self.check_command(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=SSH_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            logger.debug("SSH tunnel check did not complete in %d seconds", SSH_TIMEOUT)
+            return False
+        return proc.returncode == 0
 
-    async def aexec(self, command: str) -> str:
-        proc = await asyncio.create_subprocess_exec(
-            *self.exec_command(), command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
+    async def acheck(self) -> bool:
+        try:
+            returncode, _, _ = await _arun(self.check_command(), SSH_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.debug("SSH tunnel check did not complete in %d seconds", SSH_TIMEOUT)
+            return False
+        return returncode == 0
+
+    async def aexec(self, command: str, timeout: float = SSH_TIMEOUT) -> str:
+        """
+        Runs `command` on the remote host over the open tunnel.
+
+        :param timeout: Seconds to wait for `command` to complete before killing it
+            and raising `SSHError`.
+        """
+        try:
+            returncode, stdout, stderr = await _arun([*self.exec_command(), command], timeout)
+        except asyncio.TimeoutError as e:
+            raise SSHError(f"Command did not complete in {timeout} seconds") from e
+        if returncode != 0:
             raise SSHError(stderr.decode())
         return stdout.decode()
 
@@ -266,6 +314,21 @@ class SSHTunnel:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.aclose()
+
+    def _control_command_prefix(self) -> List[str]:
+        # If the master does not complete the initial exchange (or, for exec, the control socket
+        # is missing), OpenSSH falls back to connecting to `destination` directly, even for `-O`
+        # commands. Ignore the user's ssh config and disable prompts so that such a connection
+        # fails instead of waiting for input on the terminal.
+        return [
+            self.ssh_exec_path,
+            "-F",
+            "none",
+            "-o",
+            "BatchMode=yes",
+            "-S",
+            self.control_sock_path,
+        ]
 
     def _get_proxy_command(self) -> Optional[str]:
         proxy_command: Optional[str] = None
@@ -290,6 +353,14 @@ class SSHTunnel:
             "-o",
             "UserKnownHostsFile=/dev/null",
         ]
+        if self.batch_mode:
+            # ServerAliveInterval is explained in the open_command() comment
+            command += [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ServerAliveInterval=0",
+            ]
         if prev_proxy_command is not None:
             command += ["-o", prev_proxy_command.replace("%", "%%")]
         command += [
@@ -299,9 +370,13 @@ class SSHTunnel:
         ]
         return "ProxyCommand=" + shlex.join(command)
 
-    def _read_log_file(self) -> bytes:
-        with open(self.log_path, "rb") as f:
-            return f.read()
+    def _read_log_file(self) -> Optional[bytes]:
+        try:
+            with open(self.log_path, "rb") as f:
+                return f.read()
+        except OSError as e:
+            logger.debug("Failed to read SSH tunnel log file %s: %s", self.log_path, e)
+            return None
 
     def _remove_log_file(self) -> None:
         try:
@@ -310,6 +385,16 @@ class SSHTunnel:
             pass
         except OSError as e:
             logger.debug("Failed to remove SSH tunnel log file %s: %s", self.log_path, e)
+
+    def _raise_ssh_error_from_log_output(self, output: Optional[bytes]) -> NoReturn:
+        if output is None:
+            msg = "(no log file)"
+            ssh_error = SSHError()
+        else:
+            msg = output
+            ssh_error = get_ssh_error(output)
+        logger.debug("SSH tunnel failed: %s", msg)
+        raise ssh_error
 
     def _get_identity_path(self, identity: FilePathOrContent, tmp_filename: str) -> PathLike:
         if isinstance(identity, FilePath):
@@ -320,6 +405,25 @@ class SSHTunnel:
         ) as f:
             f.write(identity.content)
         return identity_path
+
+
+async def _arun(command: List[str], timeout: float) -> tuple[int, bytes, bytes]:
+    """
+    Runs `command` with stdin redirected from /dev/null and returns its exit status, stdout,
+    and stderr. Kills the process and raises `asyncio.TimeoutError` if it does not exit in
+    `timeout` seconds.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+    assert proc.returncode is not None
+    return proc.returncode, stdout, stderr
 
 
 def ports_to_forwarded_sockets(

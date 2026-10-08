@@ -10,6 +10,7 @@ from dstack._internal.core.backends.base.compute import (
     ComputeWithPlacementGroupSupport,
     ComputeWithPrivateGatewaySupport,
     ComputeWithPrivilegedSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithReservationSupport,
     ComputeWithVolumeSupport,
 )
@@ -34,6 +35,7 @@ class {{ backend_name }}Compute(
     # ComputeWithAllOffersCached,
     # ComputeWithCreateInstanceSupport,
     # ComputeWithPrivilegedSupport,
+    # ComputeWithInstanceVolumesSupport,
     # ComputeWithMultinodeSupport,
     # ComputeWithReservationSupport,
     # ComputeWithPlacementGroupSupport,
@@ -47,7 +49,7 @@ class {{ backend_name }}Compute(
         self.config = config
 
     def get_offers(
-        self, requirements: Requirements
+        self, requirements: Requirements, full_offers: bool, unallocated_resources: bool
     ) -> Iterator[InstanceOfferWithAvailability]:
         # If the provider is added to gpuhunt, you'd typically get offers
         # using `get_catalog_offers()` and extend them with availability info.
@@ -59,10 +61,7 @@ class {{ backend_name }}Compute(
         )
         # TODO: Add availability info to offers
         return (
-            InstanceOfferWithAvailability(
-                **offer.dict(),
-                availability=InstanceAvailability.UNKNOWN,
-            )
+            offer.with_availability(availability=InstanceAvailability.UNKNOWN)
             for offer in offers
         )
 
@@ -85,6 +84,7 @@ class {{ backend_name }}Compute(
         project_ssh_private_key: str,
         volumes: List[Volume],
         placement_group: Optional[PlacementGroup],
+        requirements: Requirements,
     ) -> JobProvisioningData:
         # TODO: Implement if create_instance() is not implemented. Delete otherwise.
         raise NotImplementedError()

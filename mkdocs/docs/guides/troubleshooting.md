@@ -1,0 +1,235 @@
+---
+title: Troubleshooting
+description: Common issues and how to resolve them
+---
+
+# Troubleshooting
+
+## Reporting issues
+
+When you encounter a problem, please report it as
+a [GitHub issue](https://github.com/dstackai/dstack/issues/new/choose).
+
+If you have a question or need help, feel free to ask it in our [Discord server](https://discord.gg/u8SmfwPpMd).
+
+> When bringing up issues, always include the steps to reproduce.
+
+### Steps to reproduce
+
+Make sure to provide clear, detailed steps to reproduce the issue. 
+Include server logs, CLI outputs, and configuration samples. Avoid using screenshots for logs or errors—use text instead. 
+
+#### Server logs
+
+To get more detailed server logs, set the `DSTACK_SERVER_LOG_LEVEL` 
+environment variable to `DEBUG`. By default, it is set to `INFO`.
+
+#### CLI logs
+
+CLI logs are located in `~/.dstack/logs/cli`, and the default log level is `DEBUG`.
+
+> See these examples for well-reported issues: [this](https://github.com/dstackai/dstack/issues/1640)
+and [this](https://github.com/dstackai/dstack/issues/1551).
+
+## Typical issues
+
+### No fleets { #no-fleets }
+[//]: # (NOTE: This section is referenced in the CLI. Do not change its URL.)
+
+If you run `dstack apply` and see `No fleets` status it can mean two things:
+
+=== "The project has no fleets"
+    In this case, ensure you've created one before submitting runs. This can be either a [backend fleet](../concepts/fleets.md#backend-fleets) (if you are using cloud or Kubernetes) or an [SSH fleet](../concepts/fleets.md#ssh-fleets) (if you're using on-prem clusters).
+      
+    !!! info "Backend fleets"
+        Note that creating [backend fleet](../concepts/fleets.md#backend-fleets) doesn't necessarily require provisioning instances upfront. If you set `nodes` to a range, `dstack` will be able to provision instances as required. See [backend fleet](../concepts/fleets.md#backend-fleets) for examples.
+
+=== "No matching fleet found"
+    This means fleets exist but run requirements do not match the configuration of the fleet. Review your fleets, and ensure that both run and fleet configuration are correct.
+
+### No offers { #no-offers }
+[//]: # (NOTE: This section is referenced in the CLI. Do not change its URL.)
+
+If you run `dstack apply` and don't see any instance offers, it means that
+`dstack` could not find instances that match the requirements in your configuration.
+Below are some of the reasons why this might happen.
+
+Feel free to use `dstack offer` to inspect available offers:
+
+```shell
+# All matching offers, ignoring fleet configurations
+$ dstack offer --gpu H100
+
+# Offers available through a specific fleet
+$ dstack offer --gpu H100 --fleet my-fleet
+```
+
+#### Cause 1: No backends
+
+If you are not using [SSH fleets](../concepts/fleets.md#ssh-fleets), make sure you have configured at least one [backends](../concepts/backends.md).
+
+If you have configured a backend but still cannot use it, check the output of `dstack server` for backend configuration errors.
+
+> You can find a list of successfully configured backends on the [project settings page](../concepts/projects.md#backends) in the UI.
+
+#### Cause 2: Requirements mismatch
+
+When you apply a configuration, `dstack` tries to find instances that match the
+[`resources`](../reference/dstack.yml/task.md#resources),
+[`backends`](../reference/dstack.yml/task.md#backends),
+[`regions`](../reference/dstack.yml/task.md#regions),
+[`availability_zones`](../reference/dstack.yml/task.md#availability_zones),
+[`instance_types`](../reference/dstack.yml/task.md#instance_types),
+[`spot_policy`](../reference/dstack.yml/task.md#spot_policy),
+and [`max_price`](../reference/dstack.yml/task.md#max_price)
+properties from the configuration.
+
+`dstack` will only select instances that meet all the requirements.
+Make sure your configuration doesn't set any conflicting requirements, such as
+`regions` that don't exist in the specified `backends`, or `instance_types` that
+don't match the specified `resources`.
+
+#### Cause 3: Too specific resources
+
+If you set a resource requirement to an exact value, `dstack` will only select instances
+that have exactly that amount of resources. For example, `cpu: 5` and `memory: 10GB` will only
+match instances that have exactly 5 CPUs and exactly 10GB of memory.
+
+Typically, you will want to set resource ranges to match more instances.
+For example, `cpu: 4..8` and `memory: 10GB..` will match instances with 4 to 8 CPUs
+and at least 10GB of memory.
+
+#### Cause 4: Default resources
+
+By default, `dstack` uses these resource requirements:
+`cpu: 2..`, `memory: 8GB..`, `disk: 100GB..`.
+If you want to use smaller instances, override the `cpu`, `memory`, or `disk`
+properties in your configuration.
+
+#### Cause 5: GPU requirements
+
+By default, `dstack` only selects instances with no GPUs or a single NVIDIA GPU.
+If you want to use non-NVIDIA GPUs or multi-GPU instances, set the `gpu` property
+in your configuration.
+
+Examples: `gpu: amd` (one AMD GPU), `gpu: A10:4..8` (4 to 8 A10 GPUs),
+`gpu: tt:32` (32 Tenstorrent devices).
+
+> If you don't specify the number of GPUs, `dstack` will only select single-GPU instances.
+
+#### Cause 6: Network volumes
+
+If your run configuration uses [network volumes](../concepts/volumes.md#network-volumes),
+`dstack` will only select instances from the same backend and region as the volumes.
+For AWS, the availability zone of the volume and the instance should also match.
+
+#### Cause 7: Feature support
+
+Some `dstack` features are not supported by all backends. If your configuration uses
+one of these features, `dstack` will only select offers from the backends that support it.
+
+- [Backend fleets](../concepts/fleets.md#backend-fleets) configurations,
+  [Instance volumes](../concepts/volumes.md#instance-volumes),
+  and [Privileged containers](../reference/dstack.yml/dev-environment.md#privileged)
+  are supported by all backends except `runpod`, `vastai`, and `kubernetes`.
+- [Clusters](../concepts/fleets.md#cluster-placement)
+  and [multi-node tasks](../concepts/tasks.md#nodes)
+  are only supported by the `aws`, `azure`, `gcp`, `nebius`, `oci`, and `vultr` backends,
+  as well as SSH fleets.
+- [Reservations](../reference/dstack.yml/fleet.md#reservation)
+  are only supported by the `aws` and `gcp` backends.
+
+#### Cause 8: dstack Sky balance
+
+If you are using
+[dstack Sky](https://sky.dstack.ai),
+you will not see marketplace offers until you top up your balance.
+Alternatively, you can configure your own cloud accounts
+on the [project settings page](../concepts/projects.md#backends)
+or use [SSH fleets](../concepts/fleets.md#ssh-fleets).
+
+### Provisioning fails { #provisioning-fails }
+[//]: # (NOTE: This section is referenced in the CLI. Do not change its URL.)
+
+In certain cases, running `dstack apply` may show instance offers,
+but then produce the following output:
+
+```shell
+wet-mangust-1 provisioning completed (failed)
+No capacity
+Failed to provision in fleet 'aws-main': tried 5 of 12 offers (attempt limit reached), all failed.
+Errors: g5.xlarge in aws/us-east-1: InsufficientInstanceCapacity; g5.xlarge in aws/eu-west-1: RequestLimitExceeded
+```
+
+`dstack` only tries offers from the fleet it selected for the run, so the message names that
+fleet, how many of its offers were tried, and what each attempt returned. Repeated errors are
+reported once; every attempt is logged by the server, so check the [server logs](#server-logs)
+for the full list.
+
+#### Cause 1: Insufficient service quotas
+
+If some runs fail to provision, it may be due to an insufficient service quota. For cloud providers like AWS, GCP,
+Azure, and OCI, you often need to request an increased [service quota](protips.md#service-quotas) before you can use
+specific instances.
+
+### Run starts but fails
+
+There could be several reasons for a run failing after successful provisioning. 
+
+!!! info "Termination reason"
+    To find out why a run terminated, use `--verbose` (or `-v`) with `dstack ps`.
+    This will show the run's status and any failure reasons.
+
+!!! info "Diagnostic logs"
+    You can get more information on why a run fails with diagnostic logs.
+    Pass `--diagnose` (or `-d`) to `dstack logs` and you'll see logs of the run executor.
+
+#### Cause 1: Spot interruption
+
+If a run fails after provisioning with the termination reason `INTERRUPTED_BY_NO_CAPACITY`, it is likely that the run
+was using spot instances and was interrupted. To address this, you can either set the
+[`spot_policy`](../reference/dstack.yml/task.md#spot_policy) to `on-demand` or specify the 
+[`retry`](../reference/dstack.yml/task.md#retry) property.
+
+[//]: # (#### Other)
+[//]: # (TODO: Explain how to get the shim logs)
+
+### Services fail to start
+
+#### Cause 1: Gateway misconfiguration
+
+If all services fail to start with a specific gateway, make sure a
+[correct DNS record](../concepts/gateways.md#update-dns-records)
+pointing to the gateway's hostname is configured.
+
+### Service endpoint doesn't work 
+
+#### Cause 1: Bad Authorization
+
+If the service endpoint returns a 403 error, it is likely because the [`Authorization`](../concepts/services.md#access-the-endpoint) 
+header with the correct `dstack` token was not provided.
+
+[//]: # (#### Other)
+[//]: # (TODO: Explain how to get the gateway logs)
+
+### Cannot access dev environment or task ports
+
+#### Cause 1: Detached from run
+
+When running a dev environment or task with configured ports, `dstack apply` 
+automatically forwards remote ports to `localhost` via SSH for easy and secure access.
+If you interrupt the command, the port forwarding will be disconnected. To reattach, use `dstack attach <run name`.
+
+#### Cause 2: Windows
+
+If you're using the CLI on Windows, make sure to run it through WSL by following [these instructions:material-arrow-top-right-thin:{ .external }](https://github.com/dstackai/dstack/issues/1644#issuecomment-2321559265). 
+Native support will be available soon.
+
+### SSH fleet fails to provision
+
+If you set up an SSH fleet and it fails to provision after a long wait, first check the server logs. 
+Also, review the  `/root/.dstack/shim.log` file on each host used to create the fleet.
+
+## Community
+
+If you have a question, please feel free to ask it in our [Discord server](https://discord.gg/u8SmfwPpMd).

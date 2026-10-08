@@ -77,7 +77,10 @@ export const useColumnsDefinitions = () => {
                                             {target.project_name}
                                         </NavigateLink>
                                     )}
-                                    /{target.name}
+                                    /
+                                    <NavigateLink href={ROUTES.INSTANCES.DETAILS.FORMAT(target.project_name ?? '', target.id)}>
+                                        {target.name}
+                                    </NavigateLink>
                                 </div>
                             );
 
@@ -103,6 +106,71 @@ export const useColumnsDefinitions = () => {
                             return (
                                 <div>
                                     Job{' '}
+                                    {target.project_name && (
+                                        <NavigateLink href={ROUTES.PROJECT.DETAILS.FORMAT(target.project_name)}>
+                                            {target.project_name}
+                                        </NavigateLink>
+                                    )}
+                                    /{target.name}
+                                </div>
+                            );
+
+                        case 'volume':
+                            return (
+                                <div>
+                                    Volume{' '}
+                                    {target.project_name && (
+                                        <NavigateLink href={ROUTES.PROJECT.DETAILS.FORMAT(target.project_name)}>
+                                            {target.project_name}
+                                        </NavigateLink>
+                                    )}
+                                    /{target.name}
+                                </div>
+                            );
+
+                        case 'gateway':
+                            return (
+                                <div>
+                                    Gateway{' '}
+                                    {target.project_name && (
+                                        <NavigateLink href={ROUTES.PROJECT.DETAILS.FORMAT(target.project_name)}>
+                                            {target.project_name}
+                                        </NavigateLink>
+                                    )}
+                                    /{target.name}
+                                </div>
+                            );
+
+                        case 'gateway-replica':
+                            return (
+                                <div>
+                                    Gateway replica{' '}
+                                    {target.project_name && (
+                                        <NavigateLink href={ROUTES.PROJECT.DETAILS.FORMAT(target.project_name)}>
+                                            {target.project_name}
+                                        </NavigateLink>
+                                    )}
+                                    /{target.name}
+                                </div>
+                            );
+
+                        case 'secret':
+                            return (
+                                <div>
+                                    Secret{' '}
+                                    {target.project_name && (
+                                        <NavigateLink href={ROUTES.PROJECT.DETAILS.FORMAT(target.project_name)}>
+                                            {target.project_name}
+                                        </NavigateLink>
+                                    )}
+                                    /{target.name}
+                                </div>
+                            );
+
+                        case 'preset':
+                            return (
+                                <div>
+                                    Preset{' '}
                                     {target.project_name && (
                                         <NavigateLink href={ROUTES.PROJECT.DETAILS.FORMAT(target.project_name)}>
                                             {target.project_name}

@@ -3,7 +3,7 @@ name = "dstack"
 dynamic = ["version", "readme"]
 authors = [{ name = "Andrey Cheptsov", email = "andrey@dstack.ai" }]
 description = "dstack is an open-source orchestration engine for running AI workloads on any cloud or on-premises."
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -13,7 +13,9 @@ classifiers = [
 dependencies = [
     "pyyaml",
     "requests",
+    "requests-unixsocket>=0.4.1",
     "typing-extensions>=4.0.0",
+    "tomli>=2.0; python_version < '3.11'",
     "cryptography",
     "packaging",
     "python-dateutil",
@@ -25,17 +27,15 @@ dependencies = [
     "rich",
     "rich-argparse",
     "tqdm",
-    "simple-term-menu",
-    "pydantic>=1.10.10,<2.0.0",
-    "pydantic-duality>=1.2.4",
+    "questionary>=2.0.1",
+    "pydantic>=2.12",
     "websocket-client",
     "python-multipart>=0.0.16",
     "filelock",
     "psutil",
-    "gpuhunt==0.1.16",
+    "gpuhunt==0.1.32",
     "argcomplete>=3.5.0",
     "ignore-python>=0.2.0",
-    "orjson",
     "apscheduler<4",
 ]
 
@@ -62,10 +62,18 @@ artifacts = [
     "src/dstack/_internal/server/statics/**",
 ]
 
+[tool.hatch.build.targets.sdist.force-include]
+"skills/dstack/SKILL.md" = "skills/dstack/SKILL.md"
+"skills/dstack-prototyping/SKILL.md" = "skills/dstack-prototyping/SKILL.md"
+
 [tool.hatch.build.targets.wheel]
 artifacts = [
     "src/dstack/_internal/server/statics/**",
 ]
+
+[tool.hatch.build.targets.wheel.force-include]
+"skills/dstack/SKILL.md" = "dstack/_internal/cli/services/presets/resources/skills/dstack/SKILL.md"
+"skills/dstack-prototyping/SKILL.md" = "dstack/_internal/cli/services/presets/resources/skills/dstack-prototyping/SKILL.md"
 
 [tool.hatch.metadata.hooks.fancy-pypi-readme]
 content-type = "text/markdown"
@@ -78,8 +86,22 @@ pattern = '<picture>\s*|<source[^>]*>\s*|\s*</picture>|<video[^>]*>\s*|</video>\
 replacement = ''
 ignore-case = true
 
-#[tool.uv.sources]
-#dstack-plugin-server = { path = "examples/plugins/example_plugin_server", editable = true }
+[tool.uv.sources]
+dstack-plugin-server = { path = "examples/plugins/example_plugin_server", editable = true }
+
+[tool.ruff]
+target-version = "py310"
+line-length = 99
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "Q", "W", "PGH", "FLY", "S113"]
+ignore = [
+    "E501",
+    "E712",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dstack"]
 
 [tool.pyright]
 typeCheckingMode = "standard"
@@ -87,45 +109,107 @@ include = [
     "src/dstack/plugins",
     "src/dstack/_internal/server",
     "src/dstack/_internal/core/services",
+    "src/dstack/_internal/core/backends/aws",
+    "src/dstack/_internal/core/backends/daytona",
     "src/dstack/_internal/core/backends/kubernetes",
     "src/dstack/_internal/core/backends/runpod",
+    "src/dstack/_internal/core/backends/slurm",
     "src/dstack/_internal/cli/services/configurators",
     "src/dstack/_internal/cli/commands",
+    "src/tests/_internal/server/background/pipeline_tasks",
 ]
 ignore = [
     "src/dstack/_internal/server/migrations/versions",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["src/tests"]
+addopts = [
+    "--disable-socket",
+    "--allow-hosts=127.0.0.1,localhost",
+    # unix socket for Docker/testcontainers
+    "--allow-unix-socket",
+]
+# One session-scoped event loop for fixtures and tests so that `sqlite_db` and `postgres_db` engines are reused.
+# Tests must not leave pending asyncio tasks behind; nothing enforces it automatically.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+markers = [
+    "shim_version",
+    "dockerized",
+]
+env = [
+    "DSTACK_SSHPROXY_API_TOKEN=test-token",
+    # Pin every rich console in the process to non-terminal output so tests asserting on plain CLI
+    # text never see ANSI escapes.
+    "TTY_COMPATIBLE=0",
+]
+filterwarnings = [
+    # Fail on any use of a pydantic v1 shim (`.dict()`, `parse_obj_as`, class-based `Config`, ...)
+    # so they cannot creep back after the v2 migration.
+    "error::pydantic.PydanticDeprecatedSince20",
+    # Remove or change to 3.11 once support for Python 3.10 is dropped.
+    "ignore:You are using a Python version \\(3.10:FutureWarning:^google\\.",
+]
+
+[tool.tox]
+env_list = ["default"]
+
+[tool.tox.env_run_base]
+description = "Run tests under {base_python}"
+extras = ["all"]
+dependency_groups = ["test"]
+commands = [["pytest", { replace = "posargs", extend = true }]]
+
+# `tox run [-e default]` -- run tests inside an isolated environment
+# with Python version read from `.python-version` file
+[tool.tox.env.default]
+base_python_file = [".python-version"]
+
+# `tox run -e dummy --skip-env-install` -- run tests inside the current environment
+# all dependencies must be already installed; a dummy environment is still created
+[tool.tox.env.dummy]
+description = "Run tests inside the current environment"
+# Must be called with --skip-env-install
+dependency_groups = ["nonexistent-group-to-trigger-failure"]
+allowlist_externals = ["pytest"]
+
 [dependency-groups]
 dev = [
     "pre-commit>=4.2.0",
-    "pytest~=7.2",
-    "pytest-asyncio>=0.23.8",
+    "ruff==0.12.7",  # should match .pre-commit-config.yaml
+    "pyinstrument>=5.0.0",
+    "kubernetes-stubs-elephant-fork>=35.0.0.post3",
+    {include-group = "test"},
+    {include-group = "docs"},
+]
+test = [
+    "pytest~=8.0",
+    "pytest-asyncio>=0.25.2",
+    "pytest-mock>=3.14.0",
     "pytest-httpbin>=2.1.0",
     "pytest-socket>=0.7.0",
     "pytest-env>=1.1.0",
-    "httpbin>=0.10.2", # indirect to make compatible with Werkzeug 3
-    "requests-mock>=1.12.1",
-    "openai>=1.68.2",
-    "freezegun>=1.5.1",
-    "ruff==0.12.7",  # should match .pre-commit-config.yaml
-    "testcontainers>=4.9.2",
+    "pytest-unordered>=0.7.0",
     "pytest-xdist>=3.6.1",
-    "pyinstrument>=5.0.0",
-    "kubernetes-stubs-elephant-fork",
-    # docs
-    "dstack[server]; python_version >= '3.11'",
-    # "dstack-plugin-server; python_version >= '3.11'",
-    "pillow; python_version >= '3.11'",
-    "cairosvg; python_version >= '3.11'",
-    "mkdocs-material>=9.7.0; python_version >= '3.11'",
-    "mkdocs-material[imaging]; python_version >= '3.11'",
-    "mkdocs-material-extensions; python_version >= '3.11'",
-    "mkdocs-redirects; python_version >= '3.11'",
-    "mkdocs-gen-files; python_version >= '3.11'",
-    "mkdocstrings[python]; python_version >= '3.11'",
-    "mkdocs-render-swagger-plugin; python_version >= '3.11'",
-    "mkdocs-llmstxt-md; python_version >= '3.11'"
+    "requests-mock>=1.12.1",
+    "freezegun>=1.5.1",
+    "httpbin>=0.10.2", # indirect to make compatible with Werkzeug 3
+    "openai>=1.68.2",
+    "testcontainers>=4.15.0",
+]
+docs = [
+    "dstack[server]",
+    "dstack-plugin-server",
+    "pillow",
+    "cairosvg",
+    "mkdocs-material>=9.7.0",
+    "mkdocs-material[imaging]",
+    "mkdocs-material-extensions",
+    "mkdocs-redirects",
+    "mkdocs-gen-files",
+    "mkdocstrings[python]",
+    "mkdocs-render-swagger-plugin",
 ]
 
 [project.optional-dependencies]
@@ -147,7 +231,8 @@ server = [
     "httpx>=0.28.0",
     "jinja2",
     "watchfiles",
-    "sqlalchemy[asyncio]>=2.0.0",
+    # sqlalchemy_utils is not compatible with SQLAlchemy >= 2.1.0
+    "sqlalchemy[asyncio]>=2.0.0,<2.1",
     "sqlalchemy_utils>=0.40.0",
     "alembic>=1.16.0",
     "aiosqlite",
@@ -158,8 +243,9 @@ server = [
     "asyncpg",
     "python-json-logger>=3.1.0",
     "prometheus-client",
-    "grpcio>=1.50",
-    "backports.entry-points-selectable",
+    "grpcio>=1.81.0",
+    "protobuf>=6.33.5",
+    "smg-grpc-proto==0.4.9", # Pin to avoid grpcio version mismatch when smg-grpc-proto bumps grpcio dependency https://github.com/dstackai/dstack/pull/3971
 ]
 aws = [
     "boto3>=1.38.13",
@@ -187,11 +273,11 @@ gcp = [
     "dstack[server]",
 ]
 datacrunch = [
-    "verda; python_version >= '3.10'",
+    "verda>=1.23.0",
     "dstack[server]",
 ]
 verda = [
-    "verda; python_version >= '3.10'",
+    "verda>=1.23.0",
     "dstack[server]",
 ]
 kubernetes = [
@@ -212,9 +298,29 @@ oci = [
     "dstack[server]",
 ]
 nebius = [
-    "nebius>=0.3.4,<0.4; python_version >= '3.10'",
+    "nebius>=0.6.13,<0.7",
+    "dstack[server]",
+]
+fluentbit = [
+    "fluent-logger>=0.10.0",
+    "elasticsearch>=8.0.0",
+    "dstack[server]",
+]
+otel = [
+    "opentelemetry-sdk>=1.30.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.30.0",
+    "opentelemetry-exporter-prometheus>=0.51b0",
+    "opentelemetry-instrumentation-fastapi>=0.51b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.51b0",
+    "opentelemetry-instrumentation-httpx>=0.51b0",
+    "opentelemetry-instrumentation-requests>=0.51b0",
+    "opentelemetry-instrumentation-system-metrics>=0.51b0",
+    "opentelemetry-instrumentation-logging>=0.61b0",
+    "dstack[server]",
+]
+crusoe = [
     "dstack[server]",
 ]
 all = [
-    "dstack[gateway,server,aws,azure,gcp,verda,kubernetes,lambda,nebius,oci]",
+    "dstack[gateway,server,aws,azure,gcp,verda,kubernetes,lambda,nebius,oci,crusoe,fluentbit,otel]",
 ]

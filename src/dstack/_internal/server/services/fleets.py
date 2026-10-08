@@ -1,10 +1,11 @@
+import asyncio
 import uuid
 from collections.abc import Callable
 from datetime import datetime
 from functools import wraps
-from typing import List, Literal, Optional, Tuple, TypeVar, Union, cast
+from typing import List, Literal, Optional, Tuple, TypeVar, Union
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, exists, false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, joinedload, selectinload
 
@@ -15,23 +16,25 @@ from dstack._internal.core.errors import (
     ResourceExistsError,
     ServerClientError,
 )
-from dstack._internal.core.models.common import ApplyAction, CoreModel
+from dstack._internal.core.models.common import ApplyAction, CoreModel, validate_json_extra_ignore
 from dstack._internal.core.models.envs import Env
 from dstack._internal.core.models.fleets import (
     ApplyFleetPlanInput,
+    BackendFleetConfiguraionProps,
     Fleet,
     FleetConfiguration,
     FleetPlan,
     FleetSpec,
     FleetStatus,
     InstanceGroupPlacement,
+    SSHFleetConfigurationProps,
     SSHHostParams,
     SSHParams,
 )
 from dstack._internal.core.models.instances import (
     InstanceOfferWithAvailability,
     InstanceStatus,
-    RemoteConnectionInfo,
+    InstanceTerminationReason,
     SSHConnectionParams,
     SSHKey,
 )
@@ -42,31 +45,41 @@ from dstack._internal.core.models.profiles import (
 )
 from dstack._internal.core.models.projects import Project
 from dstack._internal.core.models.resources import ResourcesSpec
-from dstack._internal.core.models.runs import JobProvisioningData, Requirements, get_policy_map
+from dstack._internal.core.models.runs import (
+    JobProvisioningData,
+    Requirements,
+    RunStatus,
+    get_policy_map,
+)
 from dstack._internal.core.models.users import GlobalRole
 from dstack._internal.core.services import validate_dstack_resource_name
 from dstack._internal.core.services.diff import ModelDiff, copy_model, diff_models
-from dstack._internal.server.db import get_db, is_db_postgres, is_db_sqlite
+from dstack._internal.server.db import get_db, is_db_postgres, is_db_sqlite, sqlite_commit
 from dstack._internal.server.models import (
+    ExportedFleetModel,
     FleetModel,
+    ImportModel,
     InstanceModel,
     JobModel,
     MemberModel,
     ProjectModel,
+    RunModel,
     UserModel,
 )
 from dstack._internal.server.services import events
 from dstack._internal.server.services import instances as instances_services
 from dstack._internal.server.services import offers as offers_services
 from dstack._internal.server.services.instances import (
-    format_instance_status_for_event,
     get_instance_remote_connection_info,
+    is_placeholder_instance,
     list_active_remote_instances,
+    switch_instance_status,
 )
 from dstack._internal.server.services.locking import (
     get_locker,
     string_to_lock_id,
 )
+from dstack._internal.server.services.pipelines import PipelineHinterProtocol
 from dstack._internal.server.services.plugins import apply_plugin_policies
 from dstack._internal.server.services.projects import (
     get_member,
@@ -74,12 +87,23 @@ from dstack._internal.server.services.projects import (
     list_user_project_models,
     project_model_to_project,
 )
-from dstack._internal.server.services.resources import set_resources_defaults
+from dstack._internal.server.services.resources import set_default_gpu_spec
 from dstack._internal.utils import random_names
+from dstack._internal.utils import ssh as ssh_utils
+from dstack._internal.utils.common import (
+    EntityID,
+    EntityName,
+    EntityNameOrID,
+    get_current_datetime,
+    get_lowest_unused_nums,
+)
 from dstack._internal.utils.logging import get_logger
-from dstack._internal.utils.ssh import pkey_from_str
 
 logger = get_logger(__name__)
+
+# How hard to retry row locks before reporting the fleet as busy.
+_LOCK_RETRY_ATTEMPTS = 10
+_LOCK_RETRY_INTERVAL = 0.5
 
 
 def switch_fleet_status(
@@ -96,9 +120,43 @@ def switch_fleet_status(
         return
 
     fleet_model.status = new_status
+    emit_fleet_status_change_event(
+        session=session,
+        fleet_model=fleet_model,
+        old_status=old_status,
+        new_status=new_status,
+        status_message=fleet_model.status_message,
+        actor=actor,
+    )
 
-    msg = f"Fleet status changed {old_status.upper()} -> {new_status.upper()}"
+
+def emit_fleet_status_change_event(
+    session: AsyncSession,
+    fleet_model: FleetModel,
+    old_status: FleetStatus,
+    new_status: FleetStatus,
+    status_message: Optional[str],
+    actor: events.AnyActor = events.SystemActor(),
+) -> None:
+    if old_status == new_status:
+        return
+    msg = get_fleet_status_change_message(
+        old_status=old_status,
+        new_status=new_status,
+        status_message=status_message,
+    )
     events.emit(session, msg, actor=actor, targets=[events.Target.from_model(fleet_model)])
+
+
+def get_fleet_status_change_message(
+    old_status: FleetStatus,
+    new_status: FleetStatus,
+    status_message: Optional[str],
+) -> str:
+    msg = f"Fleet status changed {old_status.upper()} -> {new_status.upper()}"
+    if status_message is not None:
+        msg += f" ({status_message})"
+    return msg
 
 
 async def list_projects_with_no_active_fleets(
@@ -106,7 +164,8 @@ async def list_projects_with_no_active_fleets(
     user: UserModel,
 ) -> List[Project]:
     """
-    Returns all projects where the user is a member that have no active fleets.
+    Returns all projects where the user is a member that have no active fleets,
+    neither owned nor imported.
 
     Active fleets are those with `deleted == False`. Projects with only deleted fleets
     (or no fleets) are included. Deleted projects are excluded.
@@ -128,7 +187,14 @@ async def list_projects_with_no_active_fleets(
         .outerjoin(
             active_fleet_alias,
             and_(
-                active_fleet_alias.project_id == ProjectModel.id,
+                or_(
+                    active_fleet_alias.project_id == ProjectModel.id,
+                    exists().where(
+                        ImportModel.project_id == ProjectModel.id,
+                        ImportModel.export_id == ExportedFleetModel.export_id,
+                        ExportedFleetModel.fleet_id == active_fleet_alias.id,
+                    ),
+                ),
                 active_fleet_alias.deleted == False,
             ),
         )
@@ -137,6 +203,7 @@ async def list_projects_with_no_active_fleets(
             active_fleet_alias.id.is_(None),
         )
         .order_by(ProjectModel.created_at)
+        .options(joinedload(ProjectModel.owner))
     )
 
     res = await session.execute(query)
@@ -153,6 +220,7 @@ async def list_fleets(
     user: UserModel,
     project_name: Optional[str],
     only_active: bool,
+    include_imported: bool,
     prev_created_at: Optional[datetime],
     prev_id: Optional[uuid.UUID],
     limit: int,
@@ -169,27 +237,38 @@ async def list_fleets(
         session=session,
         projects=projects,
         only_active=only_active,
+        include_imported=include_imported,
         prev_created_at=prev_created_at,
         prev_id=prev_id,
         limit=limit,
         ascending=ascending,
     )
-    return [
-        fleet_model_to_fleet(v, include_deleted_instances=not only_active) for v in fleet_models
-    ]
+    return [fleet_model_to_fleet(v) for v in fleet_models]
 
 
 async def list_projects_fleet_models(
     session: AsyncSession,
     projects: List[ProjectModel],
     only_active: bool,
+    include_imported: bool,
     prev_created_at: Optional[datetime],
     prev_id: Optional[uuid.UUID],
     limit: int,
     ascending: bool,
 ) -> List[FleetModel]:
     filters = []
-    filters.append(FleetModel.project_id.in_(p.id for p in projects))
+    project_ids = {p.id for p in projects}
+    is_fleet_imported_subquery = exists().where(
+        ImportModel.project_id.in_(project_ids),
+        ImportModel.export_id == ExportedFleetModel.export_id,
+        ExportedFleetModel.fleet_id == FleetModel.id,
+    )
+    filters.append(
+        or_(
+            FleetModel.project_id.in_(project_ids),
+            is_fleet_imported_subquery if include_imported else false(),
+        )
+    )
     if only_active:
         filters.append(FleetModel.deleted == False)
     if prev_created_at is not None:
@@ -221,7 +300,10 @@ async def list_projects_fleet_models(
         .where(*filters)
         .order_by(*order_by)
         .limit(limit)
-        .options(joinedload(FleetModel.instances))
+        .options(
+            joinedload(FleetModel.project).load_only(ProjectModel.name),
+            selectinload(FleetModel.instances.and_(InstanceModel.deleted == False)),
+        )
     )
     fleet_models = list(res.unique().scalars().all())
     return fleet_models
@@ -231,8 +313,11 @@ async def list_project_fleets(
     session: AsyncSession,
     project: ProjectModel,
     names: Optional[List[str]] = None,
+    include_imported: bool = False,
 ) -> List[Fleet]:
-    fleet_models = await list_project_fleet_models(session=session, project=project, names=names)
+    fleet_models = await list_project_fleet_models(
+        session=session, project=project, names=names, include_imported=include_imported
+    )
     return [fleet_model_to_fleet(v) for v in fleet_models]
 
 
@@ -240,17 +325,34 @@ async def list_project_fleet_models(
     session: AsyncSession,
     project: ProjectModel,
     names: Optional[List[str]] = None,
+    include_imported: bool = False,
     include_deleted: bool = False,
+    include_instances: bool = True,
 ) -> List[FleetModel]:
-    filters = [
-        FleetModel.project_id == project.id,
-    ]
+    filters = []
+    is_fleet_imported_subquery = exists().where(
+        ImportModel.project_id == project.id,
+        ImportModel.export_id == ExportedFleetModel.export_id,
+        ExportedFleetModel.fleet_id == FleetModel.id,
+    )
+    filters.append(
+        or_(
+            FleetModel.project_id == project.id,
+            is_fleet_imported_subquery if include_imported else false(),
+        )
+    )
     if names is not None:
         filters.append(FleetModel.name.in_(names))
     if not include_deleted:
         filters.append(FleetModel.deleted == False)
+    options = [joinedload(FleetModel.project).load_only(ProjectModel.name)]
+    if include_instances:
+        options.append(selectinload(FleetModel.instances.and_(InstanceModel.deleted == False)))
     res = await session.execute(
-        select(FleetModel).where(*filters).options(joinedload(FleetModel.instances))
+        select(FleetModel)
+        .where(*filters)
+        .order_by(FleetModel.created_at.desc(), FleetModel.id)
+        .options(*options)
     )
     return list(res.unique().scalars().all())
 
@@ -258,20 +360,17 @@ async def list_project_fleet_models(
 async def get_fleet(
     session: AsyncSession,
     project: ProjectModel,
-    name: Optional[str] = None,
-    fleet_id: Optional[uuid.UUID] = None,
+    name_or_id: EntityNameOrID,
     include_sensitive: bool = False,
 ) -> Optional[Fleet]:
-    if fleet_id is not None:
+    if isinstance(name_or_id, EntityID):
         fleet_model = await get_project_fleet_model_by_id(
-            session=session, project=project, fleet_id=fleet_id
-        )
-    elif name is not None:
-        fleet_model = await get_project_fleet_model_by_name(
-            session=session, project=project, name=name
+            session=session, project=project, fleet_id=name_or_id.id
         )
     else:
-        raise ServerClientError("name or id must be specified")
+        fleet_model = await get_project_fleet_model_by_name(
+            session=session, project=project, name=name_or_id.name
+        )
     if fleet_model is None:
         return None
     return fleet_model_to_fleet(fleet_model, include_sensitive=include_sensitive)
@@ -287,7 +386,12 @@ async def get_project_fleet_model_by_id(
         FleetModel.project_id == project.id,
     ]
     res = await session.execute(
-        select(FleetModel).where(*filters).options(joinedload(FleetModel.instances))
+        select(FleetModel)
+        .where(*filters)
+        .options(
+            joinedload(FleetModel.instances.and_(InstanceModel.deleted == False)),
+            joinedload(FleetModel.project).load_only(ProjectModel.name),
+        )
     )
     return res.unique().scalar_one_or_none()
 
@@ -305,7 +409,12 @@ async def get_project_fleet_model_by_name(
     if not include_deleted:
         filters.append(FleetModel.deleted == False)
     res = await session.execute(
-        select(FleetModel).where(*filters).options(joinedload(FleetModel.instances))
+        select(FleetModel)
+        .where(*filters)
+        .options(
+            joinedload(FleetModel.instances.and_(InstanceModel.deleted == False)),
+            joinedload(FleetModel.project).load_only(ProjectModel.name),
+        )
     )
     return res.unique().scalar_one_or_none()
 
@@ -316,7 +425,6 @@ async def get_plan(
     user: UserModel,
     spec: FleetSpec,
 ) -> FleetPlan:
-    # Spec must be copied by parsing to calculate merged_profile
     effective_spec = copy_model(spec)
     effective_spec = await apply_plugin_policies(
         user=user.name,
@@ -335,7 +443,7 @@ async def get_plan(
         current_fleet = await get_fleet(
             session=session,
             project=project,
-            name=effective_spec.configuration.name,
+            name_or_id=EntityName(effective_spec.configuration.name),
             include_sensitive=True,
         )
         if current_fleet is not None:
@@ -347,12 +455,20 @@ async def get_plan(
 
     offers = []
     if effective_spec.configuration.ssh_config is None:
-        offers_with_backends = await get_create_instance_offers(
+        requirements = get_fleet_requirements(effective_spec)
+        nodes = effective_spec.configuration.nodes
+        include_only_create_instance_supported_backends = True
+        if nodes is not None:
+            include_only_create_instance_supported_backends = nodes.target != 0
+        offers_with_backends = await get_fleet_offers(
             project=project,
             profile=effective_spec.merged_profile,
-            requirements=get_fleet_requirements(effective_spec),
+            requirements=requirements,
             fleet_spec=effective_spec,
             blocks=effective_spec.configuration.blocks,
+            include_only_create_instance_supported_backends=(
+                include_only_create_instance_supported_backends
+            ),
         )
         offers = [offer for _, offer in offers_with_backends]
 
@@ -373,7 +489,7 @@ async def get_plan(
     return plan
 
 
-async def get_create_instance_offers(
+async def get_fleet_offers(
     project: ProjectModel,
     profile: Profile,
     requirements: Requirements,
@@ -382,19 +498,34 @@ async def get_create_instance_offers(
     fleet_model: Optional[FleetModel] = None,
     blocks: Union[int, Literal["auto"]] = 1,
     exclude_not_available: bool = False,
+    master_job_provisioning_data: Optional[JobProvisioningData] = None,
+    infer_master_job_provisioning_data_from_fleet_instances: bool = True,
+    include_only_create_instance_supported_backends: bool = True,
 ) -> List[Tuple[Backend, InstanceOfferWithAvailability]]:
+    """
+    Return offers for fleet planning and provisioning.
+
+    By default, restricts to backends that support `create_instance`.
+    Set `include_only_create_instance_supported_backends=False` to include
+    all matching backends.
+    """
     multinode = False
-    master_job_provisioning_data = None
     if fleet_spec is not None:
         multinode = fleet_spec.configuration.placement == InstanceGroupPlacement.CLUSTER
     if fleet_model is not None:
-        fleet = fleet_model_to_fleet(fleet_model)
-        multinode = fleet.spec.configuration.placement == InstanceGroupPlacement.CLUSTER
-        for instance in fleet_model.instances:
-            jpd = instances_services.get_instance_provisioning_data(instance)
-            if jpd is not None:
-                master_job_provisioning_data = jpd
-                break
+        fleet_spec_from_model = get_fleet_spec(fleet_model)
+        multinode = fleet_spec_from_model.configuration.placement == InstanceGroupPlacement.CLUSTER
+        # The caller may override the current cluster master explicitly instead
+        # of inferring placement restrictions from the loaded fleet instances.
+        if (
+            master_job_provisioning_data is None
+            and infer_master_job_provisioning_data_from_fleet_instances
+        ):
+            for instance in fleet_model.instances:
+                jpd = instances_services.get_instance_provisioning_data(instance)
+                if jpd is not None:
+                    master_job_provisioning_data = jpd
+                    break
 
     offers = await offers_services.get_offers_by_requirements(
         project=project,
@@ -406,11 +537,12 @@ async def get_create_instance_offers(
         placement_group=placement_group,
         blocks=blocks,
     )
-    offers = [
-        (backend, offer)
-        for backend, offer in offers
-        if offer.backend in BACKENDS_WITH_CREATE_INSTANCE_SUPPORT
-    ]
+    if include_only_create_instance_supported_backends:
+        offers = [
+            (backend, offer)
+            for backend, offer in offers
+            if offer.backend in BACKENDS_WITH_CREATE_INSTANCE_SUPPORT
+        ]
     return offers
 
 
@@ -420,6 +552,7 @@ async def apply_plan(
     project: ProjectModel,
     plan: ApplyFleetPlanInput,
     force: bool,
+    pipeline_hinter: PipelineHinterProtocol,
 ) -> Fleet:
     spec = await apply_plugin_policies(
         user=user.name,
@@ -440,6 +573,7 @@ async def apply_plan(
             project=project,
             user=user,
             spec=spec,
+            pipeline_hinter=pipeline_hinter,
         )
 
     fleet_model = await get_project_fleet_model_by_name(
@@ -453,6 +587,7 @@ async def apply_plan(
             project=project,
             user=user,
             spec=spec,
+            pipeline_hinter=pipeline_hinter,
         )
 
     instances_ids = sorted(i.id for i in fleet_model.instances if not i.deleted)
@@ -463,6 +598,8 @@ async def apply_plan(
     ):
         # Refetch after lock
         # TODO: Lock instances with FOR UPDATE?
+        # We do not respect InstanceModel.lock_* fields here because FleetPipeline does not update SSH instances.
+        # TODO: Respect InstanceModel.lock_* fields if FleetPipeline and apply update the same instances.
         res = await session.execute(
             select(FleetModel)
             .where(
@@ -475,13 +612,24 @@ async def apply_plan(
                 .joinedload(InstanceModel.jobs)
                 .load_only(JobModel.id)
             )
-            .options(selectinload(FleetModel.runs))
+            # `is_fleet_in_use()` only needs active run presence/status.
+            .options(
+                selectinload(
+                    FleetModel.runs.and_(RunModel.status.not_in(RunStatus.finished_statuses()))
+                ).load_only(RunModel.id, RunModel.status)
+            )
             .execution_options(populate_existing=True)
             .order_by(FleetModel.id)  # take locks in order
             .with_for_update(key_share=True)
         )
         fleet_model = res.scalars().unique().one_or_none()
         if fleet_model is not None:
+            if fleet_model.lock_expires_at is not None:
+                # TODO: Make the endpoint fully async so we don't need to lock and error:
+                # put the request in queue and process in the background.
+                raise ServerClientError(
+                    "Failed to update fleet: fleet is being processed currently. Try again later."
+                )
             return await _update_fleet(
                 session=session,
                 user=user,
@@ -497,6 +645,7 @@ async def apply_plan(
         project=project,
         user=user,
         spec=spec,
+        pipeline_hinter=pipeline_hinter,
     )
 
 
@@ -505,6 +654,7 @@ async def create_fleet(
     project: ProjectModel,
     user: UserModel,
     spec: FleetSpec,
+    pipeline_hinter: PipelineHinterProtocol,
 ) -> Fleet:
     spec = await apply_plugin_policies(
         user=user.name,
@@ -518,7 +668,9 @@ async def create_fleet(
     if spec.configuration.ssh_config is not None:
         _check_can_manage_ssh_fleets(user=user, project=project)
 
-    return await _create_fleet(session=session, project=project, user=user, spec=spec)
+    return await _create_fleet(
+        session=session, project=project, user=user, spec=spec, pipeline_hinter=pipeline_hinter
+    )
 
 
 def create_fleet_instance_model(
@@ -527,6 +679,7 @@ def create_fleet_instance_model(
     username: str,
     spec: FleetSpec,
     instance_num: int,
+    instance_id: Optional[uuid.UUID] = None,
 ) -> InstanceModel:
     profile = spec.merged_profile
     requirements = get_fleet_requirements(spec)
@@ -538,6 +691,7 @@ def create_fleet_instance_model(
         requirements=requirements,
         instance_name=f"{spec.configuration.name}-{instance_num}",
         instance_num=instance_num,
+        instance_id=instance_id,
         reservation=spec.merged_profile.reservation,
         blocks=spec.configuration.blocks,
         tags=spec.configuration.tags,
@@ -550,6 +704,7 @@ async def create_fleet_ssh_instance_model(
     spec: FleetSpec,
     ssh_params: SSHParams,
     env: Env,
+    blocks: Union[int, Literal["auto"]],
     instance_num: int,
     host: Union[SSHHostParams, str],
 ) -> InstanceModel:
@@ -560,7 +715,6 @@ async def create_fleet_ssh_instance_model(
         port = ssh_params.port
         proxy_jump = ssh_params.proxy_jump
         internal_ip = None
-        blocks = 1
     else:
         hostname = host.hostname
         ssh_user = host.user or ssh_params.user
@@ -568,7 +722,8 @@ async def create_fleet_ssh_instance_model(
         port = host.port or ssh_params.port
         proxy_jump = host.proxy_jump or ssh_params.proxy_jump
         internal_ip = host.internal_ip
-        blocks = host.blocks
+        if host.blocks is not None:
+            blocks = host.blocks
 
     if ssh_user is None or ssh_key is None:
         # This should not be reachable but checked by fleet spec validation
@@ -611,53 +766,120 @@ async def delete_fleets(
     user: UserModel,
     names: List[str],
     instance_nums: Optional[List[int]] = None,
+    pipeline_hinter: Optional[PipelineHinterProtocol] = None,
 ):
     res = await session.execute(
-        select(FleetModel)
+        select(FleetModel.id)
         .where(
             FleetModel.project_id == project.id,
             FleetModel.name.in_(names),
             FleetModel.deleted == False,
         )
-        .options(joinedload(FleetModel.instances))
+        .order_by(FleetModel.id)
     )
-    fleet_models = res.scalars().unique().all()
-    fleets_ids = sorted([f.id for f in fleet_models])
-    instances_ids = sorted([i.id for f in fleet_models for i in f.instances])
-    await session.commit()
-    logger.info("Deleting fleets: %s", [v.name for v in fleet_models])
+    fleets_ids = list(res.scalars().unique().all())
+    stmt = (
+        select(InstanceModel.id)
+        .where(
+            InstanceModel.fleet_id.in_(fleets_ids),
+            InstanceModel.deleted == False,
+        )
+        .order_by(InstanceModel.id)
+    )
+    if instance_nums is not None:
+        stmt = stmt.where(InstanceModel.instance_num.in_(instance_nums))
+    res = await session.execute(stmt)
+    instances_ids = list(res.scalars().unique().all())
+    await sqlite_commit(session)
     async with (
         get_locker(get_db().dialect_name).lock_ctx(FleetModel.__tablename__, fleets_ids),
         get_locker(get_db().dialect_name).lock_ctx(InstanceModel.__tablename__, instances_ids),
     ):
-        # Refetch after lock
-        # TODO: Lock instances with FOR UPDATE?
-        # TODO: Do not lock fleet when deleting only instances
-        res = await session.execute(
-            select(FleetModel)
-            .where(
-                FleetModel.project_id == project.id,
-                FleetModel.name.in_(names),
-                FleetModel.deleted == False,
+        # Retry locking fleets to increase lock acquisition chances.
+        # This hack is needed until requests are queued.
+        fleet_models = []
+        for attempt in range(_LOCK_RETRY_ATTEMPTS):
+            res = await session.execute(
+                select(FleetModel)
+                .where(
+                    FleetModel.project_id == project.id,
+                    FleetModel.id.in_(fleets_ids),
+                    FleetModel.deleted == False,
+                    FleetModel.lock_expires_at.is_(None),
+                )
+                .options(
+                    selectinload(FleetModel.instances.and_(InstanceModel.id.in_(instances_ids)))
+                    .selectinload(InstanceModel.jobs)
+                    .load_only(JobModel.id)
+                )
+                .options(
+                    selectinload(
+                        FleetModel.runs.and_(RunModel.status.not_in(RunStatus.finished_statuses()))
+                    ).load_only(RunModel.status)
+                )
+                .order_by(FleetModel.id)  # take locks in order
+                .with_for_update(key_share=True, of=FleetModel)
+                .execution_options(populate_existing=True)
             )
-            .options(
-                selectinload(FleetModel.instances)
-                .joinedload(InstanceModel.jobs)
-                .load_only(JobModel.id)
+            fleet_models = res.scalars().unique().all()
+            if len(fleet_models) == len(fleets_ids):
+                break
+            if attempt < _LOCK_RETRY_ATTEMPTS - 1:
+                await asyncio.sleep(_LOCK_RETRY_INTERVAL)
+        if len(fleet_models) != len(fleets_ids):
+            # TODO: Make the endpoint fully async so we don't need to lock and error.
+            msg = (
+                "Failed to delete fleets: fleets are being processed currently. Try again later."
+                if instance_nums is None
+                else "Failed to delete fleet instances: fleets are being processed currently. Try again later."
             )
-            .options(selectinload(FleetModel.runs))
-            .execution_options(populate_existing=True)
-            .order_by(FleetModel.id)  # take locks in order
-            .with_for_update(key_share=True)
-        )
-        fleet_models = res.scalars().unique().all()
-        fleets = [fleet_model_to_fleet(m) for m in fleet_models]
-        for fleet in fleets:
-            if fleet.spec.configuration.ssh_config is not None:
-                _check_can_manage_ssh_fleets(user=user, project=project)
+            raise ServerClientError(msg)
+        # Retry locking instances to increase lock acquisition chances.
+        # This hack is needed until requests are queued.
+        instances_left_to_lock = set(instances_ids)
+        for attempt in range(_LOCK_RETRY_ATTEMPTS):
+            res = await session.execute(
+                select(InstanceModel.id)
+                .where(
+                    InstanceModel.id.in_(instances_left_to_lock),
+                    InstanceModel.deleted == False,
+                    InstanceModel.lock_expires_at.is_(None),
+                )
+                .order_by(InstanceModel.id)  # take locks in order
+                .with_for_update(key_share=True, of=InstanceModel)
+                .execution_options(populate_existing=True)
+            )
+            instances_left_to_lock.difference_update(res.scalars().unique().all())
+            if len(instances_left_to_lock) == 0:
+                break
+            if attempt < _LOCK_RETRY_ATTEMPTS - 1:
+                await asyncio.sleep(_LOCK_RETRY_INTERVAL)
+        if len(instances_left_to_lock) > 0:
+            msg = (
+                "Failed to delete fleets: fleet instances are being processed currently. Try again later."
+                if instance_nums is None
+                else "Failed to delete fleet instances: fleet instances are being processed currently. Try again later."
+            )
+            raise ServerClientError(msg)
         for fleet_model in fleet_models:
-            _terminate_fleet_instances(fleet_model=fleet_model, instance_nums=instance_nums)
-            # TERMINATING fleets are deleted by process_fleets after instances are terminated
+            fleet_spec = get_fleet_spec(fleet_model)
+            if fleet_spec.configuration.ssh_config is not None:
+                _check_can_manage_ssh_fleets(user=user, project=project)
+        if instance_nums is None:
+            logger.info("Deleting fleets: %s", [f.name for f in fleet_models])
+        else:
+            logger.info(
+                "Deleting fleets %s instances %s", [f.name for f in fleet_models], instance_nums
+            )
+        hint_instance_pipeline = False
+        for fleet_model in fleet_models:
+            hint_instance_pipeline |= _terminate_fleet_instances(
+                session=session,
+                fleet_model=fleet_model,
+                instance_nums=instance_nums,
+                actor=user,
+            )
+            # TERMINATING fleets are deleted by FleetPipeline after instances are terminated
             if instance_nums is None:
                 switch_fleet_status(
                     session,
@@ -666,6 +888,8 @@ async def delete_fleets(
                     actor=events.UserActor.from_user(user),
                 )
         await session.commit()
+    if hint_instance_pipeline and pipeline_hinter is not None:
+        pipeline_hinter.hint_fetch(InstanceModel.__name__)
 
 
 def fleet_model_to_fleet(
@@ -694,12 +918,17 @@ def fleet_model_to_fleet(
 
 
 def get_fleet_spec(fleet_model: FleetModel) -> FleetSpec:
-    return FleetSpec.__response__.parse_raw(fleet_model.spec)
+    return validate_json_extra_ignore(FleetSpec, fleet_model.spec)
 
 
 async def generate_fleet_name(session: AsyncSession, project: ProjectModel) -> str:
-    fleet_models = await list_project_fleet_models(session=session, project=project)
-    names = {v.name for v in fleet_models}
+    res = await session.execute(
+        select(FleetModel.name).where(
+            FleetModel.project_id == project.id,
+            FleetModel.deleted == False,
+        )
+    )
+    names = set(res.scalars().all())
     while True:
         name = random_names.generate_name()
         if name not in names:
@@ -712,7 +941,9 @@ def is_fleet_in_use(fleet_model: FleetModel, instance_nums: Optional[List[int]] 
     if instance_nums is not None:
         selected_instance_in_use = [i for i in instances_in_use if i.instance_num in instance_nums]
     active_runs = [r for r in fleet_model.runs if not r.status.is_finished()]
-    return len(selected_instance_in_use) > 0 or len(instances_in_use) == 0 and len(active_runs) > 0
+    return len(selected_instance_in_use) > 0 or (
+        instance_nums is None and len(instances_in_use) == 0 and len(active_runs) > 0
+    )
 
 
 def is_fleet_empty(fleet_model: FleetModel) -> bool:
@@ -721,71 +952,71 @@ def is_fleet_empty(fleet_model: FleetModel) -> bool:
 
 
 def is_cloud_cluster(fleet_model: FleetModel) -> bool:
-    fleet = fleet_model_to_fleet(fleet_model)
+    fleet_spec = get_fleet_spec(fleet_model)
     return (
-        fleet.spec.configuration.placement == InstanceGroupPlacement.CLUSTER
-        and fleet.spec.configuration.ssh_config is None
+        fleet_spec.configuration.placement == InstanceGroupPlacement.CLUSTER
+        and fleet_spec.configuration.ssh_config is None
     )
 
 
 def get_fleet_requirements(fleet_spec: FleetSpec) -> Requirements:
     profile = fleet_spec.merged_profile
+    resources = fleet_spec.configuration.resources
+    if resources is None:
+        resources = ResourcesSpec.unconstrained()
     requirements = Requirements(
-        resources=fleet_spec.configuration.resources or ResourcesSpec(),
+        resources=resources,
         max_price=profile.max_price,
         spot=get_policy_map(profile.spot_policy, default=SpotPolicy.ONDEMAND),
         reservation=fleet_spec.configuration.reservation,
         multinode=fleet_spec.configuration.placement == InstanceGroupPlacement.CLUSTER,
+        backend_options=profile.backend_options,
     )
     return requirements
 
 
 def get_next_instance_num(taken_instance_nums: set[int]) -> int:
-    if not taken_instance_nums:
-        return 0
-    min_instance_num = min(taken_instance_nums)
-    if min_instance_num > 0:
-        return 0
-    instance_num = min_instance_num + 1
-    while True:
-        if instance_num not in taken_instance_nums:
-            return instance_num
-        instance_num += 1
+    return next(get_lowest_unused_nums(used_nums=taken_instance_nums))
 
 
 def get_fleet_master_instance_provisioning_data(
     fleet_model: FleetModel,
     fleet_spec: FleetSpec,
 ) -> Optional[JobProvisioningData]:
-    master_instance_provisioning_data = None
-    if fleet_spec.configuration.placement == InstanceGroupPlacement.CLUSTER:
-        # Offers for master jobs must be in the same cluster as existing instances.
-        fleet_instance_models = [im for im in fleet_model.instances if not im.deleted]
-        if len(fleet_instance_models) > 0:
-            master_instance_model = fleet_instance_models[0]
-            master_instance_provisioning_data = JobProvisioningData.__response__.parse_raw(
-                master_instance_model.job_provisioning_data
-            )
-    return master_instance_provisioning_data
+    if fleet_spec.configuration.placement != InstanceGroupPlacement.CLUSTER:
+        return None
+
+    if fleet_model.current_master_instance_id is not None:
+        for instance_model in fleet_model.instances:
+            if (
+                instance_model.id == fleet_model.current_master_instance_id
+                and not instance_model.deleted
+                and instance_model.job_provisioning_data is not None
+            ):
+                return validate_json_extra_ignore(
+                    JobProvisioningData, instance_model.job_provisioning_data
+                )
+
+    return None
 
 
-def can_create_new_cloud_instance_in_fleet(fleet: Fleet) -> bool:
-    if fleet.spec.configuration.ssh_config is not None:
+def can_create_new_cloud_instance_in_fleet(fleet_model: FleetModel, fleet_spec: FleetSpec) -> bool:
+    if fleet_spec.configuration.ssh_config is not None:
         return False
-    active_instances = [i for i in fleet.instances if i.status.is_active()]
+    active_instances = [i for i in fleet_model.instances if i.status.is_active()]
     # nodes.max is a soft limit that can be exceeded when provisioning concurrently.
     # The fleet consolidation logic will remove redundant nodes eventually.
     if (
-        fleet.spec.configuration.nodes is not None
-        and fleet.spec.configuration.nodes.max is not None
-        and len(active_instances) >= fleet.spec.configuration.nodes.max
+        fleet_spec.configuration.nodes is not None
+        and fleet_spec.configuration.nodes.max is not None
+        and len(active_instances) >= fleet_spec.configuration.nodes.max
     ):
         return False
     return True
 
 
-def check_can_create_new_cloud_instance_in_fleet(fleet: Fleet):
-    if not can_create_new_cloud_instance_in_fleet(fleet):
+def check_can_create_new_cloud_instance_in_fleet(fleet_model: FleetModel, fleet_spec: FleetSpec):
+    if not can_create_new_cloud_instance_in_fleet(fleet_model, fleet_spec):
         raise ValueError("Cannot fit new cloud instance into fleet")
 
 
@@ -794,6 +1025,7 @@ async def _create_fleet(
     project: ProjectModel,
     user: UserModel,
     spec: FleetSpec,
+    pipeline_hinter: PipelineHinterProtocol,
 ) -> Fleet:
     lock_namespace = f"fleet_names_{project.name}"
     if is_db_sqlite():
@@ -816,13 +1048,16 @@ async def _create_fleet(
         else:
             spec.configuration.name = await generate_fleet_name(session=session, project=project)
 
+        now = get_current_datetime()
         fleet_model = FleetModel(
             id=uuid.uuid4(),
             name=spec.configuration.name,
             project=project,
             status=FleetStatus.ACTIVE,
-            spec=spec.json(),
+            spec=spec.model_dump_json(),
             instances=[],
+            created_at=now,
+            last_processed_at=now,
         )
         session.add(fleet_model)
         events.emit(
@@ -838,19 +1073,20 @@ async def _create_fleet(
                     spec=spec,
                     ssh_params=spec.configuration.ssh_config,
                     env=spec.configuration.env,
+                    blocks=spec.configuration.blocks,
                     instance_num=i,
                     host=host,
                 )
+                fleet_model.instances.append(instance_model)
                 events.emit(
                     session,
                     (
                         "Instance created on fleet submission."
-                        f" Status: {format_instance_status_for_event(instance_model)}"
+                        f" Status: {instance_model.status.upper()}"
                     ),
                     actor=events.UserActor.from_user(user),
                     targets=[events.Target.from_model(instance_model)],
                 )
-                fleet_model.instances.append(instance_model)
         else:
             for i in range(_get_fleet_nodes_to_provision(spec)):
                 instance_model = create_fleet_instance_model(
@@ -860,11 +1096,12 @@ async def _create_fleet(
                     spec=spec,
                     instance_num=i,
                 )
+                fleet_model.instances.append(instance_model)
                 events.emit(
                     session,
                     (
                         "Instance created on fleet submission."
-                        f" Status: {format_instance_status_for_event(instance_model)}"
+                        f" Status: {instance_model.status.upper()}"
                     ),
                     # Set `SystemActor` for consistency with other places where cloud instances can be
                     # created (fleet spec consolidation, job provisioning, etc). Think of the fleet as being
@@ -873,8 +1110,10 @@ async def _create_fleet(
                     actor=events.SystemActor(),
                     targets=[events.Target.from_model(instance_model)],
                 )
-                fleet_model.instances.append(instance_model)
         await session.commit()
+        if spec.configuration.ssh_config is None:
+            pipeline_hinter.hint_fetch(FleetModel.__name__)
+        pipeline_hinter.hint_fetch(InstanceModel.__name__)
         return fleet_model_to_fleet(fleet_model)
 
 
@@ -906,8 +1145,9 @@ async def _update_fleet(
 
     _check_can_update_fleet_spec(fleet_sensitive.spec, spec)
 
-    spec_json = spec.json()
-    fleet_model.spec = spec_json
+    fleet_model.spec = spec.model_dump_json()
+    # Reset consolidation attempt so the next pipeline pass picks up the spec change promptly.
+    fleet_model.consolidation_attempt = 0
 
     if (
         fleet_sensitive.spec.configuration.ssh_config is not None
@@ -945,22 +1185,20 @@ async def _update_fleet(
                     spec=spec,
                     ssh_params=spec.configuration.ssh_config,
                     env=spec.configuration.env,
+                    blocks=spec.configuration.blocks,
                     instance_num=instance_num,
                     host=host,
                 )
+                fleet_model.instances.append(instance_model)
                 events.emit(
                     session,
-                    (
-                        "Instance created on fleet update."
-                        f" Status: {format_instance_status_for_event(instance_model)}"
-                    ),
+                    f"Instance created on fleet update. Status: {instance_model.status.upper()}",
                     actor=events.UserActor.from_user(user),
                     targets=[events.Target.from_model(instance_model)],
                 )
-                fleet_model.instances.append(instance_model)
                 active_instance_nums.add(instance_num)
         if removed_instance_nums:
-            _terminate_fleet_instances(fleet_model, removed_instance_nums)
+            _terminate_fleet_instances(session, fleet_model, removed_instance_nums, actor=user)
 
     await session.commit()
     return fleet_model_to_fleet(fleet_model)
@@ -1001,26 +1239,51 @@ def _check_can_update_inner(current: M, new: M, updatable_fields: tuple[str, ...
     return diff
 
 
-@_check_can_update("configuration", "configuration_path")
+@_check_can_update("configuration", "configuration_path", "merged_profile")
 def _check_can_update_fleet_spec(current: FleetSpec, new: FleetSpec, diff: ModelDiff):
+    # Allow `merged_profile` only to absorb derived changes from supported configuration updates
+    # such as `configuration.reservation` and `configuration.tags`.
+    # Direct `profile` updates are still not in-place updatable.
     if "configuration" in diff:
         _check_can_update_fleet_configuration(current.configuration, new.configuration)
 
 
-@_check_can_update("ssh_config")
-def _check_can_update_fleet_configuration(
-    current: FleetConfiguration, new: FleetConfiguration, diff: ModelDiff
-):
+def _check_can_update_fleet_configuration(current: FleetConfiguration, new: FleetConfiguration):
+    diff = diff_models(current, new)
+    current_ssh_config = current.ssh_config
+    new_ssh_config = new.ssh_config
+    if current_ssh_config is None:
+        if new_ssh_config is not None:
+            raise ServerClientError("Fleet type changed from Cloud to SSH, cannot update")
+        # TODO: Support best-effort `nodes.target` apply semantics:
+        # create missing instances and terminate extra idle instances.
+        # Current in-place update only persists `target`; FleetPipeline reconciles `min`/`max`.
+        #
+        # For `reservation` and `tags`, update affects only future provisioning.
+        _check_can_update_inner(
+            current,
+            new,
+            (
+                "nodes",
+                "reservation",
+                "tags",
+                "resources",
+                "backends",
+                "regions",
+                "availability_zones",
+                "instance_types",
+                "spot_policy",
+                "max_price",
+            ),
+        )
+        return
+
+    if new_ssh_config is None:
+        raise ServerClientError("Fleet type changed from SSH to Cloud, cannot update")
+
+    _check_can_update_inner(current, new, ("ssh_config",))
     if "ssh_config" in diff:
-        current_ssh_config = current.ssh_config
-        new_ssh_config = new.ssh_config
-        if current_ssh_config is None:
-            if new_ssh_config is not None:
-                raise ServerClientError("Fleet type changed from Cloud to SSH, cannot update")
-        elif new_ssh_config is None:
-            raise ServerClientError("Fleet type changed from SSH to Cloud, cannot update")
-        else:
-            _check_can_update_ssh_config(current_ssh_config, new_ssh_config)
+        _check_can_update_ssh_config(current_ssh_config, new_ssh_config)
 
 
 @_check_can_update("hosts")
@@ -1047,10 +1310,18 @@ def _calculate_ssh_hosts_changes(
         if isinstance(current_host, str) or isinstance(new_host, str):
             if current_host != new_host:
                 changed_hosts.add(host)
-        elif diff_models(
-            current_host, new_host, reset={"identity_file": True, "proxy_jump": {"identity_file"}}
-        ):
-            changed_hosts.add(host)
+        else:
+            current_host = copy_model(current_host, reset={"identity_file"})
+            new_host = copy_model(new_host, reset={"identity_file"})
+            # XXX: cannot use copy_model() or diff_models() with
+            # `reset={..., "proxy_jump": {"identity_file"}}`
+            # as SSHProxyParams.identity_file has no default value
+            if current_host.proxy_jump is not None:
+                current_host.proxy_jump.identity_file = ""
+            if new_host.proxy_jump is not None:
+                new_host.proxy_jump.identity_file = ""
+            if diff_models(current_host, new_host):
+                changed_hosts.add(host)
     return added_hosts, removed_hosts, changed_hosts
 
 
@@ -1078,9 +1349,8 @@ async def _check_ssh_hosts_not_yet_added(
             # ignore instances belonging to the same fleet -- in-place update/recreate
             if current_fleet_id is not None and instance.fleet_id == current_fleet_id:
                 continue
-            instance_conn_info = RemoteConnectionInfo.parse_raw(
-                cast(str, instance.remote_connection_info)
-            )
+            instance_conn_info = get_instance_remote_connection_info(instance)
+            assert instance_conn_info is not None
             existing_hosts.add(instance_conn_info.host)
 
         instances_already_in_fleet = []
@@ -1104,12 +1374,14 @@ def _remove_fleet_spec_sensitive_info(spec: FleetSpec):
 
 
 def _validate_fleet_spec_and_set_defaults(spec: FleetSpec):
+    # Callers do not reparse afterwards, so the defaults set here must not touch any field that
+    # `ProfileParams` also declares — `spec.merged_profile` is computed at parse time and would
+    # silently keep the pre-default value. Only `configuration.resources` is written, which
+    # `ProfileParams` does not declare.
+    # TODO: Make callers reparse if this changes.
     if spec.configuration.name is not None:
         validate_dstack_resource_name(spec.configuration.name)
-    if spec.configuration.ssh_config is None and spec.configuration.nodes is None:
-        raise ServerClientError("No ssh_config or nodes specified")
-    if spec.configuration.ssh_config is not None and spec.configuration.nodes is not None:
-        raise ServerClientError("ssh_config and nodes are mutually exclusive")
+    _validate_fleet_configuration_subtype_specific_fields(spec.configuration)
     if spec.configuration.ssh_config is not None:
         _validate_all_ssh_params_specified(spec.configuration.ssh_config)
         if spec.configuration.ssh_config.ssh_key is not None:
@@ -1121,9 +1393,40 @@ def _validate_fleet_spec_and_set_defaults(spec: FleetSpec):
     _set_fleet_spec_defaults(spec)
 
 
+def _validate_fleet_configuration_subtype_specific_fields(conf: FleetConfiguration):
+    if conf.ssh_config is None and conf.nodes is None:
+        raise ServerClientError("No ssh_config or nodes specified")
+    if conf.ssh_config is not None and conf.nodes is not None:
+        raise ServerClientError("ssh_config and nodes are mutually exclusive")
+    subtype: str
+    props_model: type[CoreModel]
+    if conf.ssh_config is not None:
+        subtype = "SSH"
+        props_model = BackendFleetConfiguraionProps
+    else:
+        subtype = "Backend"
+        props_model = SSHFleetConfigurationProps
+    non_default_fields: list[str] = []
+    for name, field in props_model.model_fields.items():
+        # `FieldInfo` has no `.name` in pydantic v2, and `.default` is `PydanticUndefined` rather
+        # than `None` for a required field — comparing against it directly would silently report
+        # every required field as non-default. No props field is required today, but that would
+        # arm itself the moment one is added.
+        default = None if field.is_required() else field.get_default(call_default_factory=True)
+        if getattr(conf, name) != default:
+            non_default_fields.append(name)
+    if non_default_fields:
+        raise ServerClientError(
+            f"{subtype} fleet configuration does not support the following fields:"
+            f" {non_default_fields}"
+        )
+    return conf
+
+
 def _set_fleet_spec_defaults(spec: FleetSpec):
-    if spec.configuration.resources is not None:
-        set_resources_defaults(spec.configuration.resources)
+    resources_spec = spec.configuration.resources
+    if resources_spec is not None:
+        set_default_gpu_spec(resources_spec)
 
 
 def _validate_all_ssh_params_specified(ssh_config: SSHParams):
@@ -1144,7 +1447,7 @@ def _validate_ssh_key(ssh_key: SSHKey):
     if ssh_key.private is None:
         raise ServerClientError("Private key not provided")
     try:
-        pkey_from_str(ssh_key.private)
+        ssh_utils.pkey_from_str(ssh_key.private)
     except ValueError:
         raise ServerClientError(
             "Unsupported key type. "
@@ -1169,7 +1472,13 @@ def _get_fleet_nodes_to_provision(spec: FleetSpec) -> int:
     return spec.configuration.nodes.target
 
 
-def _terminate_fleet_instances(fleet_model: FleetModel, instance_nums: Optional[List[int]]):
+def _terminate_fleet_instances(
+    session: AsyncSession,
+    fleet_model: FleetModel,
+    instance_nums: Optional[List[int]],
+    actor: UserModel,
+) -> bool:
+    hint_instance_pipeline = False
     if is_fleet_in_use(fleet_model, instance_nums=instance_nums):
         if instance_nums is not None:
             raise ServerClientError(
@@ -1179,7 +1488,19 @@ def _terminate_fleet_instances(fleet_model: FleetModel, instance_nums: Optional[
     for instance in fleet_model.instances:
         if instance_nums is not None and instance.instance_num not in instance_nums:
             continue
+        if is_placeholder_instance(instance):
+            raise ServerClientError("Failed to delete instance while the job is provisioning.")
         if instance.status == InstanceStatus.TERMINATED:
             instance.deleted = True
         else:
-            instance.status = InstanceStatus.TERMINATING
+            instance.termination_reason = InstanceTerminationReason.TERMINATED_BY_USER
+            if instance.status != InstanceStatus.TERMINATING:
+                instance.skip_min_processing_interval = True
+                hint_instance_pipeline = True
+            switch_instance_status(
+                session,
+                instance,
+                InstanceStatus.TERMINATING,
+                actor=events.UserActor.from_user(actor),
+            )
+    return hint_instance_pipeline

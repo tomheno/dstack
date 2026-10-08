@@ -4,12 +4,16 @@ Generates OpenAPI schema from an example REST plugin.
 
 import json
 import logging
-
-import mkdocs_gen_files
+import os
+from pathlib import Path
 
 from dstack._internal.settings import DSTACK_VERSION
 
 logger = logging.getLogger("mkdocs.plugins.dstack.rest_plugin_schema")
+disable_env = "DSTACK_DOCS_DISABLE_REST_PLUGIN_SPEC_REFERENCE"
+if os.environ.get(disable_env):
+    logger.warning("REST plugin spec reference generation is disabled")
+    exit(0)
 
 try:
     from example_plugin_server.main import app
@@ -26,7 +30,8 @@ app.servers = [
     {"url": "http://localhost:8000", "description": "Local server"},
 ]
 app.version = DSTACK_VERSION or "0.0.0"
-with mkdocs_gen_files.open(
-    "docs/reference/plugins/rest_plugin/rest_plugin_openapi.json", "w"
-) as f:
-    json.dump(app.openapi(), f)
+output_path = Path("mkdocs/docs/reference/plugins/rest/rest_plugin_openapi.json")
+output_path.parent.mkdir(parents=True, exist_ok=True)
+new_content = json.dumps(app.openapi()) + "\n"
+if not output_path.exists() or output_path.read_text() != new_content:
+    output_path.write_text(new_content)

@@ -23,6 +23,11 @@ export const ROUTES = {
                 FORMAT: (projectName: string) => buildRoute(ROUTES.PROJECT.DETAILS.SETTINGS.TEMPLATE, { projectName }),
             },
 
+            EVENTS: {
+                TEMPLATE: `/projects/:projectName/events`,
+                FORMAT: (projectName: string) => buildRoute(ROUTES.PROJECT.DETAILS.EVENTS.TEMPLATE, { projectName }),
+            },
+
             RUNS: {
                 DETAILS: {
                     TEMPLATE: `/projects/:projectName/runs/:runId`,
@@ -119,7 +124,7 @@ export const ROUTES = {
 
     RUNS: {
         LIST: '/runs',
-        CREATE_DEV_ENV: '/runs/create-dev-environment',
+        CREATE_DEV_ENV: '/runs/launch',
     },
 
     OFFERS: {
@@ -137,6 +142,10 @@ export const ROUTES = {
 
     FLEETS: {
         LIST: '/fleets',
+        ADD: {
+            TEMPLATE: `/projects/:projectName/fleets/add`,
+            FORMAT: (projectName: string) => buildRoute(ROUTES.FLEETS.ADD.TEMPLATE, { projectName }),
+        },
         DETAILS: {
             TEMPLATE: `/projects/:projectName/fleets/:fleetId`,
             FORMAT: (projectName: string, fleetId: string) =>
@@ -156,10 +165,44 @@ export const ROUTES = {
 
     INSTANCES: {
         LIST: '/instances',
+        DETAILS: {
+            TEMPLATE: `/projects/:projectName/instances/:instanceId`,
+            FORMAT: (projectName: string, instanceId: string) =>
+                buildRoute(ROUTES.INSTANCES.DETAILS.TEMPLATE, { projectName, instanceId }),
+            EVENTS: {
+                TEMPLATE: `/projects/:projectName/instances/:instanceId/events`,
+                FORMAT: (projectName: string, instanceId: string) =>
+                    buildRoute(ROUTES.INSTANCES.DETAILS.EVENTS.TEMPLATE, { projectName, instanceId }),
+            },
+            INSPECT: {
+                TEMPLATE: `/projects/:projectName/instances/:instanceId/inspect`,
+                FORMAT: (projectName: string, instanceId: string) =>
+                    buildRoute(ROUTES.INSTANCES.DETAILS.INSPECT.TEMPLATE, { projectName, instanceId }),
+            },
+        },
     },
 
     VOLUMES: {
         LIST: '/volumes',
+    },
+
+    PRESETS: {
+        LIST: '/presets',
+        DETAILS: {
+            TEMPLATE: `/presets/:projectName/:presetId`,
+            FORMAT: (projectName: string, presetId: string) =>
+                buildRoute(ROUTES.PRESETS.DETAILS.TEMPLATE, { projectName, presetId }),
+            DEPLOY: {
+                TEMPLATE: `/presets/:projectName/:presetId/deploy`,
+                FORMAT: (projectName: string, presetId: string) =>
+                    buildRoute(ROUTES.PRESETS.DETAILS.DEPLOY.TEMPLATE, { projectName, presetId }),
+            },
+            INSPECT: {
+                TEMPLATE: `/presets/:projectName/:presetId/inspect`,
+                FORMAT: (projectName: string, presetId: string) =>
+                    buildRoute(ROUTES.PRESETS.DETAILS.INSPECT.TEMPLATE, { projectName, presetId }),
+            },
+        },
     },
 
     USER: {
@@ -177,6 +220,15 @@ export const ROUTES = {
             TEMPLATE: `/users/:userName/projects`,
             FORMAT: (userName: string) => buildRoute(ROUTES.USER.PROJECTS.TEMPLATE, { userName }),
         },
+        EVENTS: {
+            TEMPLATE: `/users/:userName/events`,
+            FORMAT: (userName: string) => buildRoute(ROUTES.USER.EVENTS.TEMPLATE, { userName }),
+        },
+        PUBLIC_KEYS: {
+            TEMPLATE: `/users/:userName/public-keys`,
+            FORMAT: (userName: string) => buildRoute(ROUTES.USER.PUBLIC_KEYS.TEMPLATE, { userName }),
+        },
+
         BILLING: {
             LIST: {
                 TEMPLATE: `/users/:userName/billing`,

@@ -1,16 +1,26 @@
 import argparse
 import os
-from typing import Union
 
-from dstack._internal.core.models.configurations import AnyRunConfiguration
+from dstack._internal.core.errors import CLIError
+from dstack._internal.core.models.backends.base import BackendType
+from dstack._internal.core.models.duration import (
+    parse_duration,
+    parse_idle_duration,
+    parse_off_duration,
+)
 from dstack._internal.core.models.profiles import (
     CreationPolicy,
     Profile,
+    ProfileParams,
     ProfileRetry,
     SpotPolicy,
-    parse_duration,
-    parse_max_duration,
 )
+from dstack._internal.utils.env import environ
+from dstack._internal.utils.path import PathLike
+from dstack.api.utils import load_profile
+
+_PROFILE_ENV_VAR = "DSTACK_PROFILE"
+_NO_PROFILE_ENV_VAR = "DSTACK_NO_PROFILE"
 
 
 def register_profile_args(parser: argparse.ArgumentParser):
@@ -19,12 +29,21 @@ def register_profile_args(parser: argparse.ArgumentParser):
     CLI arguments that override `profiles.yml` settings.
     """
     profile_group = parser.add_argument_group("Profile")
-    profile_group.add_argument(
+    profile_exc = profile_group.add_mutually_exclusive_group()
+    profile_exc.add_argument(
         "--profile",
         metavar="NAME",
-        help="The name of the profile. Defaults to [code]$DSTACK_PROFILE[/]",
-        default=os.getenv("DSTACK_PROFILE"),
+        help=f"The name of the profile. Defaults to [code]${_PROFILE_ENV_VAR}[/]",
         dest="profile",
+    )
+    profile_exc.add_argument(
+        "--no-profile",
+        help=(
+            "Don't load any profile."
+            f" Enabled by default if [code]${_NO_PROFILE_ENV_VAR}[/] is set and [code]--profile[/] is not specified"
+        ),
+        action="store_true",
+        dest="no_profile",
     )
     profile_group.add_argument(
         "--max-price",
@@ -46,6 +65,7 @@ def register_profile_args(parser: argparse.ArgumentParser):
         action="append",
         metavar="NAME",
         dest="backends",
+        type=BackendType,
         help="The backends that will be tried for provisioning",
     )
     profile_group.add_argument(
@@ -70,7 +90,7 @@ def register_profile_args(parser: argparse.ArgumentParser):
         action="append",
         metavar="NAME",
         dest="fleets",
-        help="Consider only instances from the specified fleet(s) for reuse",
+        help="Consider only the specified fleet(s)",
     )
     fleets_group_exc = fleets_group.add_mutually_exclusive_group()
     fleets_group_exc.add_argument(
@@ -89,8 +109,9 @@ def register_profile_args(parser: argparse.ArgumentParser):
     fleets_group_exc.add_argument(
         "--idle-duration",
         dest="idle_duration",
-        type=str,
+        type=idle_duration,
         help="Time to wait before destroying the idle instance (if the run provisions a new instance)",
+        metavar="DURATION",
     )
 
     spot_group = parser.add_argument_group("Spot policy")
@@ -133,9 +154,24 @@ def register_profile_args(parser: argparse.ArgumentParser):
     )
 
 
+def load_profile_from_args(args: argparse.Namespace, repo_dir: PathLike) -> Profile:
+    # precedence: --no-profile > --profile=name > DSTACK_NO_PROFILE=1 > DSTACK_PROFILE=name
+    if args.no_profile:
+        return _build_dummy_no_profile()
+    if args.profile is not None:
+        return load_profile(repo_dir=repo_dir, profile_name=args.profile)
+    try:
+        no_profile_from_env = environ.get_bool(_NO_PROFILE_ENV_VAR, default=False)
+    except ValueError as e:
+        raise CLIError(str(e)) from e
+    if no_profile_from_env:
+        return _build_dummy_no_profile()
+    return load_profile(repo_dir=repo_dir, profile_name=os.getenv(_PROFILE_ENV_VAR))
+
+
 def apply_profile_args(
     args: argparse.Namespace,
-    profile_settings: Union[Profile, AnyRunConfiguration],
+    profile_settings: ProfileParams,
 ):
     """
     Overrides `profile_settings` settings with arguments registered by `register_profile_args()`.
@@ -174,9 +210,17 @@ def apply_profile_args(
         )
 
 
-def max_duration(v: str) -> int:
-    return parse_max_duration(v)
+def max_duration(v: str):
+    return parse_off_duration(v)
+
+
+def idle_duration(v: str):
+    return parse_idle_duration(v)
 
 
 def retry_duration(v: str) -> int:
     return parse_duration(v)
+
+
+def _build_dummy_no_profile() -> Profile:
+    return Profile(name="no-profile")

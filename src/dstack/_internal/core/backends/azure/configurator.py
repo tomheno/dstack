@@ -6,7 +6,6 @@ import azure.core.exceptions
 from azure.core.credentials import TokenCredential
 from azure.mgmt import msi as msi_mgmt
 from azure.mgmt import network as network_mgmt
-from azure.mgmt import resource as resource_mgmt
 from azure.mgmt import subscription as subscription_mgmt
 from azure.mgmt.network.models import (
     AddressSpace,
@@ -18,6 +17,7 @@ from azure.mgmt.network.models import (
     Subnet,
     VirtualNetwork,
 )
+from azure.mgmt.resource import resources as resource_mgmt
 from azure.mgmt.resource.resources.models import ResourceGroup
 
 from dstack._internal.core.backends.azure import auth, compute, resources
@@ -46,6 +46,7 @@ from dstack._internal.core.errors import (
 from dstack._internal.core.models.backends.base import (
     BackendType,
 )
+from dstack._internal.core.models.common import validate_extra_ignore, validate_json_extra_ignore
 
 LOCATIONS = [
     ("(US) Central US", "centralus"),
@@ -125,22 +126,22 @@ class AzureConfigurator(
             subscription_id=config.subscription_id,
             resource_group=config.resource_group,
             locations=config.regions,
-            create_default_network=config.vpc_ids is None,
+            create_default_network=config.vpc_ids is None and config.subnet_ids is None,
         )
         return BackendRecord(
             config=AzureStoredConfig(
-                **AzureBackendConfig.__response__.parse_obj(config).dict()
-            ).json(),
-            auth=AzureCreds.parse_obj(config.creds).__root__.json(),
+                **validate_extra_ignore(AzureBackendConfig, config).model_dump()
+            ).model_dump_json(),
+            auth=AzureCreds.model_validate(config.creds).root.model_dump_json(),
         )
 
     def get_backend_config_with_creds(self, record: BackendRecord) -> AzureBackendConfigWithCreds:
         config = self._get_config(record)
-        return AzureBackendConfigWithCreds.__response__.parse_obj(config)
+        return validate_extra_ignore(AzureBackendConfigWithCreds, config)
 
     def get_backend_config_without_creds(self, record: BackendRecord) -> AzureBackendConfig:
         config = self._get_config(record)
-        return AzureBackendConfig.__response__.parse_obj(config)
+        return validate_extra_ignore(AzureBackendConfig, config)
 
     def get_backend(self, record: BackendRecord) -> AzureBackend:
         config = self._get_config(record)
@@ -152,10 +153,13 @@ class AzureConfigurator(
         if regions is None:
             # Legacy config stores regions as locations
             regions = config_dict.pop("locations")
-        return AzureConfig.__response__(
-            **config_dict,
-            regions=regions,
-            creds=AzureCreds.parse_raw(record.auth).__root__,
+        return validate_extra_ignore(
+            AzureConfig,
+            {
+                **config_dict,
+                "regions": regions,
+                "creds": validate_json_extra_ignore(AzureCreds, record.auth).root,
+            },
         )
 
     def _check_config_tenant_id(
@@ -226,23 +230,38 @@ class AzureConfigurator(
         if config.subscription_id is None:
             return None
         allocate_public_ip = config.public_ips if config.public_ips is not None else True
-        if config.public_ips is False and config.vpc_ids is None:
-            raise ServerClientError(msg="`vpc_ids` must be specified if `public_ips: false`.")
+        if config.public_ips is False and config.vpc_ids is None and config.subnet_ids is None:
+            raise ServerClientError(
+                msg="`vpc_ids` or `subnet_ids` must be specified if `public_ips: false`."
+            )
+        if config.vpc_ids is not None and config.subnet_ids is not None:
+            overlap = sorted(set(config.vpc_ids.keys()) & set(config.subnet_ids.keys()))
+            if overlap:
+                raise ServerClientError(
+                    f"Regions {overlap} are configured in both `vpc_ids` and `subnet_ids`."
+                    " Each region must be specified in only one of them."
+                )
         locations = config.regions
         if locations is None:
             locations = DEFAULT_LOCATIONS
-        if config.vpc_ids is not None:
-            vpc_ids_locations = list(config.vpc_ids.keys())
-            not_configured_locations = [loc for loc in locations if loc not in vpc_ids_locations]
+        if config.vpc_ids is not None or config.subnet_ids is not None:
+            configured_locations = set()
+            if config.vpc_ids is not None:
+                configured_locations |= set(config.vpc_ids.keys())
+            if config.subnet_ids is not None:
+                configured_locations |= set(config.subnet_ids.keys())
+            not_configured_locations = [
+                loc for loc in locations if loc not in configured_locations
+            ]
             if len(not_configured_locations) > 0:
                 if config.regions is None:
                     raise ServerClientError(
-                        f"`vpc_ids` not configured for regions {not_configured_locations}. "
-                        "Configure `vpc_ids` for all regions or specify `regions`."
+                        f"Networking not configured for regions {not_configured_locations}. "
+                        "Configure either `vpc_ids` or `subnet_ids` for all regions or specify `regions`."
                     )
                 raise ServerClientError(
-                    f"`vpc_ids` not configured for regions {not_configured_locations}. "
-                    "Configure `vpc_ids` for all regions specified in `regions`."
+                    f"Networking not configured for regions {not_configured_locations}. "
+                    "Configure either `vpc_ids` or `subnet_ids` for all regions specified in `regions`."
                 )
             network_client = network_mgmt.NetworkManagementClient(
                 credential=credential,
@@ -256,6 +275,7 @@ class AzureConfigurator(
                         network_client=network_client,
                         resource_group=None,
                         vpc_ids=config.vpc_ids,
+                        subnet_ids=config.subnet_ids,
                         location=location,
                         allocate_public_ip=allocate_public_ip,
                     )

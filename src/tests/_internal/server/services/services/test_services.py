@@ -1,0 +1,116 @@
+from typing import Literal, Optional, Union
+from unittest.mock import MagicMock
+
+from dstack._internal.core.models.backends.base import BackendType
+from dstack._internal.core.models.configurations import ServiceConfiguration
+from dstack._internal.core.models.gateways import (
+    ACMGatewayCertificate,
+    AnyGatewayCertificate,
+    GatewayConfiguration,
+    LetsEncryptGatewayCertificate,
+)
+from dstack._internal.core.models.runs import RunSpec
+from dstack._internal.server.services.services import (
+    _should_show_service_https,
+    should_configure_service_https_on_gateway_replica,
+)
+from dstack._internal.server.testing.common import get_run_spec
+
+
+def _service_run_spec(https: Union[bool, Literal["auto"]] = "auto") -> RunSpec:
+    return get_run_spec(
+        repo_id="test-repo",
+        configuration=ServiceConfiguration(commands=["python serve.py"], port=8000, https=https),
+    )
+
+
+def _gateway_config(
+    certificate: Optional[AnyGatewayCertificate] = LetsEncryptGatewayCertificate(),
+) -> GatewayConfiguration:
+    return GatewayConfiguration(
+        backend=BackendType.AWS,
+        region="us-east-1",
+        certificate=certificate,
+    )
+
+
+def _mock_run_model() -> MagicMock:
+    run_model = MagicMock()
+    run_model.project.name = "test-project"
+    run_model.run_name = "test-run"
+    return run_model
+
+
+class TestServiceConfigurationHttps:
+    def test_accepts_unset(self) -> None:
+        conf = ServiceConfiguration(commands=["python serve.py"], port=8000)
+        assert conf.https is None
+
+    def test_accepts_auto(self) -> None:
+        conf = ServiceConfiguration(commands=["python serve.py"], port=8000, https="auto")
+        assert conf.https == "auto"
+
+
+class TestShouldConfigureServiceHttpsOnGateway:
+    def test_auto_resolves_to_true_with_lets_encrypt_gateway(self) -> None:
+        run_spec = _service_run_spec(https="auto")
+        gw = _gateway_config(certificate=LetsEncryptGatewayCertificate())
+        assert should_configure_service_https_on_gateway_replica(run_spec, gw) is True
+
+    def test_auto_resolves_to_false_when_gateway_has_no_certificate(self) -> None:
+        run_spec = _service_run_spec(https="auto")
+        gw = _gateway_config(certificate=None)
+        assert should_configure_service_https_on_gateway_replica(run_spec, gw) is False
+
+    def test_auto_resolves_to_false_with_acm_gateway(self) -> None:
+        run_spec = _service_run_spec(https="auto")
+        gw = _gateway_config(
+            certificate=ACMGatewayCertificate(arn="arn:aws:acm:us-east-1:123:cert/abc")
+        )
+        assert should_configure_service_https_on_gateway_replica(run_spec, gw) is False
+
+    def test_true_enables_https_when_gateway_has_no_certificate(self) -> None:
+        run_spec = _service_run_spec(https=True)
+        gw = _gateway_config(certificate=None)
+        assert should_configure_service_https_on_gateway_replica(run_spec, gw) is True
+
+    def test_false_disables_https_regardless_of_gateway_certificate(self) -> None:
+        run_spec = _service_run_spec(https=False)
+        gw = _gateway_config(certificate=LetsEncryptGatewayCertificate())
+        assert should_configure_service_https_on_gateway_replica(run_spec, gw) is False
+
+    def test_true_does_not_configure_https_on_acm_gateway(self) -> None:
+        run_spec = _service_run_spec(https=True)
+        gw = _gateway_config(
+            certificate=ACMGatewayCertificate(arn="arn:aws:acm:us-east-1:123:cert/abc")
+        )
+        assert should_configure_service_https_on_gateway_replica(run_spec, gw) is False
+
+
+class TestShouldShowServiceHttps:
+    def test_auto_resolves_to_true_with_lets_encrypt_gateway(self) -> None:
+        run_spec = _service_run_spec(https="auto")
+        gw = _gateway_config(certificate=LetsEncryptGatewayCertificate())
+        assert _should_show_service_https(run_spec, gw) is True
+
+    def test_auto_resolves_to_false_when_gateway_has_no_certificate(self) -> None:
+        run_spec = _service_run_spec(https="auto")
+        gw = _gateway_config(certificate=None)
+        assert _should_show_service_https(run_spec, gw) is False
+
+    def test_auto_resolves_to_true_with_acm_gateway(self) -> None:
+        run_spec = _service_run_spec(https="auto")
+        gw = _gateway_config(
+            certificate=ACMGatewayCertificate(arn="arn:aws:acm:us-east-1:123:cert/abc")
+        )
+        assert _should_show_service_https(run_spec, gw) is True
+
+    def test_true_enables_https_regardless_of_gateway_certificate(self) -> None:
+        run_spec = _service_run_spec(https=True)
+        gw = _gateway_config(certificate=None)
+        assert _should_show_service_https(run_spec, gw) is True
+
+    def test_false_disables_https_regardless_of_gateway_certificate(self) -> None:
+        run_spec = _service_run_spec(https=False)
+        gw = _gateway_config(certificate=LetsEncryptGatewayCertificate())
+        assert _should_show_service_https(run_spec, gw) is False

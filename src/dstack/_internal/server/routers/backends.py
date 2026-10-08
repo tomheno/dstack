@@ -28,7 +28,7 @@ from dstack._internal.server.services.config import (
     update_backend_config_yaml,
 )
 from dstack._internal.server.utils.routers import (
-    CustomORJSONResponse,
+    CustomJSONResponse,
     get_base_api_additional_responses,
 )
 
@@ -44,14 +44,14 @@ project_router = APIRouter(
 )
 
 
-@root_router.post("/list_types", response_model=List[BackendType])
+@root_router.post("/list_types", summary="List backend types", response_model=List[BackendType])
 async def list_backend_types():
-    return CustomORJSONResponse(
+    return CustomJSONResponse(
         dstack._internal.core.backends.configurators.list_available_backend_types()
     )
 
 
-@project_router.post("/create", response_model=AnyBackendConfigWithCreds)
+@project_router.post("/create", summary="Create backend", response_model=AnyBackendConfigWithCreds)
 async def create_backend(
     body: AnyBackendConfigWithCreds,
     session: AsyncSession = Depends(get_session),
@@ -61,10 +61,10 @@ async def create_backend(
     config = await backends.create_backend(session=session, project=project, config=body)
     if settings.SERVER_CONFIG_ENABLED:
         await ServerConfigManager().sync_config(session=session)
-    return CustomORJSONResponse(config)
+    return CustomJSONResponse(config)
 
 
-@project_router.post("/update", response_model=AnyBackendConfigWithCreds)
+@project_router.post("/update", summary="Update backend", response_model=AnyBackendConfigWithCreds)
 async def update_backend(
     body: AnyBackendConfigWithCreds,
     session: AsyncSession = Depends(get_session),
@@ -74,10 +74,10 @@ async def update_backend(
     config = await backends.update_backend(session=session, project=project, config=body)
     if settings.SERVER_CONFIG_ENABLED:
         await ServerConfigManager().sync_config(session=session)
-    return CustomORJSONResponse(config)
+    return CustomJSONResponse(config)
 
 
-@project_router.post("/delete")
+@project_router.post("/delete", summary="Delete backends")
 async def delete_backends(
     body: DeleteBackendsRequest,
     session: AsyncSession = Depends(get_session),
@@ -91,7 +91,11 @@ async def delete_backends(
         await ServerConfigManager().sync_config(session=session)
 
 
-@project_router.post("/{backend_name}/config_info", response_model=AnyBackendConfigWithCreds)
+@project_router.post(
+    "/{backend_name}/config_info",
+    summary="Get backend config info",
+    response_model=AnyBackendConfigWithCreds,
+)
 async def get_backend_config_info(
     backend_name: BackendType,
     user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectAdmin()),
@@ -100,10 +104,10 @@ async def get_backend_config_info(
     config = await backends.get_backend_config(project=project, backend_type=backend_name)
     if config is None:
         raise ResourceNotExistsError()
-    return CustomORJSONResponse(config)
+    return CustomJSONResponse(config)
 
 
-@project_router.post("/create_yaml")
+@project_router.post("/create_yaml", summary="Create backend YAML")
 async def create_backend_yaml(
     body: CreateBackendYAMLRequest,
     session: AsyncSession = Depends(get_session),
@@ -117,7 +121,7 @@ async def create_backend_yaml(
     )
 
 
-@project_router.post("/update_yaml")
+@project_router.post("/update_yaml", summary="Update backend YAML")
 async def update_backend_yaml(
     body: UpdateBackendYAMLRequest,
     session: AsyncSession = Depends(get_session),
@@ -131,12 +135,14 @@ async def update_backend_yaml(
     )
 
 
-@project_router.post("/{backend_name}/get_yaml", response_model=BackendInfoYAML)
+@project_router.post(
+    "/{backend_name}/get_yaml", summary="Get backend YAML", response_model=BackendInfoYAML
+)
 async def get_backend_yaml(
     backend_name: BackendType,
     user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectAdmin()),
 ):
     _, project = user_project
-    return CustomORJSONResponse(
+    return CustomJSONResponse(
         await get_backend_config_yaml(project=project, backend_type=backend_name)
     )

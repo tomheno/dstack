@@ -1,10 +1,12 @@
 import asyncio
-import heapq
+import json
+import time
 from collections.abc import Iterable, Iterator
 from typing import Callable, Coroutine, Dict, List, Optional, Tuple
 from uuid import UUID
 
 from cachetools import TTLCache
+from pydantic import ValidationError
 from sqlalchemy import delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,10 +19,10 @@ from dstack._internal.core.backends.configurators import (
     get_configurator,
     list_available_backend_types,
 )
-from dstack._internal.core.backends.local.backend import LocalBackend
 from dstack._internal.core.backends.models import (
     AnyBackendConfigWithCreds,
     AnyBackendConfigWithoutCreds,
+    BackendConfigWithCreds,
 )
 from dstack._internal.core.errors import (
     BackendAuthError,
@@ -38,11 +40,21 @@ from dstack._internal.core.models.instances import (
 from dstack._internal.core.models.runs import Requirements
 from dstack._internal.server import settings
 from dstack._internal.server.models import BackendModel, DecryptedString, ProjectModel
-from dstack._internal.settings import LOCAL_BACKEND_ENABLED
+from dstack._internal.server.services.offers import merge_offer_iterables
 from dstack._internal.utils.common import run_async
 from dstack._internal.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def serialize_source_backend_config(
+    config: AnyBackendConfigWithCreds,
+) -> Tuple[str, Optional[str]]:
+    """Split user-intent backend config into non-sensitive and sensitive JSON blobs."""
+    source_config_dict = config.model_dump()
+    source_auth = source_config_dict.pop("creds", None)
+    source_auth_json = None if source_auth is None else json.dumps(source_auth)
+    return json.dumps(source_config_dict), source_auth_json
 
 
 async def create_backend(
@@ -88,6 +100,8 @@ async def update_backend(
         .values(
             config=backend.config,
             auth=backend.auth,
+            source_config=backend.source_config,
+            source_auth=backend.source_auth,
         )
     )
     return config
@@ -98,6 +112,9 @@ async def validate_and_create_backend_model(
     configurator: Configurator,
     config: AnyBackendConfigWithCreds,
 ) -> BackendModel:
+    # Configurators may mutate `config` while building the effective stored backend config,
+    # so capture the user-intent payload before validation/create_backend runs.
+    source_config, source_auth = serialize_source_backend_config(config)
     await run_async(
         configurator.validate_config, config, default_creds_enabled=settings.DEFAULT_CREDS_ENABLED
     )
@@ -111,6 +128,8 @@ async def validate_and_create_backend_model(
         type=configurator.TYPE,
         config=backend_record.config,
         auth=DecryptedString(plaintext=backend_record.auth),
+        source_config=source_config,
+        source_auth=None if source_auth is None else DecryptedString(plaintext=source_auth),
     )
 
 
@@ -133,6 +152,16 @@ async def get_backend_config(
     return None
 
 
+async def get_source_backend_config(
+    project: ProjectModel,
+    backend_type: BackendType,
+) -> Optional[AnyBackendConfigWithCreds]:
+    backend_model = await get_project_backend_model_by_type(project, backend_type)
+    if backend_model is None:
+        return None
+    return get_source_backend_config_from_backend_model(backend_model)
+
+
 def get_backend_config_with_creds_from_backend_model(
     configurator: Configurator,
     backend_model: BackendModel,
@@ -149,6 +178,48 @@ def get_backend_config_without_creds_from_backend_model(
     backend_record = get_stored_backend_record(backend_model)
     backend_config = configurator.get_backend_config_without_creds(backend_record)
     return backend_config
+
+
+def get_source_backend_config_from_backend_model(
+    backend_model: BackendModel,
+) -> Optional[AnyBackendConfigWithCreds]:
+    """Reconstruct user-intent backend config from `source_config`/`source_auth`."""
+
+    if backend_model.source_config is None:
+        return None
+    try:
+        source_config_dict = json.loads(backend_model.source_config)
+    except ValueError:
+        logger.warning(
+            "Failed to parse source config for %s backend. Falling back to stored config.",
+            backend_model.type.value,
+        )
+        return None
+    if backend_model.source_auth is not None:
+        if not backend_model.source_auth.decrypted:
+            logger.warning(
+                "Failed to decrypt source creds for %s backend. Falling back to stored config.",
+                backend_model.type.value,
+            )
+            return None
+        try:
+            source_config_dict["creds"] = json.loads(
+                backend_model.source_auth.get_plaintext_or_error()
+            )
+        except ValueError:
+            logger.warning(
+                "Failed to parse source creds for %s backend. Falling back to stored config.",
+                backend_model.type.value,
+            )
+            return None
+    try:
+        return BackendConfigWithCreds.model_validate(source_config_dict).root
+    except ValidationError:
+        logger.warning(
+            "Failed to validate source config for %s backend. Falling back to stored config.",
+            backend_model.type.value,
+        )
+        return None
 
 
 def get_stored_backend_record(backend_model: BackendModel) -> StoredBackendRecord:
@@ -201,6 +272,7 @@ async def get_project_backends_with_models(project: ProjectModel) -> List[Backen
     async with _get_project_cache_lock(project.id):
         key = project.id
         project_backends = _BACKENDS_CACHE.get(key, {})
+        to_init: List[Tuple[BackendModel, Configurator, StoredBackendRecord]] = []
         for backend_model in project.backends:
             cached_backend = project_backends.get(backend_model.type)
             if (
@@ -222,22 +294,55 @@ async def get_project_backends_with_models(project: ProjectModel) -> List[Backen
                     backend_model.type.value,
                 )
                 continue
-            try:
-                backend_record = get_stored_backend_record(backend_model)
-                backend = await run_async(configurator.get_backend, backend_record)
-            except (BackendInvalidCredentialsError, BackendAuthError):
-                logger.warning(
-                    "Credentials for %s backend are invalid. Backend will be ignored.",
-                    backend_model.type.value,
-                )
-                continue
-            project_backends[backend_model.type] = (backend_model, backend)
+            backend_record = get_stored_backend_record(backend_model)
+            to_init.append((backend_model, configurator, backend_record))
+
+        if to_init:
+            t0 = time.time()
+            tasks = [
+                _get_backend_tracked(configurator, backend_record)
+                for _, configurator, backend_record in to_init
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            initialized_results = []
+            for (backend_model, _, _), result in zip(to_init, results):
+                if isinstance(result, BaseException):
+                    if isinstance(result, (BackendInvalidCredentialsError, BackendAuthError)):
+                        logger.warning(
+                            "Credentials for %s backend are invalid. Backend will be ignored.",
+                            backend_model.type.value,
+                        )
+                    else:
+                        logger.error(
+                            "Failed to initialize %s backend. Backend will be ignored.",
+                            backend_model.type.value,
+                            exc_info=result,
+                        )
+                else:
+                    backend, duration = result
+                    project_backends[backend_model.type] = (backend_model, backend)
+                    initialized_results.append(f"{backend_model.type.value}={duration:.1f}s")
+            logger.debug(
+                "Initialized %d backends in %.1fs: %s",
+                len(initialized_results),
+                time.time() - t0,
+                ", ".join(initialized_results),
+            )
+
         # `__setitem__()` will also expire the cache.
         # Note that there is no global cache lock so a race condition is possible:
         # one coroutine updates/re-assigns backends expired by another coroutine.
         # This is ok since the only effect is that project's cache gets restored.
         _BACKENDS_CACHE[key] = project_backends
     return list(project_backends.values())
+
+
+async def _get_backend_tracked(
+    configurator: Configurator, backend_record: StoredBackendRecord
+) -> Tuple[Backend, float]:
+    t = time.time()
+    backend = await run_async(configurator.get_backend, backend_record)
+    return backend, time.time() - t
 
 
 _get_project_backend_with_model_by_type = None
@@ -288,8 +393,6 @@ async def get_project_backend_with_model_by_type_or_error(
 async def get_project_backends(project: ProjectModel) -> List[Backend]:
     backends_with_models = await get_project_backends_with_models(project)
     backends = [b for _, b in backends_with_models]
-    if LOCAL_BACKEND_ENABLED:
-        backends.append(LocalBackend())
     return backends
 
 
@@ -343,11 +446,34 @@ async def get_project_backend_model_by_type_or_error(
     return backend_model
 
 
+async def get_project_backend_with_model_by_id(
+    project: ProjectModel, backend_id: UUID
+) -> Optional[BackendTuple]:
+    backends_with_models = await get_project_backends_with_models(project=project)
+    for backend_model, backend in backends_with_models:
+        if backend_model.id == backend_id:
+            return backend_model, backend
+    return None
+
+
+async def get_project_backend_with_model_by_id_or_error(
+    project: ProjectModel, backend_id: UUID
+) -> BackendTuple:
+    backend_with_model = await get_project_backend_with_model_by_id(
+        project=project, backend_id=backend_id
+    )
+    if backend_with_model is None:
+        raise BackendNotAvailable()
+    return backend_with_model
+
+
 async def get_backend_offers(
     backends: List[Backend],
     requirements: Requirements,
+    full_offers: bool,
+    unallocated_resources: bool,
     exclude_not_available: bool = False,
-) -> Iterator[Tuple[Backend, InstanceOfferWithAvailability]]:
+) -> Iterable[Tuple[Backend, InstanceOfferWithAvailability]]:
     """
     Yields backend offers satisfying `requirements` sorted by price.
     """
@@ -360,9 +486,12 @@ async def get_backend_offers(
             if not exclude_not_available or offer.availability.is_available():
                 yield (backend, offer)
 
-    logger.info("Requesting instance offers from backends: %s", [b.TYPE.value for b in backends])
-    tasks = [run_async(backend.compute().get_offers, requirements) for backend in backends]
-    offers_by_backend = []
+    logger.debug("Requesting instance offers from backends: %s", [b.TYPE.value for b in backends])
+    tasks = [
+        run_async(get_offers_tracked, backend, requirements, full_offers, unallocated_resources)
+        for backend in backends
+    ]
+    offers_by_backend: list[Iterable[tuple[Backend, InstanceOfferWithAvailability]]] = []
     for backend, result in zip(backends, await asyncio.gather(*tasks, return_exceptions=True)):
         if isinstance(result, BackendError):
             logger.warning(
@@ -379,9 +508,7 @@ async def get_backend_offers(
             )
             continue
         offers_by_backend.append(get_filtered_offers_with_backends(backend, result))
-    # Merge preserving order for every backend.
-    offers = heapq.merge(*offers_by_backend, key=lambda i: i[1].price)
-    return offers
+    return merge_offer_iterables(*offers_by_backend)
 
 
 def check_backend_type_available(backend_type: BackendType):
@@ -391,3 +518,13 @@ def check_backend_type_available(backend_type: BackendType):
             " Ensure that backend dependencies are installed."
             f" Available backends: {[b.value for b in list_available_backend_types()]}."
         )
+
+
+def get_offers_tracked(
+    backend: Backend, requirements: Requirements, full_offers: bool, unallocated_resources: bool
+) -> Iterator[InstanceOfferWithAvailability]:
+    start = time.time()
+    res = backend.compute().get_offers(requirements, full_offers, unallocated_resources)
+    duration = time.time() - start
+    logger.debug("Got offers from %s in %.6fs", backend.TYPE.value, duration)
+    return res

@@ -16,7 +16,7 @@ from dstack._internal.server.security.permissions import ProjectMember
 from dstack._internal.server.services import repos
 from dstack._internal.server.settings import SERVER_CODE_UPLOAD_LIMIT
 from dstack._internal.server.utils.routers import (
-    CustomORJSONResponse,
+    CustomJSONResponse,
     get_base_api_additional_responses,
     get_request_size,
 )
@@ -29,16 +29,16 @@ router = APIRouter(
 )
 
 
-@router.post("/list", response_model=List[RepoHead])
+@router.post("/list", summary="List repos", response_model=List[RepoHead])
 async def list_repos(
     session: AsyncSession = Depends(get_session),
     user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectMember()),
 ):
     _, project = user_project
-    return CustomORJSONResponse(await repos.list_repos(session=session, project=project))
+    return CustomJSONResponse(await repos.list_repos(session=session, project=project))
 
 
-@router.post("/get", response_model=RepoHeadWithCreds)
+@router.post("/get", summary="Get repo", response_model=RepoHeadWithCreds)
 async def get_repo(
     body: GetRepoRequest,
     session: AsyncSession = Depends(get_session),
@@ -54,10 +54,10 @@ async def get_repo(
     )
     if repo is None:
         raise ResourceNotExistsError()
-    return CustomORJSONResponse(repo)
+    return CustomJSONResponse(repo)
 
 
-@router.post("/init")
+@router.post("/init", summary="Initialize repo")
 async def init_repo(
     body: SaveRepoCredsRequest,
     session: AsyncSession = Depends(get_session),
@@ -79,7 +79,7 @@ async def init_repo(
     )
 
 
-@router.post("/delete")
+@router.post("/delete", summary="Delete repos")
 async def delete_repos(
     body: DeleteReposRequest,
     session: AsyncSession = Depends(get_session),
@@ -89,7 +89,7 @@ async def delete_repos(
     await repos.delete_repos(session=session, project=project, repos_ids=body.repos_ids)
 
 
-@router.post("/upload_code")
+@router.post("/upload_code", summary="Upload code")
 async def upload_code(
     request: Request,
     repo_id: str,

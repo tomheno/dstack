@@ -1,41 +1,44 @@
 import copy
 import json
 from datetime import datetime, timezone
-from typing import Dict, Generator, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID
 
 import pytest
-from fastapi.testclient import TestClient
 from freezegun import freeze_time
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dstack._internal.core.models.backends.base import BackendType
-from dstack._internal.core.models.common import ApplyAction
+from dstack._internal.core.models.common import ApplyAction, EntityReference
 from dstack._internal.core.models.configurations import (
     AnyRunConfiguration,
     DevEnvironmentConfiguration,
+    ReplicaGroup,
     ScalingSpec,
     ServiceConfiguration,
     TaskConfiguration,
+    parse_run_configuration,
 )
-from dstack._internal.core.models.fleets import FleetNodesSpec
+from dstack._internal.core.models.fleets import FleetNodesSpec, InstanceGroupPlacement
 from dstack._internal.core.models.gateways import GatewayStatus
 from dstack._internal.core.models.instances import (
+    Gpu,
     InstanceAvailability,
     InstanceOfferWithAvailability,
     InstanceStatus,
     InstanceType,
     Resources,
 )
-from dstack._internal.core.models.profiles import Schedule
-from dstack._internal.core.models.resources import Range
+from dstack._internal.core.models.profiles import Profile, Schedule
+from dstack._internal.core.models.resources import GPUSpec, Range, ResourcesSpec
 from dstack._internal.core.models.runs import (
     ApplyRunPlanInput,
     JobSpec,
     JobStatus,
+    Requirements,
     Run,
     RunSpec,
     RunStatus,
@@ -43,16 +46,20 @@ from dstack._internal.core.models.runs import (
 )
 from dstack._internal.core.models.users import GlobalRole, ProjectRole
 from dstack._internal.core.models.volumes import InstanceMountPoint, MountPoint
-from dstack._internal.server.main import app
 from dstack._internal.server.models import JobModel, RunModel
-from dstack._internal.server.schemas.runs import ApplyRunPlanRequest
+from dstack._internal.server.schemas.runs import MAX_JOB_SUBMISSIONS_LIMIT, ApplyRunPlanRequest
 from dstack._internal.server.services.projects import add_project_member
 from dstack._internal.server.services.runs import run_model_to_run
+from dstack._internal.server.services.runs.spec import (
+    set_run_spec_resources_defaults,
+    validate_run_spec_and_set_defaults,
+)
 from dstack._internal.server.testing.common import (
     create_backend,
+    create_export,
     create_fleet,
     create_gateway,
-    create_gateway_compute,
+    create_gateway_replica,
     create_instance,
     create_job,
     create_project,
@@ -60,16 +67,50 @@ from dstack._internal.server.testing.common import (
     create_run,
     create_user,
     get_auth_headers,
+    get_fleet_configuration,
     get_fleet_spec,
+    get_instance_offer_with_availability,
     get_job_provisioning_data,
+    get_job_runtime_data,
     get_run_spec,
+    get_ssh_fleet_configuration,
+    list_events,
 )
 from dstack._internal.server.testing.matchers import SomeUUID4Str
-from tests._internal.server.background.tasks.test_process_running_jobs import settings
+from dstack._internal.utils.common import render_datetime_as_api
 
-pytestmark = pytest.mark.usefixtures("image_config_mock")
+pytestmark = pytest.mark.usefixtures("image_config_mock", "disable_sshproxy")
 
-client = TestClient(app)
+
+@pytest.fixture
+def disable_sshproxy(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("dstack._internal.server.settings.SSHPROXY_ENABLED", False)
+
+
+def get_default_gpu_dict(docker: Optional[bool] = None) -> Dict:
+    """
+    The GPU spec the server sets when the client submits no GPU requirements.
+    The vendor is inferred from the image: the default dstack image is NVIDIA-only,
+    while the DinD image works with any vendor.
+    """
+    return {
+        "vendor": None if docker else "nvidia",
+        "name": None,
+        "count": {"min": 0, "max": None},
+        "memory": None,
+        "total_memory": None,
+        "compute_capability": None,
+    }
+
+
+def get_submitted_run_spec_dict(run_spec: Dict) -> Dict:
+    """
+    A copy of the run spec dict as submitted by the client, that is, without the resource
+    defaults that the server sets (see `set_run_spec_resources_defaults`).
+    """
+    run_spec = copy.deepcopy(run_spec)
+    run_spec["configuration"]["resources"]["gpu"] = None
+    return run_spec
 
 
 def get_dev_env_run_plan_dict(
@@ -94,11 +135,13 @@ def get_dev_env_run_plan_dict(
             "-c",
             (
                 "start-dockerd"
-                " && (echo 'pip install ipykernel...'"
+                " && (echo 'uv pip install ipykernel...'"
+                " && uv pip install -q --no-cache-dir ipykernel 2> /dev/null)"
+                " || (echo 'pip install ipykernel...'"
                 " && pip install -q --no-cache-dir ipykernel 2> /dev/null)"
-                " || echo 'no pip, ipykernel was not installed'"
+                " || echo 'no uv or pip found, ipykernel was not installed'"
                 " && echo"
-                " && echo 'To open in VS Code Desktop, use link below:'"
+                " && echo 'To open in VS Code, use link below:'"
                 " && echo"
                 ' && echo "  vscode://vscode-remote/ssh-remote+dry-run$DSTACK_WORKING_DIR"'
                 " && echo"
@@ -121,11 +164,13 @@ def get_dev_env_run_plan_dict(
                 " && sudo chown $(id -u):$(id -g) $DSTACK_VENV_DIR"
                 " && uv venv -q --prompt dstack -p 3.13 --seed $DSTACK_VENV_DIR"
                 " && eval $(echo '. $DSTACK_VENV_DIR/bin/activate' | sudo tee -a /dstack/profile)"
-                " && (echo 'pip install ipykernel...'"
+                " && (echo 'uv pip install ipykernel...'"
+                " && uv pip install -q --no-cache-dir ipykernel 2> /dev/null)"
+                " || (echo 'pip install ipykernel...'"
                 " && pip install -q --no-cache-dir ipykernel 2> /dev/null)"
-                " || echo 'no pip, ipykernel was not installed'"
+                " || echo 'no uv or pip found, ipykernel was not installed'"
                 " && echo"
-                " && echo 'To open in VS Code Desktop, use link below:'"
+                " && echo 'To open in VS Code, use link below:'"
                 " && echo"
                 ' && echo "  vscode://vscode-remote/ssh-remote+dry-run$DSTACK_WORKING_DIR"'
                 " && echo"
@@ -135,7 +180,7 @@ def get_dev_env_run_plan_dict(
                 " && tail -f /dev/null"
             ),
         ]
-        image_name = f"dstackai/base:{settings.DSTACK_BASE_IMAGE_VERSION}-base-ubuntu{settings.DSTACK_BASE_IMAGE_UBUNTU_VERSION}"
+        image_name = "dstackai/base:0.15-base-ubuntu24.04"
 
     run_spec = {
         "configuration": {
@@ -153,6 +198,7 @@ def get_dev_env_run_plan_dict(
             "privileged": privileged,
             "init": [],
             "ports": [],
+            "dstack": False,
             "python": "3.13" if not docker else None,
             "nvcc": None,
             "registry_auth": None,
@@ -160,13 +206,13 @@ def get_dev_env_run_plan_dict(
             "type": "dev-environment",
             "name": None,
             "resources": {
-                "cpu": {"min": 2, "max": None},
+                "cpu": {"arch": "x86", "count": {"min": 2, "max": None}},
                 "memory": {"min": 8.0, "max": None},
                 "disk": None,
-                "gpu": None,
+                "gpu": get_default_gpu_dict(docker),
                 "shm_size": None,
             },
-            "volumes": [json.loads(v.json()) for v in volumes],
+            "volumes": [json.loads(v.model_dump_json()) for v in volumes],
             "repos": [
                 {
                     "url": "https://github.com/dstackai/dstack",
@@ -178,7 +224,7 @@ def get_dev_env_run_plan_dict(
                 },
             ],
             "files": [],
-            "backends": ["local", "aws", "azure", "gcp", "lambda", "runpod"],
+            "backends": ["aws", "azure", "gcp", "lambda", "runpod"],
             "regions": ["us"],
             "availability_zones": None,
             "instance_types": None,
@@ -197,12 +243,14 @@ def get_dev_env_run_plan_dict(
             "reservation": None,
             "fleets": None,
             "tags": None,
+            "backend_options": None,
+            "instances": None,
             "priority": 0,
         },
         "configuration_path": "dstack.yaml",
         "file_archives": [],
         "profile": {
-            "backends": ["local", "aws", "azure", "gcp", "lambda", "runpod"],
+            "backends": ["aws", "azure", "gcp", "lambda", "runpod"],
             "regions": ["us"],
             "availability_zones": None,
             "instance_types": None,
@@ -222,6 +270,8 @@ def get_dev_env_run_plan_dict(
             "reservation": None,
             "fleets": None,
             "tags": None,
+            "backend_options": None,
+            "instances": None,
         },
         "repo_code_hash": None,
         "repo_data": {
@@ -241,7 +291,8 @@ def get_dev_env_run_plan_dict(
     return {
         "project_name": project_name,
         "user": username,
-        "run_spec": run_spec,
+        # `run_spec` is returned as submitted, `effective_run_spec` — with the server defaults
+        "run_spec": get_submitted_run_spec_dict(run_spec),
         "effective_run_spec": run_spec,
         "job_plans": [
             {
@@ -257,6 +308,7 @@ def get_dev_env_run_plan_dict(
                     "replica_num": 0,
                     "job_num": 0,
                     "jobs_per_replica": 1,
+                    "replica_group": "0",
                     "single_branch": False,
                     "max_duration": None,
                     "stop_duration": 300,
@@ -264,19 +316,20 @@ def get_dev_env_run_plan_dict(
                     "registry_auth": None,
                     "requirements": {
                         "resources": {
-                            "cpu": {"min": 2, "max": None},
+                            "cpu": {"arch": "x86", "count": {"min": 2, "max": None}},
                             "memory": {"min": 8.0, "max": None},
                             "disk": None,
-                            "gpu": None,
+                            "gpu": get_default_gpu_dict(docker),
                             "shm_size": None,
                         },
                         "max_price": None,
                         "spot": None,
                         "reservation": None,
                         "multinode": False,
+                        "backend_options": None,
                     },
                     "retry": None,
-                    "volumes": volumes,
+                    "volumes": [json.loads(v.model_dump_json()) for v in volumes],
                     "ssh_key": None,
                     "working_dir": None,
                     "repo_code_hash": None,
@@ -293,13 +346,16 @@ def get_dev_env_run_plan_dict(
                     "file_archives": [],
                     "service_port": None,
                     "probes": [],
+                    "node_group_index": 0,
+                    "node_group_name": "0",
+                    "node_group_job_index": 0,
                 },
-                "offers": [json.loads(o.json()) for o in offers],
+                "offers": [json.loads(o.model_dump_json()) for o in offers],
                 "total_offers": total_offers,
                 "max_price": max_price,
             }
         ],
-        "current_resource": current_resource.dict() if current_resource else None,
+        "current_resource": current_resource.model_dump() if current_resource else None,
         "action": action.value,
     }
 
@@ -311,9 +367,9 @@ def get_dev_env_run_dict(
     username: str = "test_user",
     run_name: Optional[str] = "run_name",
     repo_id: str = "test_repo",
-    submitted_at: str = "2023-01-02T03:04:00+00:00",
-    last_processed_at: str = "2023-01-02T03:04:00+00:00",
-    finished_at: Optional[str] = "2023-01-02T03:04:00+00:00",
+    submitted_at: str = "2023-01-02T03:04:00Z",
+    last_processed_at: str = "2023-01-02T03:04:00Z",
+    finished_at: Optional[str] = "2023-01-02T03:04:00Z",
     privileged: bool = False,
     docker: Optional[bool] = None,
     deleted: bool = False,
@@ -326,11 +382,13 @@ def get_dev_env_run_dict(
             "-c",
             (
                 "start-dockerd"
-                " && (echo 'pip install ipykernel...'"
+                " && (echo 'uv pip install ipykernel...'"
+                " && uv pip install -q --no-cache-dir ipykernel 2> /dev/null)"
+                " || (echo 'pip install ipykernel...'"
                 " && pip install -q --no-cache-dir ipykernel 2> /dev/null)"
-                " || echo 'no pip, ipykernel was not installed'"
+                " || echo 'no uv or pip found, ipykernel was not installed'"
                 " && echo"
-                " && echo 'To open in VS Code Desktop, use link below:'"
+                " && echo 'To open in VS Code, use link below:'"
                 " && echo"
                 ' && echo "  vscode://vscode-remote/ssh-remote+test-run$DSTACK_WORKING_DIR"'
                 " && echo"
@@ -353,11 +411,13 @@ def get_dev_env_run_dict(
                 " && sudo chown $(id -u):$(id -g) $DSTACK_VENV_DIR"
                 " && uv venv -q --prompt dstack -p 3.13 --seed $DSTACK_VENV_DIR"
                 " && eval $(echo '. $DSTACK_VENV_DIR/bin/activate' | sudo tee -a /dstack/profile)"
-                " && (echo 'pip install ipykernel...'"
+                " && (echo 'uv pip install ipykernel...'"
+                " && uv pip install -q --no-cache-dir ipykernel 2> /dev/null)"
+                " || (echo 'pip install ipykernel...'"
                 " && pip install -q --no-cache-dir ipykernel 2> /dev/null)"
-                " || echo 'no pip, ipykernel was not installed'"
+                " || echo 'no uv or pip found, ipykernel was not installed'"
                 " && echo"
-                " && echo 'To open in VS Code Desktop, use link below:'"
+                " && echo 'To open in VS Code, use link below:'"
                 " && echo"
                 ' && echo "  vscode://vscode-remote/ssh-remote+test-run$DSTACK_WORKING_DIR"'
                 " && echo"
@@ -367,7 +427,7 @@ def get_dev_env_run_dict(
                 " && tail -f /dev/null"
             ),
         ]
-        image_name = "dstackai/base:0.12-base-ubuntu22.04"
+        image_name = "dstackai/base:0.15-base-ubuntu24.04"
 
     return {
         "id": run_id,
@@ -394,6 +454,7 @@ def get_dev_env_run_dict(
                 "privileged": privileged,
                 "init": [],
                 "ports": [],
+                "dstack": False,
                 "python": "3.13" if not docker else None,
                 "nvcc": None,
                 "registry_auth": None,
@@ -401,10 +462,10 @@ def get_dev_env_run_dict(
                 "name": None,
                 "type": "dev-environment",
                 "resources": {
-                    "cpu": {"min": 2, "max": None},
+                    "cpu": {"arch": "x86", "count": {"min": 2, "max": None}},
                     "memory": {"min": 8.0, "max": None},
                     "disk": None,
-                    "gpu": None,
+                    "gpu": get_default_gpu_dict(docker),
                     "shm_size": None,
                 },
                 "volumes": [],
@@ -419,7 +480,7 @@ def get_dev_env_run_dict(
                     },
                 ],
                 "files": [],
-                "backends": ["local", "aws", "azure", "gcp", "lambda"],
+                "backends": ["aws", "azure", "gcp", "lambda"],
                 "regions": ["us"],
                 "availability_zones": None,
                 "instance_types": None,
@@ -438,12 +499,14 @@ def get_dev_env_run_dict(
                 "reservation": None,
                 "fleets": None,
                 "tags": None,
+                "backend_options": None,
+                "instances": None,
                 "priority": 0,
             },
             "configuration_path": "dstack.yaml",
             "file_archives": [],
             "profile": {
-                "backends": ["local", "aws", "azure", "gcp", "lambda"],
+                "backends": ["aws", "azure", "gcp", "lambda"],
                 "regions": ["us"],
                 "availability_zones": None,
                 "instance_types": None,
@@ -463,6 +526,8 @@ def get_dev_env_run_dict(
                 "reservation": None,
                 "fleets": None,
                 "tags": None,
+                "backend_options": None,
+                "instances": None,
             },
             "repo_code_hash": None,
             "repo_data": {
@@ -493,6 +558,7 @@ def get_dev_env_run_dict(
                     "replica_num": 0,
                     "job_num": 0,
                     "jobs_per_replica": 1,
+                    "replica_group": "0",
                     "single_branch": False,
                     "max_duration": None,
                     "stop_duration": 300,
@@ -500,16 +566,17 @@ def get_dev_env_run_dict(
                     "registry_auth": None,
                     "requirements": {
                         "resources": {
-                            "cpu": {"min": 2, "max": None},
+                            "cpu": {"arch": "x86", "count": {"min": 2, "max": None}},
                             "memory": {"min": 8.0, "max": None},
                             "disk": None,
-                            "gpu": None,
+                            "gpu": get_default_gpu_dict(docker),
                             "shm_size": None,
                         },
                         "max_price": None,
                         "spot": None,
                         "reservation": None,
                         "multinode": False,
+                        "backend_options": None,
                     },
                     "retry": None,
                     "volumes": [],
@@ -529,6 +596,9 @@ def get_dev_env_run_dict(
                     "file_archives": [],
                     "service_port": None,
                     "probes": [],
+                    "node_group_index": 0,
+                    "node_group_name": "0",
+                    "node_group_job_index": 0,
                 },
                 "job_submissions": [
                     {
@@ -548,8 +618,10 @@ def get_dev_env_run_dict(
                         "job_provisioning_data": None,
                         "job_runtime_data": None,
                         "probes": [],
+                        "image_pull_progress": None,
                     }
                 ],
+                "job_connection_info": None,
             }
         ],
         "latest_job_submission": {
@@ -569,6 +641,7 @@ def get_dev_env_run_dict(
             "job_provisioning_data": None,
             "job_runtime_data": None,
             "probes": [],
+            "image_pull_progress": None,
         },
         "cost": 0.0,
         "service": None,
@@ -584,6 +657,7 @@ def get_service_run_spec(
     repo_id: str,
     run_name: Optional[str] = None,
     gateway: Optional[Union[bool, str]] = None,
+    model: Union[str, dict] = "test-model",
 ) -> dict:
     return {
         "configuration": {
@@ -591,7 +665,7 @@ def get_service_run_spec(
             "commands": ["python -m http.server"],
             "port": 8000,
             "gateway": gateway,
-            "model": "test-model",
+            "model": model,
             "repos": [
                 {
                     "url": "https://github.com/dstackai/dstack",
@@ -627,10 +701,7 @@ def get_service_run_spec(
 
 class TestListRuns:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/runs/list")
         assert response.status_code in [401, 403]
 
@@ -656,14 +727,14 @@ class TestListRuns:
             fleet=fleet,
             submitted_at=run1_submitted_at,
         )
-        run1_spec = RunSpec.parse_raw(run1.run_spec)
+        run1_spec = RunSpec.model_validate_json(run1.run_spec)
         job = await create_job(
             session=session,
             run=run1,
             submitted_at=run1_submitted_at,
             last_processed_at=run1_submitted_at,
         )
-        job_spec = JobSpec.parse_raw(job.job_spec_data)
+        job_spec = JobSpec.model_validate_json(job.job_spec_data)
         run2_submitted_at = datetime(2023, 1, 1, 3, 4, tzinfo=timezone.utc)
         run2 = await create_run(
             session=session,
@@ -673,7 +744,7 @@ class TestListRuns:
             fleet=fleet,
             submitted_at=run2_submitted_at,
         )
-        run2_spec = RunSpec.parse_raw(run2.run_spec)
+        run2_spec = RunSpec.model_validate_json(run2.run_spec)
         response = await client.post(
             "/api/runs/list",
             headers=get_auth_headers(user.token),
@@ -689,21 +760,21 @@ class TestListRuns:
                     "id": str(fleet.id),
                     "name": fleet.name,
                 },
-                "submitted_at": run1_submitted_at.isoformat(),
-                "last_processed_at": run1_submitted_at.isoformat(),
+                "submitted_at": render_datetime_as_api(run1_submitted_at),
+                "last_processed_at": render_datetime_as_api(run1_submitted_at),
                 "status": "submitted",
                 "status_message": "submitted",
-                "run_spec": run1_spec.dict(),
+                "run_spec": run1_spec.model_dump(),
                 "jobs": [
                     {
-                        "job_spec": job_spec.dict(),
+                        "job_spec": job_spec.model_dump(),
                         "job_submissions": [
                             {
                                 "id": str(job.id),
                                 "submission_num": 0,
                                 "deployment_num": 0,
-                                "submitted_at": run1_submitted_at.isoformat(),
-                                "last_processed_at": run1_submitted_at.isoformat(),
+                                "submitted_at": render_datetime_as_api(run1_submitted_at),
+                                "last_processed_at": render_datetime_as_api(run1_submitted_at),
                                 "finished_at": None,
                                 "inactivity_secs": None,
                                 "status": "submitted",
@@ -715,16 +786,18 @@ class TestListRuns:
                                 "job_provisioning_data": None,
                                 "job_runtime_data": None,
                                 "probes": [],
+                                "image_pull_progress": None,
                             }
                         ],
+                        "job_connection_info": None,
                     }
                 ],
                 "latest_job_submission": {
                     "id": str(job.id),
                     "submission_num": 0,
                     "deployment_num": 0,
-                    "submitted_at": run1_submitted_at.isoformat(),
-                    "last_processed_at": run1_submitted_at.isoformat(),
+                    "submitted_at": render_datetime_as_api(run1_submitted_at),
+                    "last_processed_at": render_datetime_as_api(run1_submitted_at),
                     "finished_at": None,
                     "inactivity_secs": None,
                     "status": "submitted",
@@ -736,8 +809,9 @@ class TestListRuns:
                     "job_provisioning_data": None,
                     "job_runtime_data": None,
                     "probes": [],
+                    "image_pull_progress": None,
                 },
-                "cost": 0,
+                "cost": 0.0,
                 "service": None,
                 "deployment_num": 0,
                 "termination_reason": None,
@@ -753,14 +827,14 @@ class TestListRuns:
                     "id": str(fleet.id),
                     "name": fleet.name,
                 },
-                "submitted_at": run2_submitted_at.isoformat(),
-                "last_processed_at": run2_submitted_at.isoformat(),
+                "submitted_at": render_datetime_as_api(run2_submitted_at),
+                "last_processed_at": render_datetime_as_api(run2_submitted_at),
                 "status": "submitted",
                 "status_message": "submitted",
-                "run_spec": run2_spec.dict(),
+                "run_spec": run2_spec.model_dump(),
                 "jobs": [],
                 "latest_job_submission": None,
-                "cost": 0,
+                "cost": 0.0,
                 "service": None,
                 "deployment_num": 0,
                 "termination_reason": None,
@@ -853,7 +927,7 @@ class TestListRuns:
             user=user,
             submitted_at=run_submitted_at,
         )
-        run_spec = RunSpec.parse_raw(run.run_spec)
+        run_spec = RunSpec.model_validate_json(run.run_spec)
         await create_job(
             session=session,
             run=run,
@@ -863,10 +937,11 @@ class TestListRuns:
         job2 = await create_job(
             session=session,
             run=run,
+            submission_num=1,
             submitted_at=run_submitted_at,
             last_processed_at=run_submitted_at,
         )
-        job2_spec = JobSpec.parse_raw(job2.job_spec_data)
+        job2_spec = JobSpec.model_validate_json(job2.job_spec_data)
         response = await client.post(
             "/api/runs/list",
             headers=get_auth_headers(user.token),
@@ -879,21 +954,21 @@ class TestListRuns:
                 "project_name": project.name,
                 "user": user.name,
                 "fleet": None,
-                "submitted_at": run_submitted_at.isoformat(),
-                "last_processed_at": run_submitted_at.isoformat(),
+                "submitted_at": render_datetime_as_api(run_submitted_at),
+                "last_processed_at": render_datetime_as_api(run_submitted_at),
                 "status": "submitted",
                 "status_message": "submitted",
-                "run_spec": run_spec.dict(),
+                "run_spec": run_spec.model_dump(),
                 "jobs": [
                     {
-                        "job_spec": job2_spec.dict(),
+                        "job_spec": job2_spec.model_dump(),
                         "job_submissions": [
                             {
                                 "id": str(job2.id),
-                                "submission_num": 0,
+                                "submission_num": 1,
                                 "deployment_num": 0,
-                                "submitted_at": run_submitted_at.isoformat(),
-                                "last_processed_at": run_submitted_at.isoformat(),
+                                "submitted_at": render_datetime_as_api(run_submitted_at),
+                                "last_processed_at": render_datetime_as_api(run_submitted_at),
                                 "finished_at": None,
                                 "inactivity_secs": None,
                                 "status": "submitted",
@@ -905,16 +980,18 @@ class TestListRuns:
                                 "job_provisioning_data": None,
                                 "job_runtime_data": None,
                                 "probes": [],
+                                "image_pull_progress": None,
                             }
                         ],
+                        "job_connection_info": None,
                     }
                 ],
                 "latest_job_submission": {
                     "id": str(job2.id),
-                    "submission_num": 0,
+                    "submission_num": 1,
                     "deployment_num": 0,
-                    "submitted_at": run_submitted_at.isoformat(),
-                    "last_processed_at": run_submitted_at.isoformat(),
+                    "submitted_at": render_datetime_as_api(run_submitted_at),
+                    "last_processed_at": render_datetime_as_api(run_submitted_at),
                     "finished_at": None,
                     "inactivity_secs": None,
                     "status": "submitted",
@@ -926,8 +1003,9 @@ class TestListRuns:
                     "job_provisioning_data": None,
                     "job_runtime_data": None,
                     "probes": [],
+                    "image_pull_progress": None,
                 },
-                "cost": 0,
+                "cost": 0.0,
                 "service": None,
                 "deployment_num": 0,
                 "termination_reason": None,
@@ -936,6 +1014,94 @@ class TestListRuns:
                 "next_triggered_at": None,
             },
         ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_limits_job_submissions_by_default(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(
+            session=session,
+            project_id=project.id,
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+        )
+        submissions_num = MAX_JOB_SUBMISSIONS_LIMIT + 2
+        for submission_num in range(submissions_num):
+            await create_job(
+                session=session,
+                run=run,
+                submission_num=submission_num,
+            )
+        response = await client.post(
+            "/api/runs/list",
+            headers=get_auth_headers(user.token),
+            json={},
+        )
+        assert response.status_code == 200, response.json()
+        runs = response.json()
+        assert len(runs) == 1
+        job_submissions = runs[0]["jobs"][0]["job_submissions"]
+        assert len(job_submissions) == MAX_JOB_SUBMISSIONS_LIMIT
+        assert [js["submission_num"] for js in job_submissions] == list(
+            range(submissions_num - MAX_JOB_SUBMISSIONS_LIMIT, submissions_num)
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "client_version,expected_probes",
+        [
+            ("0.20.7", []),
+            ("0.20.8", None),
+            (None, None),
+        ],
+    )
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_patches_service_configuration_probes_for_old_clients(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        client_version: Optional[str],
+        expected_probes: Optional[list],
+    ) -> None:
+        user = await create_user(session=session)
+        project = await create_project(session=session, owner=user)
+        repo = await create_repo(session=session, project_id=project.id)
+
+        service_conf = ServiceConfiguration(
+            commands=["echo hello"],
+            port=80,
+            probes=None,  # This should be patched to [] for clients prior to 0.20.8
+        )
+        run_spec = get_run_spec(
+            configuration=service_conf,
+            repo_id=repo.name,
+        )
+        await create_run(session=session, project=project, repo=repo, user=user, run_spec=run_spec)
+
+        headers = get_auth_headers(user.token)
+        if client_version is not None:
+            headers["X-API-Version"] = client_version
+        response = await client.post(
+            "/api/runs/list",
+            headers=headers,
+            json={"project_name": project.name},
+        )
+
+        assert response.status_code == 200
+        runs_list = response.json()
+        assert len(runs_list) == 1
+        assert runs_list[0]["run_spec"]["configuration"]["probes"] == expected_probes
 
 
 class TestGetRun:
@@ -1016,6 +1182,353 @@ class TestGetRun:
         assert response.status_code == 200, response.json()
         assert response.json()["id"] == str(run.id)
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "client_version,expected_probes",
+        [
+            ("0.20.7", []),
+            ("0.20.8", None),
+            (None, None),
+        ],
+    )
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_patches_service_configuration_probes_for_old_clients(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        client_version: Optional[str],
+        expected_probes: Optional[list],
+    ) -> None:
+        user = await create_user(session=session)
+        project = await create_project(session=session, owner=user)
+        repo = await create_repo(session=session, project_id=project.id)
+
+        service_conf = ServiceConfiguration(
+            commands=["echo hello"],
+            port=80,
+            probes=None,  # This should be patched to [] for clients prior to 0.20.8
+        )
+        run_spec = get_run_spec(
+            configuration=service_conf,
+            repo_id=repo.name,
+        )
+        run = await create_run(
+            session=session, project=project, repo=repo, user=user, run_spec=run_spec
+        )
+
+        headers = get_auth_headers(user.token)
+        if client_version is not None:
+            headers["X-API-Version"] = client_version
+        response = await client.post(
+            f"/api/project/{project.name}/runs/get",
+            headers=headers,
+            json={"run_name": run.run_name},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["run_spec"]["configuration"]["probes"] == expected_probes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("ide", "ide_name", "attached_ide_url", "proxied_ide_url_tmpl"),
+        [
+            pytest.param(
+                "vscode",
+                "VS Code",
+                "vscode://vscode-remote/ssh-remote+dev-env/test",
+                "vscode://vscode-remote/ssh-remote+{auth}/test",
+                id="vscode",
+            ),
+            pytest.param(
+                "cursor",
+                "Cursor",
+                "cursor://vscode-remote/ssh-remote+dev-env/test",
+                "cursor://vscode-remote/ssh-remote+{auth}/test",
+                id="cursor",
+            ),
+            pytest.param(
+                "windsurf",
+                "Windsurf",
+                "windsurf://vscode-remote/ssh-remote+dev-env/test",
+                "windsurf://vscode-remote/ssh-remote+{auth}/test",
+                id="windsurf",
+            ),
+            pytest.param(
+                "zed",
+                "Zed",
+                "zed://ssh/dev-env/test",
+                "zed://ssh/{auth}/test",
+                id="zed",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "sshproxy",
+        [
+            pytest.param(False, id="without-sshproxy"),
+            pytest.param(True, id="with-sshproxy"),
+        ],
+    )
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_run_with_job_connection_info_dev_environment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        sshproxy: bool,
+        ide: str,
+        ide_name: str,
+        attached_ide_url: str,
+        proxied_ide_url_tmpl: str,
+    ):
+        monkeypatch.setattr("dstack._internal.server.settings.SSHPROXY_ENABLED", sshproxy)
+        monkeypatch.setattr("dstack._internal.server.settings.SSHPROXY_HOSTNAME", "example.com")
+        monkeypatch.setattr("dstack._internal.server.settings.SSHPROXY_PORT", 2222)
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(
+            session=session,
+            project_id=project.id,
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            run_name="dev-env",
+            configuration=DevEnvironmentConfiguration(ide=ide),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            run_name=run_spec.run_name,
+        )
+        job_runtime_data = get_job_runtime_data(working_dir="/test")
+        job = await create_job(
+            session=session, run=run, status=JobStatus.RUNNING, job_runtime_data=job_runtime_data
+        )
+        response = await client.post(
+            f"/api/project/{project.name}/runs/get",
+            headers=get_auth_headers(user.token),
+            json={"run_name": run.run_name},
+        )
+        assert response.status_code == 200, response.json()
+        proxied_authority = f"{job.id.hex}@example.com:2222"
+        assert response.json()["jobs"][0]["job_connection_info"] == {
+            "ide_name": ide_name,
+            "attached_ide_url": attached_ide_url,
+            "proxied_ide_url": proxied_ide_url_tmpl.format(auth=proxied_authority)
+            if sshproxy
+            else None,
+            "attached_ssh_command": ["ssh", "dev-env"],
+            "proxied_ssh_command": ["ssh", f"{job.id.hex}@example.com", "-p", "2222"]
+            if sshproxy
+            else None,
+            "sshproxy_hostname": "example.com" if sshproxy else None,
+            "sshproxy_port": 2222 if sshproxy else None,
+            "sshproxy_upstream_id": job.id.hex if sshproxy else None,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_run_with_job_connection_info_multi_replica_multi_node_task(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(
+            session=session,
+            project_id=project.id,
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            run_name="test-task",
+            configuration=TaskConfiguration(commands=["sleep inf"]),
+        )
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            run_name=run_spec.run_name,
+        )
+        job_runtime_data = get_job_runtime_data(working_dir="/test")
+        for replica_num in range(2):
+            for job_num in range(2):
+                await create_job(
+                    session=session,
+                    run=run,
+                    # test-task-1-1 is still PULLING, other jobs are RUNNING
+                    status=JobStatus.PULLING if replica_num == job_num == 1 else JobStatus.RUNNING,
+                    job_runtime_data=job_runtime_data,
+                    replica_num=replica_num,
+                    job_num=job_num,
+                )
+        response = await client.post(
+            f"/api/project/{project.name}/runs/get",
+            headers=get_auth_headers(user.token),
+            json={"run_name": run.run_name},
+        )
+        assert response.status_code == 200, response.json()
+        jobs = response.json()["jobs"]
+        common_fields = {
+            "ide_name": None,
+            "attached_ide_url": None,
+            "proxied_ide_url": None,
+            "proxied_ssh_command": None,
+            "sshproxy_hostname": None,
+            "sshproxy_port": None,
+            "sshproxy_upstream_id": None,
+        }
+        assert jobs[0]["job_connection_info"] == {
+            "attached_ssh_command": ["ssh", "test-task"],
+            **common_fields,
+        }
+        assert jobs[1]["job_connection_info"] == {
+            "attached_ssh_command": ["ssh", "test-task-1-0"],
+            **common_fields,
+        }
+        assert jobs[2]["job_connection_info"] == {
+            "attached_ssh_command": ["ssh", "test-task-0-1"],
+            **common_fields,
+        }
+        assert jobs[3]["job_connection_info"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "client_version,expected_fleets",
+        [
+            (
+                "0.20.13",
+                [
+                    "my-fleet",
+                    "other-project/other-fleet",
+                ],
+            ),
+            (
+                "0.20.14",
+                [
+                    {"project": None, "name": "my-fleet"},
+                    {"project": "other-project", "name": "other-fleet"},
+                ],
+            ),
+            (
+                None,
+                [
+                    {"project": None, "name": "my-fleet"},
+                    {"project": "other-project", "name": "other-fleet"},
+                ],
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_patches_fleets_for_old_clients(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        client_version: Optional[str],
+        expected_fleets: list,
+    ) -> None:
+        user = await create_user(session=session)
+        project = await create_project(session=session, owner=user)
+        repo = await create_repo(session=session, project_id=project.id)
+
+        fleets: list[Union[EntityReference, str]] = [
+            EntityReference(project=None, name="my-fleet"),
+            EntityReference(project="other-project", name="other-fleet"),
+        ]
+        run_spec = get_run_spec(
+            configuration=TaskConfiguration(
+                commands=["echo hello"],
+                fleets=fleets,
+            ),
+            repo_id=repo.name,
+            profile=Profile(
+                fleets=fleets,
+            ),
+        )
+        run = await create_run(
+            session=session, project=project, repo=repo, user=user, run_spec=run_spec
+        )
+
+        headers = get_auth_headers(user.token)
+        if client_version is not None:
+            headers["X-API-Version"] = client_version
+        response = await client.post(
+            f"/api/project/{project.name}/runs/get",
+            headers=headers,
+            json={"run_name": run.run_name},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["run_spec"]["configuration"]["fleets"] == expected_fleets
+        assert response.json()["run_spec"]["profile"]["fleets"] == expected_fleets
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "client_version,expected_gateway",
+        [
+            (
+                "0.20.19",
+                "other-project/my-gateway",
+            ),
+            (
+                "0.20.20",
+                {"project": "other-project", "name": "my-gateway"},
+            ),
+            (
+                None,
+                {"project": "other-project", "name": "my-gateway"},
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_patches_service_gateway_for_old_clients(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        client_version: Optional[str],
+        expected_gateway,
+    ) -> None:
+        user = await create_user(session=session)
+        project = await create_project(session=session, owner=user)
+        repo = await create_repo(session=session, project_id=project.id)
+
+        run_spec = get_run_spec(
+            configuration=ServiceConfiguration(
+                commands=["echo hello"],
+                port=80,
+                gateway=EntityReference(project="other-project", name="my-gateway"),
+            ),
+            repo_id=repo.name,
+        )
+        run = await create_run(
+            session=session, project=project, repo=repo, user=user, run_spec=run_spec
+        )
+
+        headers = get_auth_headers(user.token)
+        if client_version is not None:
+            headers["X-API-Version"] = client_version
+        response = await client.post(
+            f"/api/project/{project.name}/runs/get",
+            headers=headers,
+            json={"run_name": run.run_name},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["run_spec"]["configuration"]["gateway"] == expected_gateway
+
 
 class TestGetRunPlan:
     @pytest.mark.asyncio
@@ -1093,6 +1606,116 @@ class TestGetRunPlan:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    @pytest.mark.parametrize(
+        ("body_full_offers", "expected_full_offers"),
+        [
+            pytest.param(None, False, id="omitted-defaults-to-false"),
+            pytest.param(True, True, id="true"),
+            pytest.param(False, False, id="false"),
+        ],
+    )
+    async def test_forwards_full_offers_to_compute_get_offers(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        body_full_offers: Optional[bool],
+        expected_full_offers: bool,
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        await create_fleet(session=session, project=project, spec=fleet_spec)
+        repo = await create_repo(session=session, project_id=project.id)
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=DevEnvironmentConfiguration(ide="vscode"),
+        )
+        body: dict = {"run_spec": json.loads(run_spec.model_dump_json())}
+        if body_full_offers is not None:
+            body["full_offers"] = body_full_offers
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            backend_mock.TYPE = BackendType.AWS
+            get_offers_mock = backend_mock.compute.return_value.get_offers
+            get_offers_mock.return_value = []
+            m.return_value = [backend_mock]
+            response = await client.post(
+                f"/api/project/{project.name}/runs/get_plan",
+                headers=get_auth_headers(user.token),
+                json=body,
+            )
+
+        assert response.status_code == 200, response.json()
+        get_offers_mock.assert_called()
+        # get_offers is called as get_offers(requirements, full_offers)
+        assert all(
+            call_args.args[1] is expected_full_offers
+            for call_args in get_offers_mock.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    @pytest.mark.parametrize(
+        ("body_unallocated_resources", "expected_unallocated_resources"),
+        [
+            pytest.param(None, False, id="omitted-defaults-to-false"),
+            pytest.param(True, True, id="true"),
+            pytest.param(False, False, id="false"),
+        ],
+    )
+    async def test_forwards_unallocated_resources_to_compute_get_offers(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        body_unallocated_resources: Optional[bool],
+        expected_unallocated_resources: bool,
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        await create_fleet(session=session, project=project, spec=fleet_spec)
+        repo = await create_repo(session=session, project_id=project.id)
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=DevEnvironmentConfiguration(ide="vscode"),
+        )
+        body: dict = {"run_spec": json.loads(run_spec.model_dump_json())}
+        if body_unallocated_resources is not None:
+            body["unallocated_resources"] = body_unallocated_resources
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            backend_mock.TYPE = BackendType.AWS
+            get_offers_mock = backend_mock.compute.return_value.get_offers
+            get_offers_mock.return_value = []
+            m.return_value = [backend_mock]
+            response = await client.post(
+                f"/api/project/{project.name}/runs/get_plan",
+                headers=get_auth_headers(user.token),
+                json=body,
+            )
+
+        assert response.status_code == 200, response.json()
+        get_offers_mock.assert_called()
+        # get_offers is called as get_offers(requirements, full_offers, unallocated_resources)
+        assert all(
+            call_args.args[2] is expected_unallocated_resources
+            for call_args in get_offers_mock.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
     async def test_returns_run_plan_privileged_true(
         self,
         test_db,
@@ -1153,6 +1776,206 @@ class TestGetRunPlan:
             )
         assert response.status_code == 200, response.json()
         assert response.json() == run_plan_dict
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_task_with_two_nodes_returns_two_job_plans(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        fleet_spec.configuration.placement = InstanceGroupPlacement.CLUSTER
+        await create_fleet(session=session, project=project, spec=fleet_spec)
+        repo = await create_repo(session=session, project_id=project.id)
+        offer = InstanceOfferWithAvailability(
+            backend=BackendType.AWS,
+            instance=InstanceType(
+                name="instance",
+                resources=Resources(cpus=4, memory_mib=16384, spot=False, gpus=[]),
+            ),
+            region="us",
+            price=1.0,
+            availability=InstanceAvailability.AVAILABLE,
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(commands=["echo hi"], nodes=2),
+        )
+        body = {"run_spec": json.loads(run_spec.model_dump_json())}
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value.get_offers.return_value = [offer]
+            m.return_value = [backend_mock]
+            response = await client.post(
+                f"/api/project/{project.name}/runs/get_plan",
+                headers=get_auth_headers(user.token),
+                json=body,
+            )
+        assert response.status_code == 200, response.json()
+        job_plans = response.json()["job_plans"]
+        assert len(job_plans) == 2
+        assert job_plans[0]["job_spec"]["job_num"] == 0
+        assert job_plans[1]["job_spec"]["job_num"] == 1
+        assert len(job_plans[0]["offers"]) == 1
+        assert job_plans[0]["offers"] == job_plans[1]["offers"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_service_with_two_replica_groups_returns_two_job_plans(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        await create_fleet(session=session, project=project, spec=fleet_spec)
+        repo = await create_repo(session=session, project_id=project.id)
+        gpu_offer = InstanceOfferWithAvailability(
+            backend=BackendType.AWS,
+            instance=InstanceType(
+                name="gpu-instance",
+                resources=Resources(
+                    cpus=8,
+                    memory_mib=32768,
+                    spot=False,
+                    gpus=[Gpu(name="A100", memory_mib=40960)],
+                ),
+            ),
+            region="us",
+            price=5.0,
+            availability=InstanceAvailability.AVAILABLE,
+        )
+        cpu_offer = InstanceOfferWithAvailability(
+            backend=BackendType.AWS,
+            instance=InstanceType(
+                name="cpu-instance",
+                resources=Resources(cpus=4, memory_mib=16384, spot=False, gpus=[]),
+            ),
+            region="us",
+            price=1.0,
+            availability=InstanceAvailability.AVAILABLE,
+        )
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=ServiceConfiguration(
+                port=8080,
+                gateway=False,
+                replicas=[
+                    ReplicaGroup(
+                        name="gpu-group",
+                        count=Range[int](min=2, max=2),
+                        resources=ResourcesSpec(gpu=GPUSpec()),
+                        commands=["python server.py"],
+                    ),
+                    ReplicaGroup(
+                        name="cpu-group",
+                        count=Range[int](min=1, max=1),
+                        resources=ResourcesSpec(gpu=None),
+                        commands=["python router.py"],
+                    ),
+                ],
+            ),
+        )
+        body = {"run_spec": json.loads(run_spec.model_dump_json())}
+
+        def offers_by_requirements(
+            requirements: Requirements, full_offers: bool, unallocated_resources: bool
+        ):
+            if (
+                requirements.resources.gpu is not None
+                and requirements.resources.gpu.count.min is not None
+                and requirements.resources.gpu.count.min > 0
+            ):
+                return [gpu_offer]
+            return [cpu_offer]
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value.get_offers.side_effect = offers_by_requirements
+            m.return_value = [backend_mock]
+            response = await client.post(
+                f"/api/project/{project.name}/runs/get_plan",
+                headers=get_auth_headers(user.token),
+                json=body,
+            )
+        assert response.status_code == 200, response.json()
+        gpu_job_plan, cpu_job_plan = response.json()["job_plans"]
+        assert gpu_job_plan["offers"][0]["instance"]["resources"]["gpus"] != []
+        assert cpu_job_plan["offers"][0]["instance"]["resources"]["gpus"] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_service_reservation_group_filters_backends_by_reservation_support(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        fleet_spec = get_fleet_spec()
+        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
+        await create_fleet(session=session, project=project, spec=fleet_spec)
+        repo = await create_repo(session=session, project_id=project.id)
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=ServiceConfiguration(
+                port=8080,
+                gateway=False,
+                image="nginx",
+                replicas=[
+                    ReplicaGroup(
+                        name="reserved-group",
+                        count=Range[int](min=1, max=1),
+                        reservation="my-reservation-id",
+                    ),
+                    ReplicaGroup(
+                        count=Range[int](min=1, max=1),
+                        name="unreserved-group",
+                    ),
+                ],
+            ),
+        )
+        body = {"run_spec": json.loads(run_spec.model_dump_json())}
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            aws_backend_mock = Mock()
+            aws_backend_mock.TYPE = BackendType.AWS
+            aws_backend_mock.compute.return_value.get_offers.return_value = [
+                get_instance_offer_with_availability(backend=BackendType.AWS, price=2)
+            ]
+            verda_backend_mock = Mock()
+            verda_backend_mock.TYPE = BackendType.VERDA
+            verda_backend_mock.compute.return_value.get_offers.return_value = [
+                get_instance_offer_with_availability(backend=BackendType.VERDA, price=1)
+            ]
+            m.return_value = [aws_backend_mock, verda_backend_mock]
+
+            response = await client.post(
+                f"/api/project/{project.name}/runs/get_plan",
+                headers=get_auth_headers(user.token),
+                json=body,
+            )
+        assert response.status_code == 200, response.json()
+        reserved_job_plan, unreserved_job_plan = response.json()["job_plans"]
+
+        # Verda offer not included for `reserved-group`, since Verda does not support reservations
+        assert reserved_job_plan["offers"][0]["backend"] == "aws"
+        assert len(reserved_job_plan["offers"]) == 1
+
+        assert unreserved_job_plan["offers"][0]["backend"] == "verda"
+        assert unreserved_job_plan["offers"][1]["backend"] == "aws"
+        assert len(unreserved_job_plan["offers"]) == 2
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -1280,78 +2103,950 @@ class TestGetRunPlan:
         assert response.status_code == 200, response.json()
         assert response.json() == run_plan_dict
 
-    @pytest.mark.parametrize(
-        ("client_version", "expected_availability"),
-        [
-            ("0.20.3", InstanceAvailability.NOT_AVAILABLE),
-            ("0.20.4", InstanceAvailability.NO_BALANCE),
-            (None, InstanceAvailability.NO_BALANCE),
-        ],
-    )
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_replaces_no_balance_with_not_available_for_old_clients(
+    @pytest.mark.parametrize(
+        "for_offers_only",
+        [
+            pytest.param(False, id="run-plan"),
+            pytest.param(True, id="offer-collection"),
+        ],
+    )
+    async def test_returns_run_plan_with_offer_from_imported_fleet(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        for_offers_only: bool,
+    ) -> None:
+        importer_user = await create_user(session, global_role=GlobalRole.USER)
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.USER,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration()),
+        )
+        await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+            instance_num=1,
+            backend=BackendType.REMOTE,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+
+        run_spec = {"configuration": {"type": "dev-environment", "ide": "vscode"}}
+        body = {"run_spec": run_spec, "for_offers_only": for_offers_only}
+        response = await client.post(
+            "/api/project/importer-project/runs/get_plan",
+            headers=get_auth_headers(importer_user.token),
+            json=body,
+        )
+        assert response.status_code == 200, response.json()
+        response_json = response.json()
+        assert response_json["project_name"] == "importer-project"
+        assert response_json["job_plans"][0]["offers"][0]["backend"] == "remote"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_no_offers_if_imported_ssh_fleet_is_empty(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+    ) -> None:
+        importer_user = await create_user(session, global_role=GlobalRole.USER)
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.USER,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration()),
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+
+        run_spec = {"configuration": {"type": "dev-environment", "ide": "vscode"}}
+        body = {"run_spec": run_spec}
+        response = await client.post(
+            "/api/project/importer-project/runs/get_plan",
+            headers=get_auth_headers(importer_user.token),
+            json=body,
+        )
+        assert response.status_code == 200, response.json()
+        response_json = response.json()
+        assert response_json["project_name"] == "importer-project"
+        assert len(response_json["job_plans"][0]["offers"]) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    @pytest.mark.parametrize(
+        ("configured_fleet", "expected_price"),
+        [
+            ("exporter-a/test-fleet", 1.0),
+            ("exporter-b/test-fleet", 2.0),
+            ("importer/test-fleet", 3.0),
+            ("test-fleet", 3.0),
+        ],
+    )
+    async def test_returns_run_plan_offers_from_specified_fleet_across_projects(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        configured_fleet: str,
+        expected_price: float,
+    ) -> None:
+        user = await create_user(session, global_role=GlobalRole.USER)
+        exporter_a = await create_project(session, name="exporter-a", owner=user)
+        exporter_b = await create_project(session, name="exporter-b", owner=user)
+        importer = await create_project(session, name="importer", owner=user)
+        await add_project_member(
+            session=session,
+            project=importer,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        fleet_a = await create_fleet(
+            session=session,
+            project=exporter_a,
+            name="test-fleet",
+            spec=get_fleet_spec(get_ssh_fleet_configuration()),
+        )
+        await create_instance(
+            session=session,
+            project=exporter_a,
+            fleet=fleet_a,
+            backend=BackendType.REMOTE,
+            price=1.0,
+        )
+        fleet_b = await create_fleet(
+            session=session,
+            project=exporter_b,
+            name="test-fleet",
+            spec=get_fleet_spec(get_ssh_fleet_configuration()),
+        )
+        await create_instance(
+            session=session,
+            project=exporter_b,
+            fleet=fleet_b,
+            backend=BackendType.REMOTE,
+            price=2.0,
+        )
+        fleet_importer = await create_fleet(
+            session=session,
+            project=importer,
+            name="test-fleet",
+            spec=get_fleet_spec(get_ssh_fleet_configuration()),
+        )
+        await create_instance(
+            session=session,
+            project=importer,
+            fleet=fleet_importer,
+            backend=BackendType.REMOTE,
+            price=3.0,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_a,
+            importer_projects=[importer],
+            exported_fleets=[fleet_a],
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_b,
+            importer_projects=[importer],
+            exported_fleets=[fleet_b],
+        )
+
+        run_spec = {
+            "configuration": {
+                "type": "dev-environment",
+                "ide": "vscode",
+                "fleets": [configured_fleet],
+            }
+        }
+        body = {"run_spec": run_spec}
+        response = await client.post(
+            "/api/project/importer/runs/get_plan",
+            headers=get_auth_headers(user.token),
+            json=body,
+        )
+        assert response.status_code == 200, response.json()
+        response_json = response.json()
+        assert response_json["project_name"] == "importer"
+        offers = response_json["job_plans"][0]["offers"]
+        assert offers[0]["price"] == expected_price
+        assert len(offers) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_no_offers_if_imported_fleet_specified_without_project_prefix(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+    ) -> None:
+        importer_user = await create_user(session, global_role=GlobalRole.USER)
+        exporter_a = await create_project(session, name="exporter-a")
+        importer = await create_project(session, name="importer", owner=importer_user)
+        await add_project_member(
+            session=session,
+            project=importer,
+            user=importer_user,
+            project_role=ProjectRole.USER,
+        )
+        fleet_a = await create_fleet(
+            session=session,
+            project=exporter_a,
+            name="test-fleet",
+            spec=get_fleet_spec(get_ssh_fleet_configuration()),
+        )
+        await create_instance(
+            session=session,
+            project=exporter_a,
+            fleet=fleet_a,
+            backend=BackendType.REMOTE,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_a,
+            importer_projects=[importer],
+            exported_fleets=[fleet_a],
+        )
+
+        run_spec = {
+            "configuration": {
+                "type": "dev-environment",
+                "ide": "vscode",
+                "fleets": ["test-fleet"],  # won't work, should be exporter-a/test-fleet
+            }
+        }
+        body = {"run_spec": run_spec}
+        response = await client.post(
+            "/api/project/importer/runs/get_plan",
+            headers=get_auth_headers(importer_user.token),
+            json=body,
+        )
+        assert response.status_code == 200, response.json()
+        response_json = response.json()
+        assert response_json["project_name"] == "importer"
+        assert len(response_json["job_plans"][0]["offers"]) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    @pytest.mark.parametrize(
+        ("configuration", "for_offers_only"),
+        [
+            pytest.param({"type": "dev-environment"}, False, id="run-plan"),
+            pytest.param({"type": "dev-environment"}, True, id="offer-collection"),
+            pytest.param(
+                {"type": "dev-environment", "fleets": ["test-fleet"]},
+                True,
+                id="offer-collection-with-fleets",  # `dstack offer --fleet`
+            ),
+        ],
+    )
+    async def test_preserves_backend_specific_offer_order(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        configuration: dict,
+        for_offers_only: bool,
+    ) -> None:
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        await create_fleet(
+            session=session,
+            project=project,
+            spec=get_fleet_spec(conf=get_fleet_configuration(name="test-fleet")),
+        )
+
+        run_spec = get_run_spec(
+            repo_id=repo.name, configuration=parse_run_configuration(configuration)
+        )
+        body = {"run_spec": run_spec.model_dump(), "for_offers_only": for_offers_only}
+
+        backend_mock_aws = Mock()
+        backend_mock_aws.TYPE = BackendType.AWS
+        backend_mock_aws.compute.return_value.get_offers.return_value = [
+            get_instance_offer_with_availability(backend=BackendType.AWS, price=1.0),
+            get_instance_offer_with_availability(backend=BackendType.AWS, price=4.0),
+        ]
+        backend_mock_vastai = Mock()
+        backend_mock_vastai.TYPE = BackendType.VASTAI
+        backend_mock_vastai.compute.return_value.get_offers.return_value = [
+            # not ordered by price - custom order should be preserved
+            get_instance_offer_with_availability(backend=BackendType.VASTAI, price=3.0),
+            get_instance_offer_with_availability(backend=BackendType.VASTAI, price=2.0),
+        ]
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            m.return_value = [backend_mock_aws, backend_mock_vastai]
+            response = await client.post(
+                f"/api/project/{project.name}/runs/get_plan",
+                headers=get_auth_headers(user.token),
+                json=body,
+            )
+
+        assert response.status_code == 200, response.json()
+        offers = [(o["backend"], o["price"]) for o in response.json()["job_plans"][0]["offers"]]
+        expected_offers = [
+            (BackendType.AWS.value, 1.0),
+            (BackendType.VASTAI.value, 3.0),
+            (BackendType.VASTAI.value, 2.0),
+            (BackendType.AWS.value, 4.0),
+        ]
+        assert offers == expected_offers
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_offer_cli_preserves_backend_specific_offer_order_across_fleets(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        await create_fleet(
+            session=session,
+            project=project,
+            spec=get_fleet_spec(
+                conf=get_fleet_configuration(name="fleet-aws", backends=[BackendType.AWS])
+            ),
+        )
+        await create_fleet(
+            session=session,
+            project=project,
+            spec=get_fleet_spec(
+                conf=get_fleet_configuration(name="fleet-vastai", backends=[BackendType.VASTAI])
+            ),
+        )
+
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(
+                commands=[":"],
+                image="scratch",
+                fleets=["fleet-aws", "fleet-vastai"],
+            ),
+        )
+        body = {"run_spec": run_spec.model_dump(), "for_offers_only": True}
+
+        backend_mock_aws = Mock()
+        backend_mock_aws.TYPE = BackendType.AWS
+        backend_mock_aws.compute.return_value.get_offers.return_value = [
+            get_instance_offer_with_availability(backend=BackendType.AWS, price=1.0),
+            get_instance_offer_with_availability(backend=BackendType.AWS, price=4.0),
+        ]
+        backend_mock_vastai = Mock()
+        backend_mock_vastai.TYPE = BackendType.VASTAI
+        backend_mock_vastai.compute.return_value.get_offers.return_value = [
+            # not ordered by price - custom order should be preserved
+            get_instance_offer_with_availability(backend=BackendType.VASTAI, price=3.0),
+            get_instance_offer_with_availability(backend=BackendType.VASTAI, price=2.0),
+        ]
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            m.return_value = [backend_mock_aws, backend_mock_vastai]
+            response = await client.post(
+                f"/api/project/{project.name}/runs/get_plan",
+                headers=get_auth_headers(user.token),
+                json=body,
+            )
+
+        assert response.status_code == 200, response.json()
+        offers = [(o["backend"], o["price"]) for o in response.json()["job_plans"][0]["offers"]]
+        expected_offers = [
+            (BackendType.AWS.value, 1.0),
+            (BackendType.VASTAI.value, 3.0),
+            (BackendType.VASTAI.value, 2.0),
+            (BackendType.AWS.value, 4.0),
+        ]
+        assert offers == expected_offers
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_offer_cli_returns_offers_from_all_specified_fleets(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+    ) -> None:
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+
+        fleet_a = await create_fleet(
+            session=session,
+            project=project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="fleet-a")),
+        )
+        await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet_a,
+            backend=BackendType.REMOTE,
+            price=1.0,
+        )
+        fleet_b = await create_fleet(
+            session=session,
+            project=project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="fleet-b")),
+        )
+        await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet_b,
+            backend=BackendType.REMOTE,
+            price=2.0,
+        )
+        fleet_c = await create_fleet(
+            session=session,
+            project=project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="fleet-c")),
+        )
+        await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet_c,
+            backend=BackendType.REMOTE,
+            price=3.0,
+        )
+
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(
+                commands=[":"],
+                image="scratch",
+                user="root",
+                fleets=["fleet-a", "fleet-b"],
+            ),
+        )
+        response = await client.post(
+            f"/api/project/{project.name}/runs/get_plan",
+            headers=get_auth_headers(user.token),
+            json={"run_spec": run_spec.model_dump(), "for_offers_only": True},
+        )
+
+        assert response.status_code == 200, response.json()
+        offers = response.json()["job_plans"][0]["offers"]
+        assert len(offers) == 2
+        assert [offer["price"] for offer in offers] == [1.0, 2.0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_offer_cli_deduplicates_identical_backend_offers_across_specified_fleets(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+    ) -> None:
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        await create_fleet(
+            session=session,
+            project=project,
+            name="fleet-a",
+            spec=get_fleet_spec(profile=Profile(backends=[BackendType.AWS])),
+        )
+        await create_fleet(
+            session=session,
+            project=project,
+            name="fleet-b",
+            spec=get_fleet_spec(profile=Profile(backends=[BackendType.AWS])),
+        )
+
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(
+                commands=[":"],
+                image="scratch",
+                user="root",
+                fleets=["fleet-a", "fleet-b"],
+            ),
+        )
+        body = {"run_spec": run_spec.model_dump(), "for_offers_only": True}
+
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock_aws = Mock()
+            backend_mock_aws.TYPE = BackendType.AWS
+            backend_mock_aws.compute.return_value.get_offers.return_value = [
+                InstanceOfferWithAvailability(
+                    backend=BackendType.AWS,
+                    instance=InstanceType(
+                        name="instance-aws",
+                        resources=Resources(cpus=2, memory_mib=8192, spot=False, gpus=[]),
+                    ),
+                    region="us",
+                    price=1.0,
+                    backend_data={"provider_data": {"zone": "us-a"}, "labels": ["gpu"]},
+                    availability=InstanceAvailability.AVAILABLE,
+                    availability_zones=["us-a"],
+                )
+            ]
+            m.return_value = [backend_mock_aws]
+
+            response = await client.post(
+                f"/api/project/{project.name}/runs/get_plan",
+                headers=get_auth_headers(user.token),
+                json=body,
+            )
+
+        assert response.status_code == 200, response.json()
+        job_plan = response.json()["job_plans"][0]
+        assert job_plan["total_offers"] == 1
+        assert len(job_plan["offers"]) == 1
+        assert job_plan["offers"][0]["price"] == 1.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_offer_cli_keeps_identical_existing_instances_from_specified_fleets(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+    ) -> None:
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+
+        fleet_a = await create_fleet(
+            session=session,
+            project=project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="fleet-a")),
+        )
+        await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet_a,
+            backend=BackendType.REMOTE,
+            price=1.0,
+        )
+        fleet_b = await create_fleet(
+            session=session,
+            project=project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="fleet-b")),
+        )
+        await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet_b,
+            backend=BackendType.REMOTE,
+            price=1.0,
+        )
+
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(
+                commands=[":"],
+                image="scratch",
+                user="root",
+                fleets=["fleet-a", "fleet-b"],
+            ),
+        )
+        response = await client.post(
+            f"/api/project/{project.name}/runs/get_plan",
+            headers=get_auth_headers(user.token),
+            json={"run_spec": run_spec.model_dump(), "for_offers_only": True},
+        )
+
+        assert response.status_code == 200, response.json()
+        job_plan = response.json()["job_plans"][0]
+        assert job_plan["total_offers"] == 2
+        assert len(job_plan["offers"]) == 2
+        assert [offer["price"] for offer in job_plan["offers"]] == [1.0, 1.0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_offer_cli_without_fleet_keeps_global_offers(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+    ) -> None:
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(
+                commands=[":"],
+                image="scratch",
+                user="root",
+            ),
+        )
+        body = {"run_spec": run_spec.model_dump(), "for_offers_only": True}
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock_aws = Mock()
+            backend_mock_aws.TYPE = BackendType.AWS
+            backend_mock_aws.compute.return_value.get_offers.return_value = [
+                InstanceOfferWithAvailability(
+                    backend=BackendType.AWS,
+                    instance=InstanceType(
+                        name="instance-aws",
+                        resources=Resources(cpus=2, memory_mib=8192, spot=False, gpus=[]),
+                    ),
+                    region="us",
+                    price=1.0,
+                    availability=InstanceAvailability.AVAILABLE,
+                )
+            ]
+            backend_mock_runpod = Mock()
+            backend_mock_runpod.TYPE = BackendType.RUNPOD
+            backend_mock_runpod.compute.return_value.get_offers.return_value = [
+                InstanceOfferWithAvailability(
+                    backend=BackendType.RUNPOD,
+                    instance=InstanceType(
+                        name="instance-runpod",
+                        resources=Resources(cpus=2, memory_mib=8192, spot=False, gpus=[]),
+                    ),
+                    region="us",
+                    price=2.0,
+                    availability=InstanceAvailability.AVAILABLE,
+                )
+            ]
+            m.return_value = [backend_mock_aws, backend_mock_runpod]
+            response = await client.post(
+                f"/api/project/{project.name}/runs/get_plan",
+                headers=get_auth_headers(user.token),
+                json=body,
+            )
+
+        assert response.status_code == 200, response.json()
+        offers = response.json()["job_plans"][0]["offers"]
+        assert [offer["backend"] for offer in offers] == ["aws", "runpod"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_offer_without_fleets_uses_global_offer_collection(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+    ) -> None:
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(
+                commands=[":"],
+                image="scratch",
+                user="root",
+            ),
+        )
+        global_offer = get_instance_offer_with_availability(price=1.0)
+        with (
+            patch(
+                "dstack._internal.server.services.runs.plan.get_non_fleet_offers",
+                new=AsyncMock(return_value=([(Mock(), global_offer)], [])),
+            ) as get_non_fleet_offers_mock,
+            patch(
+                "dstack._internal.server.services.runs.plan.get_offers_in_run_candidate_fleets",
+                new=AsyncMock(
+                    side_effect=AssertionError(
+                        "get_offers_in_run_candidate_fleets should not be called"
+                    )
+                ),
+            ) as get_offers_in_run_candidate_fleets_mock,
+            patch(
+                "dstack._internal.server.services.runs.plan.find_optimal_fleet_with_offers",
+                new=AsyncMock(
+                    side_effect=AssertionError(
+                        "find_optimal_fleet_with_offers should not be called"
+                    )
+                ),
+            ) as find_optimal_fleet_with_offers_mock,
+        ):
+            response = await client.post(
+                f"/api/project/{project.name}/runs/get_plan",
+                headers=get_auth_headers(user.token),
+                json={"run_spec": run_spec.model_dump(), "for_offers_only": True},
+            )
+
+        assert response.status_code == 200, response.json()
+        get_non_fleet_offers_mock.assert_awaited_once()
+        get_offers_in_run_candidate_fleets_mock.assert_not_called()
+        find_optimal_fleet_with_offers_mock.assert_not_called()
+        job_plan = response.json()["job_plans"][0]
+        assert job_plan["total_offers"] == 1
+        assert job_plan["offers"][0]["price"] == 1.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_offer_with_fleets_uses_selected_fleet_offer_collection(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+    ) -> None:
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        selected_fleets = ["fleet-a", "fleet-b"]
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            profile=Profile(name="default", fleets=selected_fleets),
+            configuration=TaskConfiguration(
+                commands=[":"],
+                image="scratch",
+                user="root",
+                fleets=selected_fleets,
+            ),
+        )
+        fleet_offer = get_instance_offer_with_availability(price=2.0)
+        with (
+            patch(
+                "dstack._internal.server.services.runs.plan.get_non_fleet_offers",
+                new=AsyncMock(
+                    side_effect=AssertionError("get_non_fleet_offers should not be called")
+                ),
+            ) as get_non_fleet_offers_mock,
+            patch(
+                "dstack._internal.server.services.runs.plan.get_offers_in_run_candidate_fleets",
+                new=AsyncMock(return_value=([(Mock(), fleet_offer)], [])),
+            ) as get_offers_in_run_candidate_fleets_mock,
+            patch(
+                "dstack._internal.server.services.runs.plan.find_optimal_fleet_with_offers",
+                new=AsyncMock(
+                    side_effect=AssertionError(
+                        "find_optimal_fleet_with_offers should not be called"
+                    )
+                ),
+            ) as find_optimal_fleet_with_offers_mock,
+        ):
+            response = await client.post(
+                f"/api/project/{project.name}/runs/get_plan",
+                headers=get_auth_headers(user.token),
+                json={"run_spec": run_spec.model_dump(), "for_offers_only": True},
+            )
+
+        assert response.status_code == 200, response.json()
+        get_non_fleet_offers_mock.assert_not_called()
+        get_offers_in_run_candidate_fleets_mock.assert_awaited_once()
+        find_optimal_fleet_with_offers_mock.assert_not_called()
+        job_plan = response.json()["job_plans"][0]
+        assert job_plan["total_offers"] == 1
+        assert job_plan["offers"][0]["price"] == 2.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_regular_run_plan_uses_best_fleet_candidate_selection(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+    ) -> None:
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session,
+            project=project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(
+                commands=["echo ok"],
+                image="scratch",
+                user="root",
+            ),
+        )
+        chosen_fleet_offer = get_instance_offer_with_availability(price=3.0)
+        with (
+            patch(
+                "dstack._internal.server.services.runs.plan._select_candidate_fleet_models",
+                new=AsyncMock(return_value=[Mock()]),
+            ) as select_candidate_fleet_models_mock,
+            patch(
+                "dstack._internal.server.services.runs.plan.find_optimal_fleet_with_offers",
+                new=AsyncMock(return_value=(Mock(), [(Mock(), chosen_fleet_offer)], [])),
+            ) as find_optimal_fleet_with_offers_mock,
+            patch(
+                "dstack._internal.server.services.runs.plan.get_non_fleet_offers",
+                new=AsyncMock(
+                    side_effect=AssertionError("get_non_fleet_offers should not be called")
+                ),
+            ) as get_non_fleet_offers_mock,
+            patch(
+                "dstack._internal.server.services.runs.plan.get_offers_in_run_candidate_fleets",
+                new=AsyncMock(
+                    side_effect=AssertionError(
+                        "get_offers_in_run_candidate_fleets should not be called"
+                    )
+                ),
+            ) as get_offers_in_run_candidate_fleets_mock,
+        ):
+            response = await client.post(
+                f"/api/project/{project.name}/runs/get_plan",
+                headers=get_auth_headers(user.token),
+                json={"run_spec": run_spec.model_dump()},
+            )
+
+        assert response.status_code == 200, response.json()
+        select_candidate_fleet_models_mock.assert_awaited_once()
+        find_optimal_fleet_with_offers_mock.assert_awaited_once()
+        get_non_fleet_offers_mock.assert_not_called()
+        get_offers_in_run_candidate_fleets_mock.assert_not_called()
+        job_plan = response.json()["job_plans"][0]
+        assert job_plan["total_offers"] == 1
+        assert job_plan["offers"][0]["price"] == 3.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    @pytest.mark.parametrize(
+        ("client_version", "for_offers_only", "expected_offer_collection"),
+        [
+            pytest.param(None, True, True, id="dev-client-with-flag"),
+            pytest.param("0.21.0", True, True, id="new-client-with-flag"),
+            pytest.param("0.20.30", None, True, id="old-client-without-flag"),
+            pytest.param("0.21.0", None, False, id="new-client-without-flag"),
+            pytest.param(None, None, False, id="dev-client-without-flag"),
+        ],
+    )
+    async def test_collects_offers_only_if_requested_by_for_offers_only(
         self,
         test_db,
         session: AsyncSession,
         client: AsyncClient,
         client_version: Optional[str],
-        expected_availability: InstanceAvailability,
+        for_offers_only: Optional[bool],
+        expected_offer_collection: bool,
     ) -> None:
-        user = await create_user(session=session)
+        """
+        Clients prior to 0.21.0 don't send `for_offers_only`, so the synthetic run spec that
+        `dstack offer` sends still triggers offer collection. For newer clients, the same run
+        spec is planned as a regular run unless `for_offers_only` is set.
+        """
+        user = await create_user(session=session, global_role=GlobalRole.USER)
         project = await create_project(session=session, owner=user)
-        fleet_spec = get_fleet_spec()
-        fleet_spec.configuration.nodes = FleetNodesSpec(min=0, target=0, max=None)
-        await create_fleet(session=session, project=project, spec=fleet_spec)
-        repo = await create_repo(session=session, project_id=project.id)
-        offers = [
-            InstanceOfferWithAvailability(
-                backend=BackendType.AWS,
-                instance=InstanceType(
-                    name="instance-1",
-                    resources=Resources(cpus=1, memory_mib=512, spot=False, gpus=[]),
-                ),
-                region="us",
-                price=1.0,
-                availability=InstanceAvailability.AVAILABLE,
-            ),
-            InstanceOfferWithAvailability(
-                backend=BackendType.AWS,
-                instance=InstanceType(
-                    name="instance-2",
-                    resources=Resources(cpus=2, memory_mib=1024, spot=False, gpus=[]),
-                ),
-                region="us",
-                price=2.0,
-                availability=InstanceAvailability.NO_BALANCE,
-            ),
-        ]
-        run_plan_dict = get_dev_env_run_plan_dict(
-            project_name=project.name,
-            username=user.name,
-            repo_id=repo.name,
-            offers=offers,
-            total_offers=1,
-            max_price=1.0,
+        await add_project_member(
+            session=session,
+            project=project,
+            user=user,
+            project_role=ProjectRole.USER,
         )
-        body = {"run_spec": run_plan_dict["run_spec"]}
+        repo = await create_repo(session=session, project_id=project.id)
+        run_spec = get_run_spec(
+            repo_id=repo.name,
+            configuration=TaskConfiguration(
+                commands=[":"],
+                image="scratch",
+                user="root",
+            ),
+        )
+        body: dict = {"run_spec": run_spec.model_dump()}
+        if for_offers_only is not None:
+            body["for_offers_only"] = for_offers_only
         headers = get_auth_headers(user.token)
         if client_version is not None:
             headers["X-API-Version"] = client_version
-        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
-            backend_mock = Mock()
-            backend_mock.TYPE = BackendType.AWS
-            backend_mock.compute.return_value.get_offers.return_value = offers
-            m.return_value = [backend_mock]
+        offer = get_instance_offer_with_availability(price=1.0)
+        with (
+            patch(
+                "dstack._internal.server.services.runs.plan.get_non_fleet_offers",
+                new=AsyncMock(return_value=([(Mock(), offer)], [])),
+            ) as get_non_fleet_offers_mock,
+            patch(
+                "dstack._internal.server.services.runs.plan._select_candidate_fleet_models",
+                new=AsyncMock(return_value=[Mock()]),
+            ) as select_candidate_fleet_models_mock,
+            patch(
+                "dstack._internal.server.services.runs.plan.find_optimal_fleet_with_offers",
+                new=AsyncMock(return_value=(Mock(), [(Mock(), offer)], [])),
+            ) as find_optimal_fleet_with_offers_mock,
+        ):
             response = await client.post(
                 f"/api/project/{project.name}/runs/get_plan",
                 headers=headers,
                 json=body,
             )
-        offers = response.json()["job_plans"][0]["offers"]
-        assert len(offers) == 2
-        assert offers[0]["availability"] == InstanceAvailability.AVAILABLE.value
-        assert offers[1]["availability"] == expected_availability.value
+
+        assert response.status_code == 200, response.json()
+        assert get_non_fleet_offers_mock.await_count == int(expected_offer_collection)
+        assert select_candidate_fleet_models_mock.await_count == int(not expected_offer_collection)
+        assert find_optimal_fleet_with_offers_mock.await_count == int(
+            not expected_offer_collection
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1378,18 +3073,38 @@ class TestGetRunPlan:
                     commands=["one", "two"],
                     port=80,
                     gateway=None,
+                    auth=True,
                     replicas=Range(min=1, max=1),
                     scaling=None,
                 ),
                 ServiceConfiguration(
                     commands=["one", "two"],
                     port=8080,
-                    gateway="test-gateway",  # not updatable
+                    gateway="test-gateway",
+                    auth=False,  # not updatable
                     replicas=Range(min=2, max=4),
                     scaling=ScalingSpec(metric="rps", target=5),
                 ),
                 "create",
                 id="no-update-service",
+            ),
+            pytest.param(
+                ServiceConfiguration(
+                    commands=["one", "two"],
+                    port=80,
+                    gateway=None,
+                    replicas=Range(min=1, max=1),
+                    scaling=None,
+                ),
+                ServiceConfiguration(
+                    commands=["one", "two"],
+                    port=8080,
+                    gateway="test-gateway",
+                    replicas=Range(min=2, max=4),
+                    scaling=ScalingSpec(metric="rps", target=5),
+                ),
+                "update",
+                id="update-service-gateway",
             ),
             pytest.param(
                 DevEnvironmentConfiguration(ide="vscode", inactivity_duration=False),
@@ -1436,16 +3151,17 @@ class TestGetRunPlan:
             run_spec=run_spec,
         )
         run = run_model_to_run(run_model)
+        set_run_spec_resources_defaults(run.run_spec)
         run_spec.configuration = new_conf
         response = await client.post(
             f"/api/project/{project.name}/runs/get_plan",
             headers=get_auth_headers(user.token),
-            json={"run_spec": run_spec.dict()},
+            json={"run_spec": run_spec.model_dump()},
         )
         assert response.status_code == 200
         response_json = response.json()
         assert response_json["action"] == action
-        assert response_json["current_resource"] == json.loads(run.json())
+        assert response_json["current_resource"] == json.loads(run.model_dump_json())
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("test_db")
@@ -1463,7 +3179,7 @@ class TestGetRunPlan:
         response = await client.post(
             f"/api/project/{project.name}/runs/get_plan",
             headers=get_auth_headers(user.token),
-            json={"run_spec": run_spec.dict()},
+            json={"run_spec": run_spec.model_dump()},
         )
 
         assert response.status_code == 200, response.json()
@@ -1472,6 +3188,65 @@ class TestGetRunPlan:
         await session.refresh(user)
         assert user.ssh_public_key == run_spec_ssh_public_key
         assert user.ssh_private_key is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "client_version,expected_probes",
+        [
+            ("0.20.7", []),
+            ("0.20.8", None),
+            (None, None),
+        ],
+    )
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_patches_service_configuration_probes_for_old_clients(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        client_version: Optional[str],
+        expected_probes: Optional[list],
+    ) -> None:
+        user = await create_user(session=session)
+        project = await create_project(session=session, owner=user)
+        repo = await create_repo(session=session, project_id=project.id)
+
+        service_conf = ServiceConfiguration(
+            commands=["echo hello"],
+            port=80,
+            probes=None,  # This should be patched to [] for clients prior to 0.20.8
+        )
+        run_spec = get_run_spec(
+            run_name="test-service",
+            configuration=service_conf,
+            repo_id=repo.name,
+        )
+        await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_spec=run_spec,
+            run_name="test-service",
+        )
+
+        body = {"run_spec": run_spec.model_dump()}
+        headers = get_auth_headers(user.token)
+        if client_version is not None:
+            headers["X-API-Version"] = client_version
+        response = await client.post(
+            f"/api/project/{project.name}/runs/get_plan",
+            headers=headers,
+            json=body,
+        )
+
+        assert response.status_code == 200
+        run_plan = response.json()
+        assert run_plan["run_spec"]["configuration"]["probes"] == expected_probes
+        assert run_plan["effective_run_spec"]["configuration"]["probes"] == expected_probes
+        assert (
+            run_plan["current_resource"]["run_spec"]["configuration"]["probes"] == expected_probes
+        )
 
 
 class TestApplyPlan:
@@ -1489,9 +3264,14 @@ class TestApplyPlan:
         assert response.status_code == 403
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("privileged", [None, False, True])
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
     async def test_submits_new_run_if_no_current_resource(
-        self, test_db, session: AsyncSession, client: AsyncClient
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        privileged: Optional[bool],
     ):
         user = await create_user(session=session, global_role=GlobalRole.USER)
         project = await create_project(session=session, owner=user)
@@ -1499,7 +3279,7 @@ class TestApplyPlan:
             session=session, project=project, user=user, project_role=ProjectRole.USER
         )
         submitted_at = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc)
-        submitted_at_formatted = "2023-01-02T03:04:00+00:00"
+        submitted_at_formatted = "2023-01-02T03:04:00Z"
         last_processed_at_formatted = submitted_at_formatted
         repo = await create_repo(session=session, project_id=project.id)
         run_dict = get_dev_env_run_dict(
@@ -1512,7 +3292,11 @@ class TestApplyPlan:
             finished_at=None,
             run_name="test-run",
             repo_id=repo.name,
+            privileged=bool(privileged),
         )
+        run_spec = copy.deepcopy(run_dict["run_spec"])
+        if privileged is None:
+            del run_spec["configuration"]["privileged"]
         with patch("dstack._internal.utils.common.get_current_datetime") as datetime_mock:
             datetime_mock.return_value = submitted_at
             response = await client.post(
@@ -1520,7 +3304,7 @@ class TestApplyPlan:
                 headers=get_auth_headers(user.token),
                 json={
                     "plan": {
-                        "run_spec": run_dict["run_spec"],
+                        "run_spec": run_spec,
                         "current_resource": None,
                     },
                     "force": False,
@@ -1537,6 +3321,180 @@ class TestApplyPlan:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_submits_new_run_docker_true(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        submitted_at = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc)
+        submitted_at_formatted = "2023-01-02T03:04:00Z"
+        repo = await create_repo(session=session, project_id=project.id)
+        run_dict = get_dev_env_run_dict(
+            run_id=SomeUUID4Str(),
+            job_id=SomeUUID4Str(),
+            project_name=project.name,
+            username=user.name,
+            submitted_at=submitted_at_formatted,
+            last_processed_at=submitted_at_formatted,
+            finished_at=None,
+            run_name="test-run",
+            repo_id=repo.name,
+            docker=True,
+            privileged=True,  # docker=True automatically enables privileged mode
+        )
+        with patch("dstack._internal.utils.common.get_current_datetime") as datetime_mock:
+            datetime_mock.return_value = submitted_at
+            response = await client.post(
+                f"/api/project/{project.name}/runs/apply",
+                headers=get_auth_headers(user.token),
+                json={
+                    "plan": {
+                        "run_spec": get_submitted_run_spec_dict(run_dict["run_spec"]),
+                        "current_resource": None,
+                    },
+                    "force": False,
+                },
+            )
+        assert response.status_code == 200, response.json()
+        assert response.json() == run_dict
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_submits_new_run_without_run_name(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        run_dict = get_dev_env_run_dict(
+            project_name=project.name,
+            username=user.name,
+            run_name=None,
+            repo_id=repo.name,
+        )
+        response = await client.post(
+            f"/api/project/{project.name}/runs/apply",
+            headers=get_auth_headers(user.token),
+            json={
+                "plan": {
+                    "run_spec": run_dict["run_spec"],
+                    "current_resource": None,
+                },
+                "force": False,
+            },
+        )
+        assert response.status_code == 200, response.json()
+        assert response.json()["run_spec"]["run_name"] is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    @pytest.mark.parametrize(
+        "run_name",
+        [
+            "run_with_underscores",
+            "RunWithUppercase",
+            "тест_ран",
+        ],
+    )
+    async def test_returns_400_if_bad_run_name(
+        self, test_db, session: AsyncSession, client: AsyncClient, run_name: str
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        run_dict = get_dev_env_run_dict(
+            project_name=project.name,
+            username=user.name,
+            run_name=run_name,
+            repo_id=repo.name,
+        )
+        response = await client.post(
+            f"/api/project/{project.name}/runs/apply",
+            headers=get_auth_headers(user.token),
+            json={
+                "plan": {
+                    "run_spec": run_dict["run_spec"],
+                    "current_resource": None,
+                },
+                "force": False,
+            },
+        )
+        assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_400_if_dstack_in_runs_forbidden(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        run_dict = get_dev_env_run_dict(
+            project_name=project.name,
+            username=user.name,
+            run_name="test-run",
+            repo_id=repo.name,
+        )
+        run_dict["run_spec"]["configuration"]["dstack"] = True
+        with patch(
+            "dstack._internal.server.services.runs.server_settings.FORBID_DSTACK_IN_RUNS", True
+        ):
+            response = await client.post(
+                f"/api/project/{project.name}/runs/apply",
+                headers=get_auth_headers(user.token),
+                json={
+                    "plan": {
+                        "run_spec": run_dict["run_spec"],
+                        "current_resource": None,
+                    },
+                    "force": False,
+                },
+            )
+        assert response.status_code == 400
+        assert "forbids" in response.json()["detail"][0]["msg"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_400_if_repo_does_not_exist(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        run_dict = get_dev_env_run_dict(
+            project_name=project.name,
+            username=user.name,
+            repo_id="repo1234",
+        )
+        response = await client.post(
+            f"/api/project/{project.name}/runs/apply",
+            headers=get_auth_headers(user.token),
+            json={
+                "plan": {
+                    "run_spec": run_dict["run_spec"],
+                    "current_resource": None,
+                },
+                "force": False,
+            },
+        )
+        assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
     async def test_updates_run(self, test_db, session: AsyncSession, client: AsyncClient):
         user = await create_user(session=session, global_role=GlobalRole.USER)
         project = await create_project(session=session, owner=user)
@@ -1546,6 +3504,7 @@ class TestApplyPlan:
         repo = await create_repo(session=session, project_id=project.id)
         run_spec = get_run_spec(
             run_name="test-service",
+            configuration_path="old.dstack.yml",
             repo_id=repo.name,
             configuration=ServiceConfiguration(
                 type="service",
@@ -1554,6 +3513,8 @@ class TestApplyPlan:
                 replicas=Range(min=1, max=1),
             ),
         )
+        # set defaults to avoid phantom changes being detected
+        validate_run_spec_and_set_defaults(user, run_spec)
         run_model = await create_run(
             session=session,
             project=project,
@@ -1563,7 +3524,8 @@ class TestApplyPlan:
             run_spec=run_spec,
         )
         run = run_model_to_run(run_model)
-        run_spec.configuration.replicas = Range(min=2, max=2)
+        run_spec.configuration_path = "new.dstack.yml"
+        run_spec.configuration.replicas = Range[int](min=2, max=2)
         response = await client.post(
             f"/api/project/{project.name}/runs/apply",
             headers=get_auth_headers(user.token),
@@ -1575,7 +3537,7 @@ class TestApplyPlan:
                         current_resource=run,
                     ),
                     force=False,
-                ).json()
+                ).model_dump_json()
             ),
         )
         assert response.status_code == 200, response.json()
@@ -1583,8 +3545,15 @@ class TestApplyPlan:
         updated_run = run_model_to_run(run_model)
         assert run.deployment_num == 0
         assert updated_run.deployment_num == 1
+        assert run.run_spec.configuration_path == "old.dstack.yml"
+        assert updated_run.run_spec.configuration_path == "new.dstack.yml"
         assert run.run_spec.configuration.replicas == Range(min=1, max=1)
         assert updated_run.run_spec.configuration.replicas == Range(min=2, max=2)
+        events = await list_events(session)
+        assert len(events) == 1
+        assert events[0].message == (
+            "Run updated. Deployment: 1. Changed fields: configuration_path, configuration.replicas"
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -1608,7 +3577,7 @@ class TestApplyPlan:
                 headers=get_auth_headers(user.token),
                 json={
                     "plan": {
-                        "run_spec": json.loads(run_spec.json()),
+                        "run_spec": json.loads(run_spec.model_dump_json()),
                         "current_resource": None,
                     },
                     "force": False,
@@ -1639,7 +3608,7 @@ class TestApplyPlan:
             headers=get_auth_headers(user.token),
             json={
                 "plan": {
-                    "run_spec": run_spec.dict(),
+                    "run_spec": run_spec.model_dump(),
                     "current_resource": None,
                 },
                 "force": False,
@@ -1653,182 +3622,114 @@ class TestApplyPlan:
         assert user.ssh_public_key == run_spec_ssh_public_key
         assert user.ssh_private_key is not None
 
-
-class TestSubmitRun:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_403_if_not_project_member(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
-        user = await create_user(session=session, global_role=GlobalRole.USER)
-        project = await create_project(session=session, owner=user)
-        response = await client.post(
-            f"/api/project/{project.name}/runs/submit",
-            headers=get_auth_headers(user.token),
-        )
-        assert response.status_code == 403
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("privileged", [None, False, True])
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_submits_run(
-        self, test_db, session: AsyncSession, client: AsyncClient, privileged: Optional[bool]
-    ):
-        user = await create_user(session=session, global_role=GlobalRole.USER)
-        project = await create_project(session=session, owner=user)
-        await add_project_member(
-            session=session, project=project, user=user, project_role=ProjectRole.USER
-        )
-        submitted_at = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc)
-        submitted_at_formatted = "2023-01-02T03:04:00+00:00"
-        last_processed_at_formatted = submitted_at_formatted
-        repo = await create_repo(session=session, project_id=project.id)
-        run_dict = get_dev_env_run_dict(
-            run_id=SomeUUID4Str(),
-            job_id=SomeUUID4Str(),
-            project_name=project.name,
-            username=user.name,
-            submitted_at=submitted_at_formatted,
-            last_processed_at=last_processed_at_formatted,
-            finished_at=None,
-            run_name="test-run",
-            repo_id=repo.name,
-            privileged=bool(privileged),
-        )
-        run_spec = copy.deepcopy(run_dict["run_spec"])
-        if privileged is None:
-            del run_spec["configuration"]["privileged"]
-        body = {"run_spec": run_spec}
-        with patch("dstack._internal.utils.common.get_current_datetime") as datetime_mock:
-            datetime_mock.return_value = submitted_at
-            response = await client.post(
-                f"/api/project/{project.name}/runs/submit",
-                headers=get_auth_headers(user.token),
-                json=body,
-            )
-        assert response.status_code == 200, response.json()
-        assert response.json() == run_dict
-        res = await session.execute(select(RunModel))
-        run = res.scalar()
-        assert run is not None
-        res = await session.execute(select(JobModel))
-        job = res.scalar()
-        assert job is not None
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_submits_run_docker_true(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
-        user = await create_user(session=session, global_role=GlobalRole.USER)
-        project = await create_project(session=session, owner=user)
-        await add_project_member(
-            session=session, project=project, user=user, project_role=ProjectRole.USER
-        )
-        submitted_at = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc)
-        submitted_at_formatted = "2023-01-02T03:04:00+00:00"
-        last_processed_at_formatted = submitted_at_formatted
-        repo = await create_repo(session=session, project_id=project.id)
-        run_dict = get_dev_env_run_dict(
-            run_id=SomeUUID4Str(),
-            job_id=SomeUUID4Str(),
-            project_name=project.name,
-            username=user.name,
-            submitted_at=submitted_at_formatted,
-            last_processed_at=last_processed_at_formatted,
-            finished_at=None,
-            run_name="test-run",
-            repo_id=repo.name,
-            docker=True,
-            privileged=True,  # docker=True automatically enables privileged mode
-        )
-        body = {"run_spec": run_dict["run_spec"]}
-        with patch("dstack._internal.utils.common.get_current_datetime") as datetime_mock:
-            datetime_mock.return_value = submitted_at
-            response = await client.post(
-                f"/api/project/{project.name}/runs/submit",
-                headers=get_auth_headers(user.token),
-                json=body,
-            )
-        assert response.status_code == 200, response.json()
-        assert response.json() == run_dict
-        res = await session.execute(select(RunModel))
-        run = res.scalar()
-        assert run is not None
-        res = await session.execute(select(JobModel))
-        job = res.scalar()
-        assert job is not None
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_submits_run_without_run_name(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
-        user = await create_user(session=session, global_role=GlobalRole.USER)
-        project = await create_project(session=session, owner=user)
-        await add_project_member(
-            session=session, project=project, user=user, project_role=ProjectRole.USER
-        )
-        repo = await create_repo(session=session, project_id=project.id)
-        run_dict = get_dev_env_run_dict(
-            project_name=project.name,
-            username=user.name,
-            run_name=None,
-            repo_id=repo.name,
-        )
-        body = {"run_spec": run_dict["run_spec"]}
-        response = await client.post(
-            f"/api/project/{project.name}/runs/submit",
-            headers=get_auth_headers(user.token),
-            json=body,
-        )
-        assert response.status_code == 200
-        assert response.json()["run_spec"]["run_name"] is not None
-        res = await session.execute(select(RunModel))
-        run = res.scalar()
-        assert run is not None
-        res = await session.execute(select(JobModel))
-        job = res.scalar()
-        assert job is not None
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
     @pytest.mark.parametrize(
-        "run_name",
+        "client_version,expected_probes",
         [
-            "run_with_underscores",
-            "RunWithUppercase",
-            "тест_ран",
+            ("0.20.7", []),  # Prior to 0.20.8, probes=None should be patched to []
+            ("0.20.8", None),  # 0.20.8 and later should keep probes=None
+            (None, None),  # None client version should keep probes=None
         ],
     )
-    async def test_returns_400_if_bad_run_name(
-        self, test_db, session: AsyncSession, client: AsyncClient, run_name: str
-    ):
-        user = await create_user(session=session, global_role=GlobalRole.USER)
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_patches_service_configuration_probes_for_old_clients(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        client_version: Optional[str],
+        expected_probes: Optional[list],
+    ) -> None:
+        user = await create_user(session=session)
         project = await create_project(session=session, owner=user)
-        await add_project_member(
-            session=session, project=project, user=user, project_role=ProjectRole.USER
-        )
         repo = await create_repo(session=session, project_id=project.id)
-        run_dict = get_dev_env_run_dict(
-            project_name=project.name,
-            username=user.name,
-            run_name=run_name,
+
+        service_conf = ServiceConfiguration(
+            commands=["echo hello"],
+            port=80,
+            probes=None,  # This should be patched to [] for clients prior to 0.20.8
+        )
+        run_spec = get_run_spec(
+            run_name="test-service",
+            configuration=service_conf,
             repo_id=repo.name,
         )
-        body = {"run_spec": run_dict["run_spec"]}
-        with patch("uuid.uuid4") as uuid_mock:
-            uuid_mock.return_value = UUID(run_dict["id"])
-            response = await client.post(
-                f"/api/project/{project.name}/runs/submit",
-                headers=get_auth_headers(user.token),
-                json=body,
-            )
-        assert response.status_code == 400
+
+        headers = get_auth_headers(user.token)
+        if client_version is not None:
+            headers["X-API-Version"] = client_version
+        response = await client.post(
+            f"/api/project/{project.name}/runs/apply",
+            headers=headers,
+            json={
+                "plan": {
+                    "run_spec": run_spec.model_dump(),
+                    "current_resource": None,
+                },
+                "force": False,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["run_spec"]["configuration"]["probes"] == expected_probes
+
+
+@pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+class TestApplyPlanServiceGatewayUpdate:
+    async def _create_service_run(
+        self,
+        session: AsyncSession,
+        project,
+        repo,
+        user,
+        gateway=None,
+        gateway_field=None,
+    ) -> Tuple[RunModel, RunSpec]:
+        run_spec = get_run_spec(
+            run_name="test-service",
+            repo_id=repo.name,
+            configuration=ServiceConfiguration(
+                type="service",
+                commands=["one", "two"],
+                port=80,
+                gateway=gateway_field,
+                replicas=Range(min=1, max=1),
+            ),
+        )
+        validate_run_spec_and_set_defaults(user, run_spec)
+        run_model = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            run_name=run_spec.run_name,
+            run_spec=run_spec,
+            gateway=gateway,
+        )
+        return run_model, run_spec
+
+    async def _apply(
+        self,
+        client: AsyncClient,
+        project,
+        user,
+        run_model: RunModel,
+        run_spec: RunSpec,
+    ):
+        run = run_model_to_run(run_model)
+        return await client.post(
+            f"/api/project/{project.name}/runs/apply",
+            headers=get_auth_headers(user.token),
+            json=json.loads(
+                ApplyRunPlanRequest(
+                    plan=ApplyRunPlanInput(run_spec=run_spec, current_resource=run),
+                    force=False,
+                ).model_dump_json()
+            ),
+        )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_400_if_repo_does_not_exist(
+    async def test_assigns_to_specified_gateway_on_field_change(
         self, test_db, session: AsyncSession, client: AsyncClient
     ):
         user = await create_user(session=session, global_role=GlobalRole.USER)
@@ -1836,18 +3737,299 @@ class TestSubmitRun:
         await add_project_member(
             session=session, project=project, user=user, project_role=ProjectRole.USER
         )
-        run_dict = get_dev_env_run_dict(
-            project_name=project.name,
-            username=user.name,
-            repo_id="repo1234",
+        repo = await create_repo(session=session, project_id=project.id)
+        backend = await create_backend(session=session, project_id=project.id)
+        gateway = await create_gateway(
+            session=session,
+            project_id=project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="my-gateway",
+            wildcard_domain="my-gateway.example",
         )
-        body = {"run_spec": run_dict["run_spec"]}
-        response = await client.post(
-            f"/api/project/{project.name}/runs/submit",
-            headers=get_auth_headers(user.token),
-            json=body,
+        await create_gateway_replica(session=session, backend=backend, gateway_id=gateway.id)
+
+        run_model, run_spec = await self._create_service_run(session, project, repo, user)
+        run_spec.configuration.gateway = "my-gateway"
+
+        response = await self._apply(client, project, user, run_model, run_spec)
+        assert response.status_code == 200, response.json()
+        assert response.json()["service"]["url"] == "https://test-service.my-gateway.example"
+        await session.refresh(run_model)
+        assert run_model.gateway_id == gateway.id
+        event_messages = {e.message for e in await list_events(session)}
+        assert "Service assigned to gateway" in event_messages
+
+    @pytest.mark.asyncio
+    async def test_reassigns_between_specific_gateways_on_field_change(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
         )
-        assert response.status_code == 400
+        repo = await create_repo(session=session, project_id=project.id)
+        backend = await create_backend(session=session, project_id=project.id)
+        old_gateway = await create_gateway(
+            session=session,
+            project_id=project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="old-gateway",
+            wildcard_domain="old-gateway.example",
+        )
+        await create_gateway_replica(session=session, backend=backend, gateway_id=old_gateway.id)
+        new_gateway = await create_gateway(
+            session=session,
+            project_id=project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="new-gateway",
+            wildcard_domain="new-gateway.example",
+        )
+        await create_gateway_replica(session=session, backend=backend, gateway_id=new_gateway.id)
+
+        run_model, run_spec = await self._create_service_run(
+            session, project, repo, user, gateway=old_gateway, gateway_field="old-gateway"
+        )
+        run_spec.configuration.gateway = "new-gateway"
+
+        response = await self._apply(client, project, user, run_model, run_spec)
+        assert response.status_code == 200, response.json()
+        assert response.json()["service"]["url"] == "https://test-service.new-gateway.example"
+        await session.refresh(run_model)
+        assert run_model.gateway_id == new_gateway.id
+
+    @pytest.mark.asyncio
+    async def test_unassigns_gateway_when_field_changes_to_false(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user, name="test-project")
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        backend = await create_backend(session=session, project_id=project.id)
+        gateway = await create_gateway(
+            session=session,
+            project_id=project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="my-gateway",
+            wildcard_domain="my-gateway.example",
+        )
+        await create_gateway_replica(session=session, backend=backend, gateway_id=gateway.id)
+
+        run_model, run_spec = await self._create_service_run(
+            session, project, repo, user, gateway=gateway, gateway_field="my-gateway"
+        )
+        run_spec.configuration.gateway = False
+
+        response = await self._apply(client, project, user, run_model, run_spec)
+        assert response.status_code == 200, response.json()
+        assert response.json()["service"]["url"] == "/proxy/services/test-project/test-service/"
+        await session.refresh(run_model)
+        assert run_model.gateway_id is None
+        event_messages = {e.message for e in await list_events(session)}
+        assert "Service assigned to run without a gateway" in event_messages
+
+    @pytest.mark.asyncio
+    async def test_reassigns_to_default_gateway_when_field_changes_to_true(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        backend = await create_backend(session=session, project_id=project.id)
+        default_gateway = await create_gateway(
+            session=session,
+            project_id=project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="default-gateway",
+            wildcard_domain="default-gateway.example",
+        )
+        await create_gateway_replica(
+            session=session, backend=backend, gateway_id=default_gateway.id
+        )
+        project.default_gateway_id = default_gateway.id
+        await session.commit()
+
+        run_model, run_spec = await self._create_service_run(
+            session, project, repo, user, gateway_field=False
+        )
+        run_spec.configuration.gateway = True
+
+        response = await self._apply(client, project, user, run_model, run_spec)
+        assert response.status_code == 200, response.json()
+        await session.refresh(run_model)
+        assert run_model.gateway_id == default_gateway.id
+
+    @pytest.mark.asyncio
+    async def test_reassigns_to_default_gateway_when_field_changes_to_true_even_if_assigned(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        backend = await create_backend(session=session, project_id=project.id)
+        gateway = await create_gateway(
+            session=session,
+            project_id=project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="my-gateway",
+            wildcard_domain="my-gateway.example",
+        )
+        await create_gateway_replica(session=session, backend=backend, gateway_id=gateway.id)
+        default_gateway = await create_gateway(
+            session=session,
+            project_id=project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="default-gateway",
+            wildcard_domain="default-gateway.example",
+        )
+        await create_gateway_replica(
+            session=session, backend=backend, gateway_id=default_gateway.id
+        )
+        project.default_gateway_id = default_gateway.id
+        await session.commit()
+
+        run_model, run_spec = await self._create_service_run(
+            session, project, repo, user, gateway=gateway, gateway_field="my-gateway"
+        )
+        run_spec.configuration.gateway = True
+
+        response = await self._apply(client, project, user, run_model, run_spec)
+        assert response.status_code == 200, response.json()
+        await session.refresh(run_model)
+        assert run_model.gateway_id == default_gateway.id
+
+    @pytest.mark.asyncio
+    async def test_no_reassignment_when_gateway_field_unchanged(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        """Changing which gateway is the project's default must not, by itself, move a service
+        configured with `gateway: true` — only an explicit change to the `gateway` field
+        should trigger reassignment."""
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        backend = await create_backend(session=session, project_id=project.id)
+        gateway_a = await create_gateway(
+            session=session,
+            project_id=project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="gateway-a",
+            wildcard_domain="gateway-a.example",
+        )
+        await create_gateway_replica(session=session, backend=backend, gateway_id=gateway_a.id)
+        project.default_gateway_id = gateway_a.id
+        await session.commit()
+
+        run_model, run_spec = await self._create_service_run(
+            session, project, repo, user, gateway=gateway_a, gateway_field=True
+        )
+
+        # The project's default gateway changes, but the run spec's `gateway` field is untouched.
+        gateway_b = await create_gateway(
+            session=session,
+            project_id=project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="gateway-b",
+            wildcard_domain="gateway-b.example",
+        )
+        await create_gateway_replica(session=session, backend=backend, gateway_id=gateway_b.id)
+        project.default_gateway_id = gateway_b.id
+        await session.commit()
+
+        response = await self._apply(client, project, user, run_model, run_spec)
+        assert response.status_code == 200, response.json()
+        await session.refresh(run_model)
+        assert run_model.gateway_id == gateway_a.id
+
+    @pytest.mark.asyncio
+    async def test_rejects_update_to_nonexistent_gateway(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+
+        run_model, run_spec = await self._create_service_run(session, project, repo, user)
+        run_spec.configuration.gateway = "nonexistent-gateway"
+
+        response = await self._apply(client, project, user, run_model, run_spec)
+        assert response.status_code == 400, response.json()
+        await session.refresh(run_model)
+        assert run_model.gateway_id is None
+
+    @pytest.mark.asyncio
+    async def test_rejects_field_change_to_true_when_no_default_gateway(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+
+        run_model, run_spec = await self._create_service_run(
+            session, project, repo, user, gateway_field=False
+        )
+        run_spec.configuration.gateway = True
+
+        response = await self._apply(client, project, user, run_model, run_spec)
+        assert response.status_code == 400, response.json()
+        await session.refresh(run_model)
+        assert run_model.gateway_id is None
+
+    @pytest.mark.asyncio
+    async def test_no_reassignment_when_resolved_gateway_is_unchanged(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        """Even though the literal `gateway` field changes, if it still resolves to the
+        gateway the service is already assigned to (here: no gateway, since no default exists
+        either way), no reassignment should happen — no event, and `service_spec` untouched."""
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+
+        run_model, run_spec = await self._create_service_run(
+            session, project, repo, user, gateway_field=None
+        )
+        assert run_model.service_spec is None
+        run_spec.configuration.gateway = False
+
+        response = await self._apply(client, project, user, run_model, run_spec)
+        assert response.status_code == 200, response.json()
+        await session.refresh(run_model)
+        assert run_model.gateway_id is None
+        assert run_model.service_spec is None
+        event_messages = {e.message for e in await list_events(session)}
+        assert "Service assigned to gateway" not in event_messages
+        assert "Service assigned to run without a gateway" not in event_messages
 
 
 class TestStopRuns:
@@ -2067,14 +4249,7 @@ class TestDeleteRuns:
 
 @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
 class TestSubmitService:
-    @pytest.fixture(autouse=True)
-    def mock_gateway_connections(self) -> Generator[None, None, None]:
-        with patch(
-            "dstack._internal.server.services.gateways.gateway_connections_pool.get_or_add"
-        ) as get_conn_mock:
-            get_conn_mock.return_value.client = Mock()
-            get_conn_mock.return_value.client.return_value = AsyncMock()
-            yield
+    pytestmark = pytest.mark.usefixtures("mock_gateway_connection")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2083,42 +4258,69 @@ class TestSubmitService:
             "specified_gateway_in_run_conf",
             "expected_service_url",
             "expected_model_url",
+            "is_gateway",
+            "model",
         ),
         [
             pytest.param(
                 [("default-gateway", True), ("non-default-gateway", False)],
                 None,
                 "https://test-service.default-gateway.example",
-                "https://gateway.default-gateway.example",
+                "https://test-service.default-gateway.example/v1",
+                True,
+                "test-model",
                 id="submits-to-default-gateway",
             ),
             pytest.param(
                 [("default-gateway", True), ("non-default-gateway", False)],
                 True,
                 "https://test-service.default-gateway.example",
-                "https://gateway.default-gateway.example",
+                "https://test-service.default-gateway.example/v1",
+                True,
+                "test-model",
                 id="submits-to-default-gateway-when-gateway-true",
             ),
             pytest.param(
                 [("default-gateway", True), ("non-default-gateway", False)],
                 "non-default-gateway",
                 "https://test-service.non-default-gateway.example",
-                "https://gateway.non-default-gateway.example",
+                "https://test-service.non-default-gateway.example/v1",
+                True,
+                "test-model",
                 id="submits-to-specified-gateway",
             ),
             pytest.param(
                 [("non-default-gateway", False)],
                 None,
                 "/proxy/services/test-project/test-service/",
-                "/proxy/models/test-project/",
+                "/proxy/services/test-project/test-service/v1",
+                False,
+                "test-model",
                 id="submits-in-server-when-no-default-gateway",
             ),
             pytest.param(
                 [("default-gateway", True)],
                 False,
                 "/proxy/services/test-project/test-service/",
-                "/proxy/models/test-project/",
+                "/proxy/services/test-project/test-service/v1",
+                False,
+                "test-model",
                 id="submits-in-server-when-specified",
+            ),
+            pytest.param(
+                [("default-gateway", True)],
+                None,
+                "https://test-service.default-gateway.example",
+                "https://gateway.default-gateway.example",
+                True,
+                {
+                    "type": "chat",
+                    "name": "test-model",
+                    "format": "tgi",
+                    "chat_template": "test",
+                    "eos_token": "</s>",
+                },
+                id="submits-tgi-model-to-gateway",
             ),
         ],
     )
@@ -2128,9 +4330,11 @@ class TestSubmitService:
         session: AsyncSession,
         client: AsyncClient,
         existing_gateways: List[Tuple[str, bool]],
-        specified_gateway_in_run_conf: str,
+        specified_gateway_in_run_conf: Union[str, bool, None],
         expected_service_url: str,
         expected_model_url: str,
+        is_gateway: bool,
+        model: Union[str, dict],
     ) -> None:
         user = await create_user(session=session, global_role=GlobalRole.USER)
         project = await create_project(session=session, owner=user, name="test-project")
@@ -2140,18 +4344,18 @@ class TestSubmitService:
         repo = await create_repo(session=session, project_id=project.id)
         backend = await create_backend(session=session, project_id=project.id)
         for gateway_name, is_default in existing_gateways:
-            gateway_compute = await create_gateway_compute(
-                session=session,
-                backend_id=backend.id,
-            )
             gateway = await create_gateway(
                 session=session,
                 project_id=project.id,
                 backend_id=backend.id,
-                gateway_compute_id=gateway_compute.id,
                 status=GatewayStatus.RUNNING,
                 name=gateway_name,
                 wildcard_domain=f"{gateway_name}.example",
+            )
+            await create_gateway_replica(
+                session=session,
+                backend=backend,
+                gateway_id=gateway.id,
             )
             if is_default:
                 project.default_gateway_id = gateway.id
@@ -2160,15 +4364,98 @@ class TestSubmitService:
             repo_id=repo.name,
             run_name="test-service",
             gateway=specified_gateway_in_run_conf,
+            model=model,
         )
         response = await client.post(
-            f"/api/project/{project.name}/runs/submit",
+            f"/api/project/{project.name}/runs/apply",
             headers=get_auth_headers(user.token),
-            json={"run_spec": run_spec},
+            json={
+                "plan": {
+                    "run_spec": run_spec,
+                    "current_resource": None,
+                },
+                "force": False,
+            },
         )
         assert response.status_code == 200
         assert response.json()["service"]["url"] == expected_service_url
         assert response.json()["service"]["model"]["base_url"] == expected_model_url
+        res = await session.execute(select(RunModel))
+        run = res.scalar_one()
+        assert (run.gateway_id is not None) == is_gateway
+        event_messages = {e.message for e in await list_events(session)}
+        if is_gateway:
+            assert "Service assigned to gateway" in event_messages
+            assert "Service assigned to run without a gateway" not in event_messages
+        else:
+            assert "Service assigned to gateway" not in event_messages
+            assert "Service assigned to run without a gateway" in event_messages
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("populate_configuration", [True, False])
+    @pytest.mark.parametrize("legacy_replica", [False, True])
+    async def test_submit_to_gateway_by_name(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        populate_configuration: bool,
+        legacy_replica: bool,
+    ) -> None:
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user, name="test-project")
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        backend = await create_backend(session=session, project_id=project.id)
+        gateway = await create_gateway(
+            session=session,
+            project_id=project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="my-gateway",
+            wildcard_domain="my-gateway.example",
+            populate_configuration=populate_configuration,
+        )
+        if legacy_replica:
+            gateway_replica = await create_gateway_replica(
+                session=session,
+                backend=backend,
+                populate_configuration=populate_configuration,
+            )
+            gateway.gateway_replica_id = gateway_replica.id
+            await session.commit()
+        else:
+            gateway_replica = await create_gateway_replica(
+                session=session,
+                backend=backend,
+                gateway_id=gateway.id,
+                populate_configuration=populate_configuration,
+            )
+        run_spec = get_service_run_spec(
+            repo_id=repo.name,
+            run_name="test-service",
+            gateway="my-gateway",
+        )
+        response = await client.post(
+            f"/api/project/{project.name}/runs/apply",
+            headers=get_auth_headers(user.token),
+            json={
+                "plan": {
+                    "run_spec": run_spec,
+                    "current_resource": None,
+                },
+                "force": False,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["service"]["url"] == "https://test-service.my-gateway.example"
+        res = await session.execute(select(RunModel))
+        run = res.scalar_one()
+        assert run.gateway_id is not None
+        await session.refresh(gateway_replica)
+        assert gateway_replica.skip_min_processing_interval
 
     @pytest.mark.asyncio
     async def test_return_error_if_specified_gateway_not_exists(
@@ -2182,14 +4469,23 @@ class TestSubmitService:
         repo = await create_repo(session=session, project_id=project.id)
         run_spec = get_service_run_spec(repo_id=repo.name, gateway="nonexistent")
         response = await client.post(
-            f"/api/project/{project.name}/runs/submit",
+            f"/api/project/{project.name}/runs/apply",
             headers=get_auth_headers(user.token),
-            json={"run_spec": run_spec},
+            json={
+                "plan": {
+                    "run_spec": run_spec,
+                    "current_resource": None,
+                },
+                "force": False,
+            },
         )
         assert response.status_code == 400
         assert response.json() == {
             "detail": [
-                {"msg": "Gateway nonexistent does not exist", "code": "resource_not_exists"}
+                {
+                    "msg": f"Gateway nonexistent does not exist in project {project.name}",
+                    "code": "resource_not_exists",
+                }
             ]
         }
 
@@ -2205,9 +4501,15 @@ class TestSubmitService:
         repo = await create_repo(session=session, project_id=project.id)
         run_spec = get_service_run_spec(repo_id=repo.name, gateway=True)
         response = await client.post(
-            f"/api/project/{project.name}/runs/submit",
+            f"/api/project/{project.name}/runs/apply",
             headers=get_auth_headers(user.token),
-            json={"run_spec": run_spec},
+            json={
+                "plan": {
+                    "run_spec": run_spec,
+                    "current_resource": None,
+                },
+                "force": False,
+            },
         )
         assert response.status_code == 400
         assert response.json() == {
@@ -2217,4 +4519,379 @@ class TestSubmitService:
                     "code": "resource_not_exists",
                 }
             ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_submit_to_foreign_gateway_only_if_imported(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        exporter_user = await create_user(
+            session=session, global_role=GlobalRole.USER, name="exporter_user"
+        )
+        exporter_project = await create_project(
+            session=session, owner=exporter_user, name="exporter-project"
+        )
+        backend = await create_backend(session=session, project_id=exporter_project.id)
+        gateway = await create_gateway(
+            session=session,
+            project_id=exporter_project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="exported-gateway",
+            wildcard_domain="exported-gateway.example",
+        )
+        await create_gateway_replica(session=session, backend=backend, gateway_id=gateway.id)
+
+        importer_user = await create_user(
+            session=session, global_role=GlobalRole.USER, name="importer_user"
+        )
+        importer_project = await create_project(
+            session=session, owner=importer_user, name="importer-project"
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.USER,
+        )
+        importer_repo = await create_repo(session=session, project_id=importer_project.id)
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[],
+            exported_gateways=[gateway],
+        )
+
+        not_importer_user = await create_user(
+            session=session, global_role=GlobalRole.USER, name="not_importer_user"
+        )
+        not_importer_project = await create_project(
+            session=session, owner=not_importer_user, name="not-importer-project"
+        )
+        await add_project_member(
+            session=session,
+            project=not_importer_project,
+            user=not_importer_user,
+            project_role=ProjectRole.USER,
+        )
+        not_importer_repo = await create_repo(session=session, project_id=not_importer_project.id)
+
+        importer_run_spec = get_service_run_spec(
+            repo_id=importer_repo.name,
+            run_name="test-service",
+            gateway="exporter-project/exported-gateway",
+        )
+        response = await client.post(
+            f"/api/project/{importer_project.name}/runs/apply",
+            headers=get_auth_headers(importer_user.token),
+            json={
+                "plan": {
+                    "run_spec": importer_run_spec,
+                    "current_resource": None,
+                },
+                "force": False,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["service"]["url"] == "https://test-service.exported-gateway.example"
+
+        not_importer_run_spec = get_service_run_spec(
+            repo_id=not_importer_repo.name,
+            gateway="exporter-project/exported-gateway",
+        )
+        response = await client.post(
+            f"/api/project/{not_importer_project.name}/runs/apply",
+            headers=get_auth_headers(not_importer_user.token),
+            json={
+                "plan": {
+                    "run_spec": not_importer_run_spec,
+                    "current_resource": None,
+                },
+                "force": False,
+            },
+        )
+        assert response.status_code == 400
+        assert response.json() == {
+            "detail": [
+                {
+                    "msg": "Gateway exporter-project/exported-gateway does not exist in project not-importer-project",
+                    "code": "resource_not_exists",
+                }
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_not_submits_to_default_gateway_if_not_imported(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        gateway_project = await create_project(session=session, owner=user, name="gateway-project")
+        backend = await create_backend(session=session, project_id=gateway_project.id)
+        gateway = await create_gateway(
+            session=session,
+            project_id=gateway_project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+        )
+        await create_gateway_replica(session=session, backend=backend, gateway_id=gateway.id)
+
+        service_project = await create_project(session=session, owner=user, name="service-project")
+        # The project's default_gateway_id may point to the gateway (e.g., if the gateway was
+        # imported previously), but that does not authorize the project to use this gateway if it
+        # is no longer imported.
+        service_project.default_gateway_id = gateway.id
+        await session.commit()
+        await add_project_member(
+            session=session,
+            project=service_project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        repo = await create_repo(session=session, project_id=service_project.id)
+
+        run_spec = get_service_run_spec(
+            repo_id=repo.name,
+            gateway=True,
+        )
+        response = await client.post(
+            f"/api/project/{service_project.name}/runs/apply",
+            headers=get_auth_headers(user.token),
+            json={
+                "plan": {
+                    "run_spec": run_spec,
+                    "current_resource": None,
+                },
+                "force": False,
+            },
+        )
+        assert response.status_code == 400
+        assert response.json() == {
+            "detail": [
+                {
+                    "msg": "The service requires a gateway, but there is no default gateway in the project",
+                    "code": "resource_not_exists",
+                }
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_interpolates_project_name_in_imported_gateway_domain(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        exporter_user = await create_user(
+            session=session, global_role=GlobalRole.USER, name="exporter_user"
+        )
+        exporter_project = await create_project(
+            session=session, owner=exporter_user, name="exporter-project"
+        )
+        backend = await create_backend(session=session, project_id=exporter_project.id)
+        gateway = await create_gateway(
+            session=session,
+            project_id=exporter_project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="exported-gateway",
+            wildcard_domain="${{ run.project_name }}.example.com",
+        )
+        await create_gateway_replica(session=session, backend=backend, gateway_id=gateway.id)
+
+        importer_user = await create_user(
+            session=session, global_role=GlobalRole.USER, name="importer_user"
+        )
+        importer_project = await create_project(
+            session=session, owner=importer_user, name="importer-project"
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.USER,
+        )
+        importer_repo = await create_repo(session=session, project_id=importer_project.id)
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[],
+            exported_gateways=[gateway],
+        )
+
+        run_spec = get_service_run_spec(
+            repo_id=importer_repo.name,
+            run_name="test-service",
+            gateway="exporter-project/exported-gateway",
+        )
+        response = await client.post(
+            f"/api/project/{importer_project.name}/runs/apply",
+            headers=get_auth_headers(importer_user.token),
+            json={
+                "plan": {
+                    "run_spec": run_spec,
+                    "current_resource": None,
+                },
+                "force": False,
+            },
+        )
+        assert response.status_code == 200
+        assert (
+            response.json()["service"]["url"]
+            == "https://test-service.importer-project.example.com"
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_error_if_imported_gateway_domain_has_unknown_variable(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        exporter_user = await create_user(
+            session=session, global_role=GlobalRole.USER, name="exporter_user"
+        )
+        exporter_project = await create_project(
+            session=session, owner=exporter_user, name="exporter-project"
+        )
+        backend = await create_backend(session=session, project_id=exporter_project.id)
+        gateway = await create_gateway(
+            session=session,
+            project_id=exporter_project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="exported-gateway",
+            wildcard_domain="${{ run.unknown_variable }}.example.com",
+        )
+        await create_gateway_replica(session=session, backend=backend, gateway_id=gateway.id)
+
+        importer_user = await create_user(
+            session=session, global_role=GlobalRole.USER, name="importer_user"
+        )
+        importer_project = await create_project(
+            session=session, owner=importer_user, name="importer-project"
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.USER,
+        )
+        importer_repo = await create_repo(session=session, project_id=importer_project.id)
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[],
+            exported_gateways=[gateway],
+        )
+
+        run_spec = get_service_run_spec(
+            repo_id=importer_repo.name,
+            run_name="test-service",
+            gateway="exporter-project/exported-gateway",
+        )
+        response = await client.post(
+            f"/api/project/{importer_project.name}/runs/apply",
+            headers=get_auth_headers(importer_user.token),
+            json={
+                "plan": {
+                    "run_spec": run_spec,
+                    "current_resource": None,
+                },
+                "force": False,
+            },
+        )
+        assert response.status_code == 400
+        assert response.json() == {
+            "detail": [
+                {
+                    "msg": "Cannot interpolate gateway domain name: Failed to interpolate due to missing vars: ['run.unknown_variable']",
+                    "code": "gateway_error",
+                }
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_return_error_if_default_gateway_forbids_new_services(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+    ) -> None:
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user, name="test-project")
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        backend = await create_backend(session=session, project_id=project.id)
+        gateway = await create_gateway(
+            session=session,
+            project_id=project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            wildcard_domain="example.com",
+            forbid_new_services=True,
+        )
+        await create_gateway_replica(session=session, backend=backend, gateway_id=gateway.id)
+        project.default_gateway_id = gateway.id
+        await session.commit()
+
+        response = await client.post(
+            f"/api/project/{project.name}/runs/apply",
+            headers=get_auth_headers(user.token),
+            json={
+                "plan": {
+                    "run_spec": get_service_run_spec(repo_id=repo.name, run_name="test-service"),
+                    "current_resource": None,
+                },
+                "force": False,
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json() == {
+            "detail": [{"msg": "Gateway does not accept new services", "code": "error"}]
+        }
+
+    @pytest.mark.asyncio
+    async def test_return_error_if_explicitly_specified_gateway_forbids_new_services(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+    ) -> None:
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user, name="test-project")
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        repo = await create_repo(session=session, project_id=project.id)
+        backend = await create_backend(session=session, project_id=project.id)
+        gateway = await create_gateway(
+            session=session,
+            project_id=project.id,
+            backend_id=backend.id,
+            status=GatewayStatus.RUNNING,
+            name="restricted-gateway",
+            wildcard_domain="example.com",
+            forbid_new_services=True,
+        )
+        await create_gateway_replica(session=session, backend=backend, gateway_id=gateway.id)
+
+        response = await client.post(
+            f"/api/project/{project.name}/runs/apply",
+            headers=get_auth_headers(user.token),
+            json={
+                "plan": {
+                    "run_spec": get_service_run_spec(
+                        repo_id=repo.name,
+                        run_name="test-service",
+                        gateway="restricted-gateway",
+                    ),
+                    "current_resource": None,
+                },
+                "force": False,
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json() == {
+            "detail": [{"msg": "Gateway does not accept new services", "code": "error"}]
         }

@@ -26,8 +26,7 @@ from dstack._internal.server.testing.common import (
 
 class TestListUsers:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(self, test_db, client: AsyncClient):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/users/list")
         assert response.status_code in [401, 403]
 
@@ -39,7 +38,7 @@ class TestListUsers:
         admin = await create_user(
             session=session,
             name="admin",
-            created_at=datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+            created_at=datetime(2023, 1, 2, 3, 5, tzinfo=timezone.utc),
             global_role=GlobalRole.ADMIN,
         )
         other_user = await create_user(
@@ -61,7 +60,7 @@ class TestListUsers:
             {
                 "id": str(admin.id),
                 "username": admin.name,
-                "created_at": "2023-01-02T03:04:00+00:00",
+                "created_at": "2023-01-02T03:05:00Z",
                 "global_role": admin.global_role,
                 "email": None,
                 "active": True,
@@ -73,7 +72,7 @@ class TestListUsers:
             {
                 "id": str(other_user.id),
                 "username": other_user.name,
-                "created_at": "2023-01-02T03:04:00+00:00",
+                "created_at": "2023-01-02T03:04:00Z",
                 "global_role": other_user.global_role,
                 "email": None,
                 "active": True,
@@ -82,6 +81,162 @@ class TestListUsers:
                 },
                 "ssh_public_key": None,
             },
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_total_count(self, test_db, session: AsyncSession, client: AsyncClient):
+        admin = await create_user(
+            session=session,
+            name="admin",
+            created_at=datetime(2023, 1, 2, 3, 6, tzinfo=timezone.utc),
+            global_role=GlobalRole.ADMIN,
+        )
+        await create_user(
+            session=session,
+            name="user_one",
+            created_at=datetime(2023, 1, 2, 3, 5, tzinfo=timezone.utc),
+            global_role=GlobalRole.USER,
+        )
+        await create_user(
+            session=session,
+            name="deleted_user",
+            created_at=datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+            global_role=GlobalRole.USER,
+            deleted=True,
+        )
+        response = await client.post(
+            "/api/users/list",
+            headers=get_auth_headers(admin.token),
+            json={"limit": 1, "return_total_count": True},
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "total_count": 2,
+            "users": [
+                {
+                    "id": str(admin.id),
+                    "username": admin.name,
+                    "created_at": "2023-01-02T03:06:00Z",
+                    "global_role": admin.global_role,
+                    "email": None,
+                    "active": True,
+                    "permissions": {
+                        "can_create_projects": True,
+                    },
+                    "ssh_public_key": None,
+                }
+            ],
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_paginates_results(self, test_db, session: AsyncSession, client: AsyncClient):
+        admin = await create_user(
+            session=session,
+            name="admin",
+            created_at=datetime(2023, 1, 2, 3, 6, tzinfo=timezone.utc),
+            global_role=GlobalRole.ADMIN,
+        )
+        user_one = await create_user(
+            session=session,
+            name="user_one",
+            created_at=datetime(2023, 1, 2, 3, 5, tzinfo=timezone.utc),
+            global_role=GlobalRole.USER,
+        )
+        await create_user(
+            session=session,
+            name="user_two",
+            created_at=datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+            global_role=GlobalRole.USER,
+        )
+        response = await client.post(
+            "/api/users/list",
+            headers=get_auth_headers(admin.token),
+            json={"limit": 1},
+        )
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "id": str(admin.id),
+                "username": admin.name,
+                "created_at": "2023-01-02T03:06:00Z",
+                "global_role": admin.global_role,
+                "email": None,
+                "active": True,
+                "permissions": {
+                    "can_create_projects": True,
+                },
+                "ssh_public_key": None,
+            }
+        ]
+        response = await client.post(
+            "/api/users/list",
+            headers=get_auth_headers(admin.token),
+            json={
+                "prev_created_at": "2023-01-02T03:06:00Z",
+                "prev_id": str(admin.id),
+                "limit": 1,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "id": str(user_one.id),
+                "username": user_one.name,
+                "created_at": "2023-01-02T03:05:00Z",
+                "global_role": user_one.global_role,
+                "email": None,
+                "active": True,
+                "permissions": {
+                    "can_create_projects": True,
+                },
+                "ssh_public_key": None,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_filters_by_name_pattern(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        admin = await create_user(
+            session=session,
+            name="admin",
+            created_at=datetime(2023, 1, 2, 3, 6, tzinfo=timezone.utc),
+            global_role=GlobalRole.ADMIN,
+        )
+        matching_user = await create_user(
+            session=session,
+            name="alpha_user",
+            created_at=datetime(2023, 1, 2, 3, 5, tzinfo=timezone.utc),
+            global_role=GlobalRole.USER,
+        )
+        await create_user(
+            session=session,
+            name="bravo",
+            created_at=datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+            global_role=GlobalRole.USER,
+        )
+        response = await client.post(
+            "/api/users/list",
+            headers=get_auth_headers(admin.token),
+            json={"name_pattern": "alpha"},
+        )
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "id": str(matching_user.id),
+                "username": matching_user.name,
+                "created_at": "2023-01-02T03:05:00Z",
+                "global_role": matching_user.global_role,
+                "email": None,
+                "active": True,
+                "permissions": {
+                    "can_create_projects": True,
+                },
+                "ssh_public_key": None,
+            }
         ]
 
     @pytest.mark.asyncio
@@ -107,7 +262,7 @@ class TestListUsers:
             {
                 "id": str(other_user.id),
                 "username": other_user.name,
-                "created_at": "2023-01-02T03:04:00+00:00",
+                "created_at": "2023-01-02T03:04:00Z",
                 "global_role": other_user.global_role,
                 "email": None,
                 "active": True,
@@ -121,8 +276,7 @@ class TestListUsers:
 
 class TestGetMyUser:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(self, test_db, client: AsyncClient):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/users/get_my_user")
         assert response.status_code in [401, 403]
 
@@ -161,7 +315,7 @@ class TestGetMyUser:
         assert response.json() == {
             "id": str(user.id),
             "username": user.name,
-            "created_at": "2023-01-02T03:04:00+00:00",
+            "created_at": "2023-01-02T03:04:00Z",
             "global_role": user.global_role,
             "email": None,
             "creds": {"token": user.token.get_plaintext_or_error()},
@@ -199,8 +353,7 @@ class TestGetMyUser:
 
 class TestGetUser:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(self, test_db, client: AsyncClient):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/users/get_user")
         assert response.status_code in [401, 403]
 
@@ -239,7 +392,7 @@ class TestGetUser:
         assert response.json() == {
             "id": str(other_user.id),
             "username": other_user.name,
-            "created_at": "2023-01-02T03:04:00+00:00",
+            "created_at": "2023-01-02T03:04:00Z",
             "global_role": other_user.global_role,
             "email": None,
             "creds": {"token": "1234"},
@@ -254,8 +407,7 @@ class TestGetUser:
 
 class TestCreateUser:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(self, test_db, client: AsyncClient):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/users/create")
         assert response.status_code in [401, 403]
 
@@ -282,7 +434,7 @@ class TestCreateUser:
         assert user_data == {
             "id": "1b0e1b45-2f8c-4ab6-8010-a0d1a3e44e0e",
             "username": "test",
-            "created_at": "2023-01-02T03:04:00+00:00",
+            "created_at": "2023-01-02T03:04:00Z",
             "global_role": "user",
             "email": "test@example.com",
             "active": True,
@@ -320,7 +472,7 @@ class TestCreateUser:
         assert user_data == {
             "id": "1b0e1b45-2f8c-4ab6-8010-a0d1a3e44e0e",
             "username": "Test",
-            "created_at": "2023-01-02T03:04:00+00:00",
+            "created_at": "2023-01-02T03:04:00Z",
             "global_role": "user",
             "email": None,
             "active": True,
@@ -373,8 +525,7 @@ class TestCreateUser:
 
 class TestDeleteUsers:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(self, test_db, client: AsyncClient):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/users/delete")
         assert response.status_code in [401, 403]
 
@@ -483,8 +634,7 @@ class TestDeleteUsers:
 
 class TestRefreshToken:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(self, test_db, client: AsyncClient):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/users/refresh_token")
         assert response.status_code in [401, 403]
 

@@ -14,6 +14,7 @@ from dstack._internal.core.models.users import GlobalRole, ProjectRole
 from dstack._internal.server.models import UserModel
 from dstack._internal.server.services.projects import add_project_member
 from dstack._internal.server.testing.common import (
+    create_export,
     create_fleet,
     create_instance,
     create_instance_health_check,
@@ -22,6 +23,7 @@ from dstack._internal.server.testing.common import (
     get_auth_headers,
     get_fleet_configuration,
     get_fleet_spec,
+    get_ssh_fleet_configuration,
 )
 
 
@@ -268,6 +270,240 @@ class TestListInstances:
         resp = await client.post("/api/instances/list", json={})
         assert resp.status_code in [401, 403]
 
+    @pytest.mark.parametrize("with_project_name_filter", [True, False])
+    async def test_returns_imported_instances_with_include_imported(
+        self, session: AsyncSession, client: AsyncClient, with_project_name_filter: bool
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.USER,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        await create_instance(
+            session=session, project=exporter_project, fleet=fleet, name="exported-fleet-0"
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        local_fleet = await create_fleet(
+            session=session,
+            project=importer_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="local-fleet")),
+        )
+        await create_instance(
+            session=session, project=importer_project, fleet=local_fleet, name="local-fleet-0"
+        )
+        response = await client.post(
+            "/api/instances/list",
+            headers=get_auth_headers(importer_user.token),
+            json={
+                "include_imported": True,
+                "project_names": ["importer-project"] if with_project_name_filter else None,
+            },
+        )
+        assert response.status_code == 200
+        response_json = response.json()
+        response_json.sort(key=lambda i: i["name"])
+        assert len(response_json) == 2
+        assert response_json[0]["name"] == "exported-fleet-0"
+        assert response_json[0]["project_name"] == "exporter-project"
+        assert response_json[0]["fleet_name"] == "exported-fleet"
+        assert response_json[1]["name"] == "local-fleet-0"
+        assert response_json[1]["project_name"] == "importer-project"
+        assert response_json[1]["fleet_name"] == "local-fleet"
+
+    async def test_not_returns_imported_instances_without_include_imported(
+        self, session: AsyncSession, client: AsyncClient
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.USER,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+            name="exported-fleet-0",
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        local_fleet = await create_fleet(
+            session=session,
+            project=importer_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="local-fleet")),
+        )
+        await create_instance(
+            session=session, project=importer_project, fleet=local_fleet, name="local-fleet-0"
+        )
+        response = await client.post(
+            "/api/instances/list",
+            headers=get_auth_headers(importer_user.token),
+            json={},  # No include_imported
+        )
+        assert response.status_code == 200
+        response_json = response.json()
+        assert len(response_json) == 1
+        assert response_json[0]["name"] == "local-fleet-0"
+        assert response_json[0]["project_name"] == "importer-project"
+        assert response_json[0]["fleet_name"] == "local-fleet"
+
+    async def test_returns_imported_instances_once_when_user_member_of_both_projects(
+        self, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session, name="user", global_role=GlobalRole.USER)
+        exporter_project = await create_project(session, name="exporter-project", owner=user)
+        importer_project = await create_project(session, name="importer-project", owner=user)
+        await add_project_member(
+            session=session,
+            project=exporter_project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="shared-fleet")),
+        )
+        await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+            name="shared-fleet-0",
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        local_exporter_fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="local-exporter-fleet")),
+        )
+        await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=local_exporter_fleet,
+            name="local-exported-fleet-0",
+        )
+        local_importer_fleet = await create_fleet(
+            session=session,
+            project=importer_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="local-importer-fleet")),
+        )
+        await create_instance(
+            session=session,
+            project=importer_project,
+            fleet=local_importer_fleet,
+            name="local-importer-fleet-0",
+        )
+        response = await client.post(
+            "/api/instances/list",
+            headers=get_auth_headers(user.token),
+            json={"include_imported": True},
+        )
+        assert response.status_code == 200
+        response_json = response.json()
+        response_json.sort(key=lambda i: i["name"])
+        assert len(response_json) == 3
+        assert response_json[0]["name"] == "local-exported-fleet-0"
+        assert response_json[0]["project_name"] == "exporter-project"
+        assert response_json[0]["fleet_name"] == "local-exporter-fleet"
+        assert response_json[1]["name"] == "local-importer-fleet-0"
+        assert response_json[1]["project_name"] == "importer-project"
+        assert response_json[1]["fleet_name"] == "local-importer-fleet"
+        assert response_json[2]["name"] == "shared-fleet-0"
+        assert response_json[2]["project_name"] == "exporter-project"
+        assert response_json[2]["fleet_name"] == "shared-fleet"
+
+    async def test_returns_instance_once_if_imported_twice(
+        self, session: AsyncSession, client: AsyncClient
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.USER,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+            name="exported-fleet-0",
+        )
+        for name in ["export-1", "export-2"]:
+            await create_export(
+                session=session,
+                exporter_project=exporter_project,
+                importer_projects=[importer_project],
+                exported_fleets=[fleet],
+                name=name,
+            )
+        response = await client.post(
+            "/api/instances/list",
+            headers=get_auth_headers(importer_user.token),
+            json={"include_imported": True},
+        )
+        assert response.status_code == 200
+        response_json = response.json()
+        assert len(response_json) == 1
+        assert response_json[0]["name"] == "exported-fleet-0"
+        assert response_json[0]["project_name"] == "exporter-project"
+        assert response_json[0]["fleet_name"] == "exported-fleet"
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -360,17 +596,17 @@ class TestGetInstanceHealthChecks:
         assert response.json() == {
             "health_checks": [
                 {
-                    "collected_at": "2025-01-01T12:01:00+00:00",
+                    "collected_at": "2025-01-01T12:01:00Z",
                     "status": "failure",
                     "events": [
                         {
-                            "timestamp": "2025-01-01T12:01:00+00:00",
+                            "timestamp": "2025-01-01T12:01:00Z",
                             "status": "failure",
                             "message": "Detected 333 volatile double-bit ECC error(s) in GPU 0.",
                         }
                     ],
                 },
-                {"collected_at": "2025-01-01T12:00:00+00:00", "status": "healthy", "events": []},
+                {"collected_at": "2025-01-01T12:00:00Z", "status": "healthy", "events": []},
             ]
         }
 
@@ -395,3 +631,207 @@ class TestCompatibility:
         )
         # Must convert legacy "Fleet has too many instances" to "max_instances_limit"
         assert resp.json()[0]["termination_reason"] == "max_instances_limit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+class TestGetInstance:
+    async def test_returns_instance_by_id(
+        self, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session, owner=user)
+        await add_project_member(
+            session, project=project, user=user, project_role=ProjectRole.ADMIN
+        )
+        fleet = await create_fleet(session, project)
+        instance = await create_instance(session=session, project=project, fleet=fleet)
+
+        resp = await client.post(
+            f"/api/project/{project.name}/instances/get",
+            headers=get_auth_headers(user.token),
+            json={"id": str(instance.id)},
+        )
+        assert resp.status_code == 200
+        resp_data = resp.json()
+        assert resp_data["id"] == str(instance.id)
+        assert resp_data["project_name"] == project.name
+        assert resp_data["fleet_name"] == fleet.name
+
+    async def test_returns_instance_to_global_admin(
+        self, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        admin = await create_user(session, global_role=GlobalRole.ADMIN, name="global-admin")
+        project = await create_project(session)
+        fleet = await create_fleet(session, project)
+        instance = await create_instance(session=session, project=project, fleet=fleet)
+
+        resp = await client.post(
+            f"/api/project/{project.name}/instances/get",
+            headers=get_auth_headers(admin.token),
+            json={"id": str(instance.id)},
+        )
+        assert resp.status_code == 200
+        resp_data = resp.json()
+        assert resp_data["id"] == str(instance.id)
+
+    async def test_returns_400_if_instance_not_found(
+        self, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session, owner=user)
+        await add_project_member(
+            session, project=project, user=user, project_role=ProjectRole.ADMIN
+        )
+
+        resp = await client.post(
+            f"/api/project/{project.name}/instances/get",
+            headers=get_auth_headers(user.token),
+            json={"id": str(uuid.uuid4())},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"][0]["code"] == "resource_not_exists"
+
+    async def test_returns_400_if_instance_exists_in_different_project(
+        self, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        user = await create_user(session, global_role=GlobalRole.USER)
+
+        project1 = await create_project(session, owner=user, name="p1")
+        project2 = await create_project(session, owner=user, name="p2")
+
+        await add_project_member(
+            session, project=project1, user=user, project_role=ProjectRole.ADMIN
+        )
+        await add_project_member(
+            session, project=project2, user=user, project_role=ProjectRole.ADMIN
+        )
+
+        fleet = await create_fleet(session, project2)
+        instance = await create_instance(session=session, project=project2, fleet=fleet)
+
+        resp = await client.post(
+            f"/api/project/{project1.name}/instances/get",
+            headers=get_auth_headers(user.token),
+            json={"id": str(instance.id)},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"][0]["code"] == "resource_not_exists"
+
+    async def test_returns_403_if_not_project_member(
+        self, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        user = await create_user(session, name="non_member", global_role=GlobalRole.USER)
+        project = await create_project(session)
+        fleet = await create_fleet(session, project)
+        instance = await create_instance(session=session, project=project, fleet=fleet)
+
+        resp = await client.post(
+            f"/api/project/{project.name}/instances/get",
+            headers=get_auth_headers(user.token),
+            json={"id": str(instance.id)},
+        )
+        assert resp.status_code == 403
+
+    async def test_returns_403_if_not_project_member_and_instance_not_exists(
+        self, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        user = await create_user(session, name="non_member", global_role=GlobalRole.USER)
+        project = await create_project(session)
+
+        resp = await client.post(
+            f"/api/project/{project.name}/instances/get",
+            headers=get_auth_headers(user.token),
+            json={"id": str(uuid.uuid4())},
+        )
+        assert resp.status_code == 403
+
+    async def test_returns_imported_instance(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.USER,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        instance = await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        response = await client.post(
+            "/api/project/exporter-project/instances/get",
+            headers=get_auth_headers(importer_user.token),
+            json={"id": str(instance.id)},
+        )
+        assert response.status_code == 200
+        response_json = response.json()
+        assert response_json["id"] == str(instance.id)
+        assert response_json["project_name"] == "exporter-project"
+        assert response_json["fleet_name"] == "exported-fleet"
+
+    async def test_returns_403_on_foreign_instance_if_not_imported(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        not_importer_user = await create_user(
+            session, name="not-importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(
+            session, name="exporter-project", owner=importer_user
+        )
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        not_importer_project = await create_project(
+            session, name="not-importer-project", owner=not_importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=not_importer_project,
+            user=not_importer_user,
+            project_role=ProjectRole.USER,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        instance = await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        response = await client.post(
+            "/api/project/exporter-project/instances/get",
+            headers=get_auth_headers(not_importer_user.token),
+            json={"id": str(instance.id)},
+        )
+        assert response.status_code == 403

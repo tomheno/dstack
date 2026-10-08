@@ -19,6 +19,13 @@ type InstanceHealthResponse struct {
 	DCGM *dcgm.Health `json:"dcgm"`
 }
 
+// InstanceInfoResponse reports facts about the host observed by shim. Fields are
+// omitted if the corresponding fact is not applicable or could not be detected.
+type InstanceInfoResponse struct {
+	GpuVendor        string `json:"gpu_vendor,omitempty"`
+	GpuDriverVersion string `json:"gpu_driver_version,omitempty"`
+}
+
 type TaskListResponse struct {
 	Tasks []*shim.TaskListItem `json:"tasks"`
 }
@@ -29,6 +36,9 @@ type TaskInfoResponse struct {
 	TerminationReason  string             `json:"termination_reason"`
 	TerminationMessage string             `json:"termination_message"`
 	Ports              []shim.PortMapping `json:"ports"`
+
+	ImagePullProgress *shim.ImagePullProgress `json:"image_pull_progress"`
+
 	// The following fields are for debugging only, server doesn't need them
 	ContainerName string   `json:"container_name"`
 	ContainerID   string   `json:"container_id"`

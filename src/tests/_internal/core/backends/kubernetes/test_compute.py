@@ -1,53 +1,94 @@
-import logging
+from unittest.mock import MagicMock, patch
 
-import pytest
-from gpuhunt import AcceleratorVendor
-
-from dstack._internal.core.backends.kubernetes.compute import (
-    _get_amd_gpu_from_node_labels,
-    _get_nvidia_gpu_from_node_labels,
+from dstack._internal.core.backends.kubernetes.compute import KubernetesCompute
+from dstack._internal.core.backends.kubernetes.models import KubeconfigConfig, KubernetesConfig
+from dstack._internal.core.models.backends.base import BackendType
+from dstack._internal.core.models.instances import (
+    Disk,
+    Gpu,
+    InstanceAvailability,
+    InstanceOfferWithAvailability,
+    InstanceType,
+    Resources,
 )
-from dstack._internal.core.models.instances import Gpu
+from dstack._internal.core.models.resources import ResourcesSpec
+from dstack._internal.core.models.runs import Requirements
 
 
-class TestGetNvidiaGPUFromNodeLabels:
-    def test_returns_none_if_no_labels(self):
-        assert _get_nvidia_gpu_from_node_labels({}) is None
-
-    def test_returns_correct_memory_for_different_A100(self):
-        assert _get_nvidia_gpu_from_node_labels(
-            {"nvidia.com/gpu.product": "A100-SXM4-40GB"}
-        ) == Gpu(vendor=AcceleratorVendor.NVIDIA, name="A100", memory_mib=40 * 1024)
-
-        assert _get_nvidia_gpu_from_node_labels(
-            {"nvidia.com/gpu.product": "A100-SXM4-80GB"}
-        ) == Gpu(vendor=AcceleratorVendor.NVIDIA, name="A100", memory_mib=80 * 1024)
-
-
-class TestGetAMDGPUFromNodeLabels:
-    def test_returns_no_gpus_if_no_labels(self):
-        assert _get_amd_gpu_from_node_labels({}) is None
-
-    def test_returns_known_gpu(self):
-        assert _get_amd_gpu_from_node_labels({"beta.amd.com/gpu.device-id.74b5": "4"}) == Gpu(
-            vendor=AcceleratorVendor.AMD, name="MI300X", memory_mib=192 * 1024
+def _compute() -> KubernetesCompute:
+    with patch(
+        "dstack._internal.core.backends.kubernetes.compute.get_clusters_from_backend_config",
+        return_value=[],
+    ):
+        return KubernetesCompute(
+            KubernetesConfig(
+                kubeconfig=KubeconfigConfig(data="mocked", filename="-"),
+                contexts=["ctx"],
+            )
         )
 
-    def test_returns_known_gpu_if_multiple_device_ids_match_the_same_gpu(self):
-        # 4x AMD Instinct MI300X VF + 4x AMD Instinct MI300X
-        labels = {"beta.amd.com/gpu.device-id.74b5": "4", "beta.amd.com/gpu.device-id.74a1": "4"}
-        assert _get_amd_gpu_from_node_labels(labels) == Gpu(
-            vendor=AcceleratorVendor.AMD, name="MI300X", memory_mib=192 * 1024
-        )
 
-    def test_returns_none_if_device_id_is_unknown(self, caplog: pytest.LogCaptureFixture):
-        caplog.set_level(logging.WARNING)
-        assert _get_amd_gpu_from_node_labels({"beta.amd.com/gpu.device-id.ffff": "4"}) is None
-        assert "Unknown AMD GPU device id: FFFF" in caplog.text
+def _node_offer() -> InstanceOfferWithAvailability:
+    return InstanceOfferWithAvailability(
+        backend=BackendType.KUBERNETES,
+        instance=InstanceType(
+            name="ctx-node",
+            resources=Resources(
+                cpus=8,
+                memory_mib=64 * 1024,
+                gpus=[Gpu(name="A100", memory_mib=80 * 1024) for _ in range(4)],
+                spot=False,
+                disk=Disk(size_mib=200 * 1024),
+            ),
+        ),
+        region="ctx",
+        price=0.0,
+        availability=InstanceAvailability.AVAILABLE,
+    )
 
-    def test_returns_none_if_multiple_gpu_models(self, caplog: pytest.LogCaptureFixture):
-        caplog.set_level(logging.WARNING)
-        # 4x AMD Instinct MI300X VF + 4x AMD Instinct MI325X
-        labels = {"beta.amd.com/gpu.device-id.74b5": "4", "beta.amd.com/gpu.device-id.74a5": "4"}
-        assert _get_amd_gpu_from_node_labels(labels) is None
-        assert "Multiple AMD GPU models detected" in caplog.text
+
+def test_get_offers_modifiers_are_skipped_with_full_offers():
+    compute = _compute()
+    requirements = Requirements(resources=ResourcesSpec(cpu="2", memory="8GB", gpu="1"))
+
+    assert compute.get_offers_modifiers(requirements, full_offers=True) == []
+    assert compute.get_offers_modifiers(requirements, full_offers=False) != []
+
+
+def test_get_offers_with_full_offers_keeps_full_node_resources():
+    compute = _compute()
+    compute.get_all_offers_with_availability = MagicMock(return_value=[_node_offer()])
+    # Open-ended requirements so the full node satisfies them without an upper bound.
+    requirements = Requirements(
+        resources=ResourcesSpec(cpu="2..", memory="8GB..", gpu="1..", disk="100GB..")
+    )
+
+    full_offers = list(
+        compute.get_offers(requirements, full_offers=True, unallocated_resources=False)
+    )
+
+    assert len(full_offers) == 1
+    full_resources = full_offers[0].instance.resources
+    assert full_resources.cpus == 8
+    assert full_resources.memory_mib == 64 * 1024
+    assert len(full_resources.gpus) == 4
+    assert full_resources.disk.size_mib == 200 * 1024
+
+
+def test_get_offers_without_full_offers_adjusts_to_requested_slice():
+    compute = _compute()
+    compute.get_all_offers_with_availability = MagicMock(return_value=[_node_offer()])
+    requirements = Requirements(
+        resources=ResourcesSpec(cpu="2..", memory="8GB..", gpu="1..", disk="100GB..")
+    )
+
+    adjusted_offers = list(
+        compute.get_offers(requirements, full_offers=False, unallocated_resources=False)
+    )
+
+    assert len(adjusted_offers) == 1
+    adjusted_resources = adjusted_offers[0].instance.resources
+    assert adjusted_resources.cpus == 2
+    assert adjusted_resources.memory_mib == 8 * 1024
+    assert len(adjusted_resources.gpus) == 1
+    assert adjusted_resources.disk.size_mib == 100 * 1024

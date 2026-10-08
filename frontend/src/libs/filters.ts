@@ -21,6 +21,31 @@ export const tokensToSearchParams = <RequestParamsKeys extends string>(
 
 export type RequestParam = string | { min: number } | { max: number };
 
+export const getNamePatternFilterRequestParams = (filteringText: string, limit: number) => {
+    return {
+        ...(filteringText ? { name_pattern: filteringText } : {}),
+        limit,
+    };
+};
+
+export const getTokenAwareNamePatternFilterRequestParams = <PropertyKey extends string>({
+    filteringText,
+    limit,
+    propertyKey,
+    tokens,
+}: {
+    filteringText: string;
+    limit: number;
+    propertyKey: PropertyKey;
+    tokens: PropertyFilterProps.Query['tokens'];
+}) => {
+    const matchingExistingToken = tokens.some((token) => {
+        return token.propertyKey === propertyKey && typeof token.value === 'string' && token.value === filteringText;
+    });
+
+    return getNamePatternFilterRequestParams(matchingExistingToken ? '' : filteringText, limit);
+};
+
 const convertTokenValueToRequestParam = (token: PropertyFilterProps.Query['tokens'][number]): RequestParam => {
     const { value, operator } = token;
 
@@ -78,16 +103,37 @@ export const EMPTY_QUERY: PropertyFilterProps.Query = {
 export const requestParamsToTokens = <RequestParamsKeys extends string>({
     searchParams,
     filterKeys,
+    defaultFilterValues,
 }: {
     searchParams: URLSearchParams;
     filterKeys: Record<string, RequestParamsKeys>;
+    defaultFilterValues?: Partial<Record<RequestParamsKeys, string | string[]>>;
 }): PropertyFilterProps.Query => {
     const tokens = [];
+    const filterKeysValues = Object.values(filterKeys);
+
+    if (defaultFilterValues) {
+        Object.keys(defaultFilterValues).forEach((defaultFilterKey) => {
+            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+            // @ts-expect-error
+            const defaultFilterValue: string[] = Array.isArray(defaultFilterValues[defaultFilterKey])
+                ? // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+                  // @ts-expect-error
+                  defaultFilterValues[defaultFilterKey]
+                : // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+                  // @ts-expect-error
+                  [defaultFilterValues[defaultFilterKey]];
+
+            defaultFilterValue.forEach((value) => {
+                tokens.push({ propertyKey: defaultFilterKey, operator: '=', value: value });
+            });
+        });
+    }
 
     // eslint-disable-next-line @typescript-eslint/ban-ts-comment
     // @ts-ignore
     for (const [paramKey, paramValue] of searchParams.entries()) {
-        if (Object.values(filterKeys).includes(paramKey)) {
+        if (filterKeysValues.includes(paramKey)) {
             tokens.push({ propertyKey: paramKey, operator: '=', value: paramValue });
         }
     }

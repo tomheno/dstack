@@ -4,10 +4,8 @@ from typing import Any, Dict, List, Optional
 import botocore.client
 import botocore.exceptions
 
-import dstack.version as version
+from dstack._internal import settings
 from dstack._internal.core.backends.aws.models import AWSOSImageConfig
-from dstack._internal.core.backends.base.compute import requires_nvidia_proprietary_kernel_modules
-from dstack._internal.core.consts import DSTACK_OS_IMAGE_WITH_PROPRIETARY_NVIDIA_KERNEL_MODULES
 from dstack._internal.core.errors import BackendError, ComputeError, ComputeResourceNotFoundError
 from dstack._internal.utils.logging import get_logger
 
@@ -31,18 +29,17 @@ def get_image_id_and_username(
         image_name = image.name
         image_owner = image.owner
         username = image.user
-    elif _supported_by_dlami(instance_type):
-        # TODO: Update DLAMI image version from time to time
-        image_name = "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) 20250516"
+    elif gpu_name is not None:
+        # AWS Deep Learning AMIs (DLAMI) support all GPU instance types currently supported by dstack.
+        # dstack's cuda AMI is still built but not used.
+        # It may be used again in case some instance types are not supported by DLAMI.
+        image_name = "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) *"
         image_owner = DLAMI_OWNER_ACCOUNT_ID
         username = "ubuntu"
     else:
-        if gpu_name is None:
-            image_name = f"dstack-{version.base_image}"
-        elif not requires_nvidia_proprietary_kernel_modules(gpu_name):
-            image_name = f"dstack-cuda-{version.base_image}"
-        else:
-            image_name = f"dstack-cuda-{DSTACK_OS_IMAGE_WITH_PROPRIETARY_NVIDIA_KERNEL_MODULES}"
+        image_name = (
+            f"{settings.DSTACK_VM_BASE_IMAGE_PREFIX}dstack-{settings.DSTACK_VM_BASE_IMAGE_VERSION}"
+        )
         image_owner = DSTACK_ACCOUNT_ID
         username = "ubuntu"
     response = ec2_client.describe_images(
@@ -155,6 +152,7 @@ def create_instances_struct(
     max_efa_interfaces: int = 0,
     reservation_id: Optional[str] = None,
     is_capacity_block: bool = False,
+    tenancy: Optional[str] = None,
 ) -> Dict[str, Any]:
     struct: Dict[str, Any] = dict(
         BlockDeviceMappings=[
@@ -196,44 +194,13 @@ def create_instances_struct(
     # AWS allows specifying either NetworkInterfaces for specific subnet_id
     # or instance-level SecurityGroupIds in case of no specific subnet_id, not both.
     if subnet_id is not None:
-        # If the instance type supports multiple cards, we request multiple interfaces only if not allocate_public_ip
-        # due to the limitation: "AssociatePublicIpAddress [...] You cannot specify more than one
-        # network interface in the request".
-        # Error message: "(InvalidParameterCombination) when calling the RunInstances operation:
-        # The associatePublicIPAddress parameter cannot be specified when launching with
-        # multiple network interfaces".
-        # See: https://stackoverflow.com/questions/49882121
-        # If we need more than one card, we should either use Elastic IP (AWS-recommended way) or
-        # create the instance with one interface and add the rest later (the latter is not tested
-        # and may or may not work).
-        struct["NetworkInterfaces"] = [
-            {
-                "AssociatePublicIpAddress": allocate_public_ip,
-                "DeviceIndex": 0,
-                "SubnetId": subnet_id,
-                "Groups": [security_group_id],
-                "InterfaceType": "efa" if max_efa_interfaces > 0 else "interface",
-            },
-        ]
-
-        if max_efa_interfaces > 1 and allocate_public_ip is False:
-            for i in range(1, max_efa_interfaces):
-                # Set to efa-only to use interfaces exclusively for GPU-to-GPU communication
-                interface_type = "efa-only"
-                if instance_type == "p5.48xlarge":
-                    # EFA configuration for P5 instances:
-                    # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-acc-inst-types.html#efa-for-p5
-                    interface_type = "efa" if i % 4 == 0 else "efa-only"
-                struct["NetworkInterfaces"].append(
-                    {
-                        "AssociatePublicIpAddress": allocate_public_ip,
-                        "NetworkCardIndex": i,
-                        "DeviceIndex": 1,
-                        "SubnetId": subnet_id,
-                        "Groups": [security_group_id],
-                        "InterfaceType": interface_type,
-                    }
-                )
+        struct["NetworkInterfaces"] = _create_network_interfaces_struct(
+            instance_type=instance_type,
+            subnet_id=subnet_id,
+            security_group_id=security_group_id,
+            allocate_public_ip=allocate_public_ip,
+            max_efa_interfaces=max_efa_interfaces,
+        )
     else:
         struct["SecurityGroupIds"] = [security_group_id]
 
@@ -246,6 +213,12 @@ def create_instances_struct(
         struct["CapacityReservationSpecification"] = {
             "CapacityReservationTarget": {"CapacityReservationId": reservation_id}
         }
+
+    # A Capacity Reservation created with non-default tenancy (e.g. `dedicated`) only
+    # accepts instances launched with a matching `Placement.Tenancy`. Apply it
+    # automatically so users don't have to configure tenancy explicitly.
+    if tenancy is not None and tenancy != "default":
+        struct.setdefault("Placement", {})["Tenancy"] = tenancy
 
     return struct
 
@@ -373,6 +346,7 @@ def get_subnets_ids_for_vpc(
     """
     If `allocate_public_ip` is True, returns public subnets found in the VPC.
     If `allocate_public_ip` is False, returns subnets with NAT found in the VPC.
+    Returns
     """
     subnets = _get_subnets_by_vpc_id(
         ec2_client=ec2_client,
@@ -423,9 +397,9 @@ def get_availability_zone_by_subnet_id(
 
 
 def get_subnets_availability_zones(
-    ec2_client: botocore.client.BaseClient, subnet_ids: List[str]
+    ec2_client: botocore.client.BaseClient, subnets_ids: List[str]
 ) -> Dict[str, str]:
-    response = ec2_client.describe_subnets(SubnetIds=subnet_ids)
+    response = ec2_client.describe_subnets(SubnetIds=subnets_ids)
     subnet_id_to_az_map = {
         subnet["SubnetId"]: subnet["AvailabilityZone"] for subnet in response["Subnets"]
     }
@@ -640,23 +614,62 @@ def _is_private_subnet_with_internet_egress(
     return False
 
 
-def _supported_by_dlami(instance_type: str) -> bool:
-    # Currently only p3. instances are not supported by DLAMI among GPU instances.
-    return any(
-        instance_type.startswith(family)
-        for family in [
-            "g4dn.",
-            "g5.",
-            "g6.",
-            "gr6.",
-            "g6e.",
-            "p4d.",
-            "p4de.",
-            "p5.",
-            "p5e.",
-            "p6-b200.",
-        ]
-    )
+def _create_network_interfaces_struct(
+    instance_type: str,
+    subnet_id: str,
+    security_group_id: str,
+    allocate_public_ip: bool,
+    max_efa_interfaces: int,
+) -> List[Dict[str, Any]]:
+    # AWS does not auto-assign a public IPv4 to instances launched with multiple network
+    # interfaces ("AssociatePublicIpAddress [...] You cannot specify more than one network
+    # interface in the request"). For multi-EFA instance types (e.g. p4d, p5, p6, trn1), we
+    # therefore launch all EFA NICs without `AssociatePublicIpAddress` and, when
+    # `public_ips: true`, attach an Elastic IP after launch in `update_provisioning_data`.
+    multi_eni = max_efa_interfaces > 1
+    primary_supports_efa = _primary_nic_supports_efa(instance_type)
+    network_interfaces: List[Dict[str, Any]] = [
+        {
+            "AssociatePublicIpAddress": allocate_public_ip and not multi_eni,
+            "DeviceIndex": 0,
+            "SubnetId": subnet_id,
+            "Groups": [security_group_id],
+            "InterfaceType": "efa"
+            if max_efa_interfaces > 0 and primary_supports_efa
+            else "interface",
+        },
+    ]
+
+    if multi_eni:
+        last_card_index = max_efa_interfaces
+        if not primary_supports_efa:
+            last_card_index += 1
+        for i in range(1, last_card_index):
+            # Set to efa-only to use interfaces exclusively for GPU-to-GPU communication
+            interface_type = "efa-only"
+            if instance_type == "p5.48xlarge":
+                # EFA configuration for P5 instances:
+                # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-acc-inst-types.html#efa-for-p5
+                interface_type = "efa" if i % 4 == 0 else "efa-only"
+            network_interfaces.append(
+                {
+                    "AssociatePublicIpAddress": False,
+                    "NetworkCardIndex": i,
+                    "DeviceIndex": 1,
+                    "SubnetId": subnet_id,
+                    "Groups": [security_group_id],
+                    "InterfaceType": interface_type,
+                }
+            )
+    return network_interfaces
+
+
+def _primary_nic_supports_efa(instance_type: str) -> bool:
+    """For most EFA-supported instance types, primary network card (index 0) supports
+    attaching both ENA and EFA. But some may support only one interface (ENA),
+    and all EFA interfaces are placed on the secondary network cards (1..max_efa_interfaces).
+    """
+    return instance_type not in {"p6-b300.48xlarge"}
 
 
 def get_reservation(
@@ -665,8 +678,11 @@ def get_reservation(
     instance_count: int = 0,
     instance_types: Optional[List[str]] = None,
     is_capacity_block: bool = False,
+    active_only: bool = True,
 ) -> Optional[Dict[str, Any]]:
-    filters = [{"Name": "state", "Values": ["active"]}]
+    filters = []
+    if active_only:
+        filters.append({"Name": "state", "Values": ["active"]})
     if instance_types:
         filters.append({"Name": "instance-type", "Values": instance_types})
     try:
@@ -694,7 +710,7 @@ def get_reservation(
     if instance_count > 0 and reservation["AvailableInstanceCount"] < instance_count:
         return None
 
-    if is_capacity_block and reservation["ReservationType"] != "capacity-block":
+    if is_capacity_block and reservation.get("ReservationType") != "capacity-block":
         return None
 
     return reservation

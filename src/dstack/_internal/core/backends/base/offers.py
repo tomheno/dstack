@@ -1,9 +1,11 @@
+from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict
-from typing import Callable, List, Optional, TypeVar
+from typing import Callable, Generic, List, Literal, Optional, TypeVar
+from uuid import UUID
 
 import gpuhunt
-from pydantic import parse_obj_as
+from cachetools import TTLCache
 
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.instances import (
@@ -14,8 +16,8 @@ from dstack._internal.core.models.instances import (
     InstanceType,
     Resources,
 )
-from dstack._internal.core.models.resources import DEFAULT_DISK, CPUSpec, Memory, Range
-from dstack._internal.core.models.runs import Requirements
+from dstack._internal.core.models.resources import DEFAULT_DISK, GPUSpec, Memory, Range
+from dstack._internal.core.models.runs import Job, Requirements, Run
 from dstack._internal.utils.common import get_or_error
 
 # Offers not supported by all dstack versions are hidden behind one or more flags.
@@ -26,8 +28,18 @@ SUPPORTED_GPUHUNT_FLAGS = [
     "gcp-a4",
     "gcp-g4",
     "gcp-dws-calendar-mode",
+    "runpod-cpu",
     "runpod-cluster",
+    "hotaisle-bm",
 ]
+
+
+# NvidiaGPUInfo.name in KNOWN_NVIDIA_GPUS is not unique -- there are multiple variants
+# with the same name but different amount of memory, but Compute Capability of the variants
+# is always the same, so it's safe to use 1:1 mapping
+NVIDIA_GPU_NAME_TO_COMPUTE_CAPABILITY_MAP = {
+    gpu_info.name: gpu_info.compute_capability for gpu_info in gpuhunt.KNOWN_NVIDIA_GPUS
+}
 
 
 def get_catalog_offers(
@@ -37,7 +49,14 @@ def get_catalog_offers(
     configurable_disk_size: Range[Memory] = Range[Memory](min=Memory.parse("1GB"), max=None),
     extra_filter: Optional[Callable[[InstanceOffer], bool]] = None,
     catalog: Optional[gpuhunt.Catalog] = None,
+    catalog_item_filter: Optional[Callable[[gpuhunt.CatalogItem], bool]] = None,
 ) -> List[InstanceOffer]:
+    """
+    Args:
+        catalog_item_filter: applied to raw catalog items before the conversion to
+        `InstanceOffer` models. Use it for filtering that can be done on raw catalog fields
+        to avoid expensive model construction for items that will be discarded.
+    """
     provider = backend.value
     if backend == BackendType.DATACRUNCH:
         provider = BackendType.VERDA.value  # Backward compatibility
@@ -52,6 +71,8 @@ def get_catalog_offers(
     catalog = catalog if catalog is not None else gpuhunt.default_catalog()
     for item in catalog.query(**asdict(q)):
         if locations is not None and item.location not in locations:
+            continue
+        if catalog_item_filter is not None and not catalog_item_filter(item):
             continue
         offer = catalog_item_to_offer(backend, item, requirements, configurable_disk_size)
         if offer is None:
@@ -68,6 +89,8 @@ def catalog_item_to_offer(
     requirements: Optional[Requirements],
     configurable_disk_size: Range[Memory],
 ) -> Optional[InstanceOffer]:
+    # Gpu() keeps validation for vendor normalization.
+    # The rest use construct() to skip redundant validation — data comes from already validated CatalogItem.
     gpus = []
     if item.gpu_count > 0:
         gpu = Gpu(
@@ -83,17 +106,17 @@ def catalog_item_to_offer(
     )
     if disk_size_mib is None:
         return None
-    resources = Resources(
+    resources = Resources.model_construct(
         cpu_arch=item.cpu_arch,
         cpus=item.cpu,
         memory_mib=round(item.memory * 1024),
         gpus=gpus,
         spot=item.spot,
-        disk=Disk(size_mib=disk_size_mib),
+        disk=Disk.model_construct(size_mib=disk_size_mib),
     )
-    return InstanceOffer(
+    return InstanceOffer.model_construct(
         backend=backend,
-        instance=InstanceType(
+        instance=InstanceType.model_construct(
             name=item.instance_name,
             resources=resources,
         ),
@@ -116,6 +139,11 @@ def offer_to_catalog_item(offer: InstanceOffer) -> gpuhunt.CatalogItem:
         gpu_vendor = gpu.vendor
         gpu_name = gpu.name
         gpu_memory = gpu.memory_mib / 1024
+    # Resources.disk.size_mib = 0 -> gpuhunt.CatalogItem.disk_size = None -> gpuhunt.matches()
+    # doesn't check disk size (gpuhunt.QueryFilter.{min_disk_size,max_disk_size} are ignored)
+    disk_size: Optional[float] = None
+    if (disk_size_mib := offer.instance.resources.disk.size_mib) != 0:
+        disk_size = disk_size_mib / 1024
     return gpuhunt.CatalogItem(
         provider=offer.backend.value,
         instance_name=offer.instance.name,
@@ -129,7 +157,7 @@ def offer_to_catalog_item(offer: InstanceOffer) -> gpuhunt.CatalogItem:
         gpu_name=gpu_name,
         gpu_memory=gpu_memory,
         spot=offer.instance.resources.spot,
-        disk_size=offer.instance.resources.disk.size_mib / 1024,
+        disk_size=disk_size,
     )
 
 
@@ -143,8 +171,7 @@ def requirements_to_query_filter(req: Optional[Requirements]) -> gpuhunt.QueryFi
 
     res = req.resources
     if res.cpu:
-        # TODO: Remove in 0.20. Use res.cpu directly
-        cpu = parse_obj_as(CPUSpec, res.cpu)
+        cpu = res.cpu
         q.cpu_arch = cpu.arch
         q.min_cpu = cpu.count.min
         q.max_cpu = cpu.count.max
@@ -222,11 +249,75 @@ def get_offers_disk_modifier(
         disk_size_range = requirements_disk_range.intersect(configurable_disk_size)
         if disk_size_range is None:
             return None
-        offer_copy = offer.copy(deep=True)
+        offer_copy = offer.model_copy(deep=True)
         offer_copy.instance.resources.disk = Disk(
             size_mib=get_or_error(disk_size_range.min) * 1024
         )
-        offer_copy.instance.resources.update_description()
         return offer_copy
 
     return modifier
+
+
+def gpu_matches_gpu_spec(gpu: Gpu, gpu_spec: GPUSpec) -> bool:
+    if gpu_spec.vendor is not None and gpu.vendor != gpu_spec.vendor:
+        return False
+    if gpu_spec.name is not None and gpu.name.lower() not in map(str.lower, gpu_spec.name):
+        return False
+    if gpu_spec.memory is not None:
+        min_memory_gib = gpu_spec.memory.min
+        if min_memory_gib is not None and gpu.memory_mib < min_memory_gib * 1024:
+            return False
+        max_memory_gib = gpu_spec.memory.max
+        if max_memory_gib is not None and gpu.memory_mib > max_memory_gib * 1024:
+            return False
+    if gpu_spec.compute_capability is not None:
+        if gpu.vendor != gpuhunt.AcceleratorVendor.NVIDIA:
+            return False
+        compute_capability = NVIDIA_GPU_NAME_TO_COMPUTE_CAPABILITY_MAP.get(gpu.name)
+        if compute_capability is None:
+            return False
+        if compute_capability < gpu_spec.compute_capability:
+            return False
+    return True
+
+
+OfferKeyT = TypeVar("OfferKeyT")
+
+
+class BaseSkipOfferCache(Generic[OfferKeyT], ABC):
+    """
+    A base class for a cache to track (run/job, offer) pairs that failed to provision.
+
+    Implementations can be used to skip offers based on, e.g., a region, an instance type,
+    a region/type pair, etc.
+
+    Subclasses must implement `_build_key()`.
+    """
+
+    def __init__(self, *, ttl: int, maxsize: int = 1000) -> None:
+        self._cache = TTLCache[OfferKeyT, Literal[True]](maxsize=maxsize, ttl=ttl)
+
+    def add(self, run: Run, job: Job, offer: InstanceOffer) -> None:
+        self._cache[self._build_key(run, job, offer)] = True
+
+    def check(self, run: Run, job: Job, offer: InstanceOffer) -> bool:
+        return self._build_key(run, job, offer) in self._cache
+
+    @abstractmethod
+    def _build_key(self, run: Run, job: Job, offer: InstanceOffer) -> OfferKeyT:
+        pass
+
+
+class RegionalSkipOfferCache(BaseSkipOfferCache[tuple[UUID, str]]):
+    """
+    `RegionalSkipOfferRegionCache` tracks failed provisioning attempts based on the offer's region.
+
+    The current implementation tracks _any_ job of the specific run (identified by `Run.id`)
+    in the specific region (identified by `InstanceOffer.region`).
+    """
+
+    def _build_key(self, run: Run, job: Job, offer: InstanceOffer) -> tuple[UUID, str]:
+        # The current implementation uses only Run.id ignoring the job/job spec.
+        # A more sophisticated implementation could use some parts of the job spec
+        # (e.g., requirements, volumes) instead.
+        return (run.id, offer.region)

@@ -3,17 +3,21 @@ import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 from uuid import UUID
 
 import gpuhunt
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 
 from dstack._internal.core.backends.base.compute import (
     Compute,
     ComputeWithCreateInstanceSupport,
+    ComputeWithGatewayLoadBalancerSupport,
     ComputeWithGatewaySupport,
     ComputeWithGroupProvisioningSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     ComputeWithPlacementGroupSupport,
     ComputeWithPrivateGatewaySupport,
@@ -22,7 +26,7 @@ from dstack._internal.core.backends.base.compute import (
     ComputeWithVolumeSupport,
 )
 from dstack._internal.core.models.backends.base import BackendType
-from dstack._internal.core.models.common import NetworkMode
+from dstack._internal.core.models.common import NetworkMode, validate_json_extra_ignore
 from dstack._internal.core.models.compute_groups import (
     ComputeGroupProvisioningData,
     ComputeGroupStatus,
@@ -31,6 +35,7 @@ from dstack._internal.core.models.configurations import (
     AnyRunConfiguration,
     DevEnvironmentConfiguration,
 )
+from dstack._internal.core.models.duration import OptionalIdleDuration
 from dstack._internal.core.models.envs import Env
 from dstack._internal.core.models.fleets import (
     FleetConfiguration,
@@ -41,7 +46,16 @@ from dstack._internal.core.models.fleets import (
     SSHHostParams,
     SSHParams,
 )
-from dstack._internal.core.models.gateways import GatewayComputeConfiguration, GatewayStatus
+from dstack._internal.core.models.gateways import (
+    GATEWAY_REPLICAS_DEFAULT,
+    AnyGatewayCertificate,
+    AnyGatewayLoadBalancer,
+    GatewayConfiguration,
+    GatewayReplicaConfiguration,
+    GatewayReplicaStatus,
+    GatewayStatus,
+    LetsEncryptGatewayCertificate,
+)
 from dstack._internal.core.models.health import HealthStatus
 from dstack._internal.core.models.instances import (
     Disk,
@@ -53,6 +67,7 @@ from dstack._internal.core.models.instances import (
     InstanceType,
     RemoteConnectionInfo,
     Resources,
+    SSHConnectionParams,
     SSHKey,
 )
 from dstack._internal.core.models.placement import (
@@ -65,6 +80,7 @@ from dstack._internal.core.models.profiles import (
     Profile,
     TerminationPolicy,
 )
+from dstack._internal.core.models.repos import AnyRunRepoData
 from dstack._internal.core.models.repos.base import RepoType
 from dstack._internal.core.models.repos.local import LocalRunRepoData
 from dstack._internal.core.models.resources import CPUSpec, Memory, ResourcesSpec
@@ -80,6 +96,8 @@ from dstack._internal.core.models.runs import (
 )
 from dstack._internal.core.models.users import GlobalRole
 from dstack._internal.core.models.volumes import (
+    AnyVolumeConfiguration,
+    KubernetesVolumeConfiguration,
     Volume,
     VolumeAttachment,
     VolumeConfiguration,
@@ -88,12 +106,18 @@ from dstack._internal.core.models.volumes import (
 )
 from dstack._internal.server.models import (
     BackendModel,
+    CodeModel,
     ComputeGroupModel,
     DecryptedString,
+    EventModel,
+    ExportedFleetModel,
+    ExportedGatewayModel,
+    ExportModel,
     FileArchiveModel,
     FleetModel,
-    GatewayComputeModel,
     GatewayModel,
+    GatewayReplicaModel,
+    ImportModel,
     InstanceHealthCheckModel,
     InstanceModel,
     JobMetricsPoint,
@@ -107,6 +131,7 @@ from dstack._internal.server.models import (
     RunModel,
     SecretModel,
     UserModel,
+    UserPublicKeyModel,
     VolumeAttachmentModel,
     VolumeModel,
 )
@@ -156,6 +181,28 @@ async def create_user(
     return user
 
 
+async def create_user_public_key(
+    session: AsyncSession,
+    user: UserModel,
+    name: str = "test-key",
+    type: str = "ssh-ed25519",
+    fingerprint: str = "SHA256:testfingerprint",
+    key: str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
+    created_at: datetime = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+) -> UserPublicKeyModel:
+    user_public_key = UserPublicKeyModel(
+        user=user,
+        name=name,
+        type=type,
+        fingerprint=fingerprint,
+        key=key,
+        created_at=created_at,
+    )
+    session.add(user_public_key)
+    await session.commit()
+    return user_public_key
+
+
 async def create_project(
     session: AsyncSession,
     owner: Optional[UserModel] = None,
@@ -164,6 +211,8 @@ async def create_project(
     ssh_private_key: str = "",
     ssh_public_key: str = "",
     is_public: bool = False,
+    templates_repo: Optional[str] = None,
+    deleted: bool = False,
 ) -> ProjectModel:
     if owner is None:
         owner = await create_user(session=session, name="test_owner")
@@ -174,6 +223,8 @@ async def create_project(
         ssh_private_key=ssh_private_key,
         ssh_public_key=ssh_public_key,
         is_public=is_public,
+        templates_repo=templates_repo,
+        deleted=deleted,
     )
     session.add(project)
     await session.commit()
@@ -186,6 +237,8 @@ async def create_backend(
     backend_type: BackendType = BackendType.AWS,
     config: Optional[Dict] = None,
     auth: Optional[Dict] = None,
+    source_config: Optional[Dict] = None,
+    source_auth: Optional[Dict] = None,
 ) -> BackendModel:
     if config is None:
         config = {
@@ -202,6 +255,10 @@ async def create_backend(
         type=backend_type,
         config=json.dumps(config),
         auth=DecryptedString(plaintext=json.dumps(auth)),
+        source_config=None if source_config is None else json.dumps(source_config),
+        source_auth=(
+            None if source_auth is None else DecryptedString(plaintext=json.dumps(source_auth))
+        ),
     )
     session.add(backend)
     await session.commit()
@@ -233,6 +290,22 @@ async def create_repo(
     return repo
 
 
+async def create_code(
+    session: AsyncSession,
+    repo: RepoModel,
+    blob_hash: str = "blob_hash",
+    blob: Optional[bytes] = b"blob_content",
+) -> CodeModel:
+    code = CodeModel(
+        repo_id=repo.id,
+        blob_hash=blob_hash,
+        blob=blob,
+    )
+    session.add(code)
+    await session.commit()
+    return code
+
+
 async def create_repo_creds(
     session: AsyncSession,
     repo_id: UUID,
@@ -259,7 +332,7 @@ async def create_file_archive(
     session: AsyncSession,
     user_id: UUID,
     blob_hash: str = "blob_hash",
-    blob: bytes = b"blob_content",
+    blob: Optional[bytes] = b"blob_content",
 ) -> FileArchiveModel:
     archive = FileArchiveModel(
         user_id=user_id,
@@ -278,14 +351,16 @@ def get_run_spec(
     profile: Union[Profile, Callable[[], Profile], None] = lambda: Profile(name="default"),
     configuration: Optional[AnyRunConfiguration] = None,
     ssh_key_pub: Optional[str] = "user_ssh_key",
+    repo_data: AnyRunRepoData = LocalRunRepoData(repo_dir="/"),
+    repo_code_hash: Optional[str] = None,
 ) -> RunSpec:
     if callable(profile):
         profile = profile()
     return RunSpec(
         run_name=run_name,
         repo_id=repo_id,
-        repo_data=LocalRunRepoData(repo_dir="/"),
-        repo_code_hash=None,
+        repo_data=repo_data,
+        repo_code_hash=repo_code_hash,
         configuration_path=configuration_path,
         configuration=configuration or DevEnvironmentConfiguration(ide="vscode"),
         profile=profile,
@@ -299,7 +374,8 @@ async def create_run(
     repo: RepoModel,
     user: UserModel,
     fleet: Optional[FleetModel] = None,
-    run_name: str = "test-run",
+    gateway: Optional[GatewayModel] = None,
+    run_name: Optional[str] = None,
     status: RunStatus = RunStatus.SUBMITTED,
     termination_reason: Optional[RunTerminationReason] = None,
     submitted_at: datetime = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
@@ -310,7 +386,10 @@ async def create_run(
     deployment_num: int = 0,
     resubmission_attempt: int = 0,
     next_triggered_at: Optional[datetime] = None,
+    last_processed_at: Optional[datetime] = None,
 ) -> RunModel:
+    if run_name is None:
+        run_name = "test-run"
     if run_spec is None:
         run_spec = get_run_spec(
             run_name=run_name,
@@ -318,6 +397,8 @@ async def create_run(
         )
     if run_id is None:
         run_id = uuid.uuid4()
+    if last_processed_at is None:
+        last_processed_at = submitted_at
     run = RunModel(
         id=run_id,
         deleted=deleted,
@@ -329,14 +410,15 @@ async def create_run(
         run_name=run_name,
         status=status,
         termination_reason=termination_reason,
-        run_spec=run_spec.json(),
-        last_processed_at=submitted_at,
+        run_spec=run_spec.model_dump_json(),
+        last_processed_at=last_processed_at,
         jobs=[],
         priority=priority,
         deployment_num=deployment_num,
         desired_replica_count=1,
         resubmission_attempt=resubmission_attempt,
         next_triggered_at=next_triggered_at,
+        gateway=gateway,
     )
     session.add(run)
     await session.commit()
@@ -350,6 +432,7 @@ async def create_job(
     submission_num: int = 0,
     status: JobStatus = JobStatus.SUBMITTED,
     submitted_at: datetime = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+    running_at: Optional[datetime] = None,
     last_processed_at: datetime = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
     termination_reason: Optional[JobTerminationReason] = None,
     job_provisioning_data: Optional[JobProvisioningData] = None,
@@ -361,15 +444,27 @@ async def create_job(
     instance_assigned: bool = False,
     disconnected_at: Optional[datetime] = None,
     registered: bool = False,
+    ready: bool = False,
     waiting_master_job: Optional[bool] = None,
+    replica_group_name: Optional[str] = None,
 ) -> JobModel:
+    assert not (registered and not ready), "registered=True with ready=False is invalid"
     if deployment_num is None:
         deployment_num = run.deployment_num
-    run_spec = RunSpec.parse_raw(run.run_spec)
-    job_spec = (
-        await get_job_specs_from_run_spec(run_spec=run_spec, secrets={}, replica_num=replica_num)
-    )[0]
-    job_spec.job_num = job_num
+    run_spec = validate_json_extra_ignore(RunSpec, run.run_spec)
+    job_specs = await get_job_specs_from_run_spec(
+        run_spec=run_spec,
+        secrets={},
+        replica_num=replica_num,
+        replica_group_name=replica_group_name,
+    )
+    if 0 <= job_num < len(job_specs):
+        job_spec = job_specs[job_num]
+    else:
+        job_spec = job_specs[0].model_copy(deep=True)
+        job_spec.job_num = job_num
+        job_spec.job_name = f"{run_spec.run_name}-{job_num}-{replica_num}"
+
     job = JobModel(
         project_id=run.project_id,
         fleet=fleet,
@@ -381,18 +476,22 @@ async def create_job(
         deployment_num=deployment_num,
         submission_num=submission_num,
         submitted_at=submitted_at,
+        running_at=running_at,
         last_processed_at=last_processed_at,
         status=status,
         termination_reason=termination_reason,
-        job_spec_data=job_spec.json(),
-        job_provisioning_data=job_provisioning_data.json() if job_provisioning_data else None,
-        job_runtime_data=job_runtime_data.json() if job_runtime_data else None,
+        job_spec_data=job_spec.model_dump_json(),
+        job_provisioning_data=job_provisioning_data.model_dump_json()
+        if job_provisioning_data
+        else None,
+        job_runtime_data=job_runtime_data.model_dump_json() if job_runtime_data else None,
         instance=instance,
         instance_assigned=instance_assigned,
         used_instance_id=instance.id if instance is not None else None,
         disconnected_at=disconnected_at,
         probes=[],
         registered=registered,
+        ready=ready,
         waiting_master_job=waiting_master_job,
     )
     session.add(job)
@@ -404,6 +503,7 @@ def get_job_provisioning_data(
     dockerized: bool = False,
     backend: BackendType = BackendType.AWS,
     region: str = "us-east-1",
+    availability_zone: Optional[str] = None,
     gpu_count: int = 0,
     gpu_memory_gib: float = 16,
     gpu_name: str = "T4",
@@ -414,6 +514,9 @@ def get_job_provisioning_data(
     internal_ip: Optional[str] = "127.0.0.4",
     price: float = 10.5,
     instance_type: Optional[InstanceType] = None,
+    username: str = "ubuntu",
+    ssh_port: int = 22,
+    ssh_proxy: Optional[SSHConnectionParams] = None,
 ) -> JobProvisioningData:
     gpus = [
         Gpu(
@@ -436,12 +539,13 @@ def get_job_provisioning_data(
         hostname=hostname,
         internal_ip=internal_ip,
         region=region,
+        availability_zone=availability_zone,
         price=price,
-        username="ubuntu",
-        ssh_port=22,
+        username=username,
+        ssh_port=ssh_port,
         dockerized=dockerized,
         backend_data=None,
-        ssh_proxy=None,
+        ssh_proxy=ssh_proxy,
     )
 
 
@@ -453,6 +557,8 @@ def get_job_runtime_data(
     ports: Optional[dict[int, int]] = None,
     offer: Optional[InstanceOfferWithAvailability] = None,
     volume_names: Optional[list[str]] = None,
+    working_dir: Optional[str] = None,
+    username: Optional[str] = None,
 ) -> JobRuntimeData:
     return JobRuntimeData(
         network_mode=NetworkMode(network_mode),
@@ -462,6 +568,8 @@ def get_job_runtime_data(
         ports=ports,
         offer=offer,
         volume_names=volume_names,
+        working_dir=working_dir,
+        username=username,
     )
 
 
@@ -499,12 +607,36 @@ async def create_compute_group(
         project=project,
         fleet=fleet,
         status=status,
-        provisioning_data=provisioning_data.json(),
+        provisioning_data=provisioning_data.model_dump_json(),
         last_processed_at=last_processed_at,
     )
     session.add(compute_group)
     await session.commit()
     return compute_group
+
+
+async def create_export(
+    session: AsyncSession,
+    exporter_project: ProjectModel,
+    importer_projects: list[ProjectModel],
+    exported_fleets: list[FleetModel],
+    exported_gateways: Optional[list[GatewayModel]] = None,
+    name: str = "test-export",
+    is_global: bool = False,
+) -> ExportModel:
+    export = ExportModel(
+        name=name,
+        project=exporter_project,
+        is_global=is_global,
+        imports=[ImportModel(project=project) for project in importer_projects],
+        exported_fleets=[ExportedFleetModel(fleet=fleet) for fleet in exported_fleets],
+        exported_gateways=[
+            ExportedGatewayModel(gateway=gateway) for gateway in (exported_gateways or [])
+        ],
+    )
+    session.add(export)
+    await session.commit()
+    return export
 
 
 async def create_probe(
@@ -534,55 +666,120 @@ async def create_gateway(
     name: str = "test_gateway",
     region: str = "us",
     wildcard_domain: Optional[str] = None,
-    gateway_compute_id: Optional[UUID] = None,
     status: Optional[GatewayStatus] = GatewayStatus.SUBMITTED,
+    replicas: Optional[int] = None,
     last_processed_at: datetime = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+    forbid_new_services: bool = False,
+    populate_configuration: bool = True,
+    certificate: Optional[AnyGatewayCertificate] = LetsEncryptGatewayCertificate(),
+    load_balancer: Optional[AnyGatewayLoadBalancer] = None,
+    hostname: Optional[str] = None,
+    backend_data: Optional[str] = None,
 ) -> GatewayModel:
+    """
+    Args:
+        populate_configuration: whether to populate GatewayModel.configuration.
+            True - 0.18.2+ gateways, False - legacy pre-0.18.2 gateways. Prefer
+            testing against both in major test cases.
+    """
+    configuration = None
+    if populate_configuration:
+        backend = await session.get(BackendModel, backend_id)
+        assert backend is not None
+        configuration = GatewayConfiguration(
+            name=name,
+            backend=backend.type,
+            region=region,
+            domain=wildcard_domain,
+            replicas=replicas,
+            certificate=certificate,
+            load_balancer=load_balancer,
+        ).model_dump_json()
     gateway = GatewayModel(
         project_id=project_id,
         backend_id=backend_id,
         name=name,
         region=region,
         wildcard_domain=wildcard_domain,
-        gateway_compute_id=gateway_compute_id,
+        configuration=configuration,
         status=status,
+        desired_replica_count=replicas if replicas is not None else GATEWAY_REPLICAS_DEFAULT,
         last_processed_at=last_processed_at,
+        forbid_new_services=forbid_new_services,
+        hostname=hostname,
+        backend_data=backend_data,
     )
     session.add(gateway)
     await session.commit()
     return gateway
 
 
-async def create_gateway_compute(
+async def create_gateway_replica(
     session: AsyncSession,
-    backend_id: Optional[UUID] = None,
+    backend: BackendModel,
+    gateway_id: Optional[UUID] = None,
     ip_address: Optional[str] = "1.1.1.1",
-    region: str = "us",
+    region: Optional[str] = "us",
     instance_id: Optional[str] = "i-1234567890",
     ssh_private_key: str = "",
     ssh_public_key: str = "",
-) -> GatewayComputeModel:
-    gateway_compute = GatewayComputeModel(
-        backend_id=backend_id,
+    status: GatewayReplicaStatus = GatewayReplicaStatus.RUNNING,
+    last_processed_at: datetime = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+    replica_num: int = 0,
+    active: bool = True,
+    configuration: Optional[str] = None,
+    populate_configuration: bool = True,
+    hostname_deprecated_readonly: Optional[str] = None,
+    backend_data: Optional[str] = None,
+) -> GatewayReplicaModel:
+    """
+    Args:
+        populate_configuration: whether to populate GatewayReplicaModel.configuration.
+            True - 0.18.2+ gateways, False - legacy pre-0.18.2 gateways. Prefer
+            testing against both in major test cases.
+    """
+    name = f"test-gateway-{replica_num}"
+    if configuration is None and populate_configuration:
+        assert region is not None
+        configuration = GatewayReplicaConfiguration(
+            project_name="test-project",
+            instance_name=name,
+            backend=backend.type,
+            region=region,
+            public_ip=True,
+            ssh_key_pub=ssh_public_key,
+            certificate=None,
+        ).model_dump_json()
+    gateway_replica = GatewayReplicaModel(
+        name=name,
+        gateway_id=gateway_id,
+        backend_id=backend.id,
         ip_address=ip_address,
         region=region,
         instance_id=instance_id,
         ssh_private_key=ssh_private_key,
         ssh_public_key=ssh_public_key,
+        status=status,
+        last_processed_at=last_processed_at,
+        replica_num=replica_num,
+        active=active,
+        configuration=configuration,
+        hostname_deprecated_readonly=hostname_deprecated_readonly,
+        backend_data=backend_data,
     )
-    session.add(gateway_compute)
+    session.add(gateway_replica)
     await session.commit()
-    return gateway_compute
+    return gateway_replica
 
 
-def get_gateway_compute_configuration(
+def get_gateway_replica_configuration(
     project_name: str = "test-project",
     instance_name: str = "test-instance",
     backend: BackendType = BackendType.AWS,
     region: str = "us",
     public_ip: bool = True,
-) -> GatewayComputeConfiguration:
-    return GatewayComputeConfiguration(
+) -> GatewayReplicaConfiguration:
+    return GatewayReplicaConfiguration(
         project_name=project_name,
         instance_name=instance_name,
         backend=backend,
@@ -617,7 +814,7 @@ async def create_fleet(
         name=spec.configuration.name,
         status=status,
         created_at=created_at,
-        spec=spec.json(),
+        spec=spec.model_dump_json(),
         instances=[],
         runs=[],
         last_processed_at=last_processed_at,
@@ -627,13 +824,17 @@ async def create_fleet(
     return fm
 
 
-def get_fleet_spec(conf: Optional[FleetConfiguration] = None) -> FleetSpec:
+def get_fleet_spec(
+    conf: Optional[FleetConfiguration] = None, profile: Optional[Profile] = None
+) -> FleetSpec:
     if conf is None:
         conf = get_fleet_configuration()
+    if profile is None:
+        profile = Profile()
     return FleetSpec(
         configuration=conf,
         configuration_path="fleet.dstack.yml",
-        profile=Profile(),
+        profile=profile,
     )
 
 
@@ -641,11 +842,13 @@ def get_fleet_configuration(
     name: str = "test-fleet",
     nodes: FleetNodesSpec = FleetNodesSpec(min=1, target=1, max=1),
     placement: Optional[InstanceGroupPlacement] = None,
+    backends: Optional[list[BackendType]] = None,
 ) -> FleetConfiguration:
     return FleetConfiguration(
         name=name,
         nodes=nodes,
         placement=placement,
+        backends=backends,
     )
 
 
@@ -656,6 +859,7 @@ def get_ssh_fleet_configuration(
     hosts: Optional[list[Union[SSHHostParams, str]]] = None,
     network: Optional[str] = None,
     placement: Optional[InstanceGroupPlacement] = None,
+    blocks: Optional[Union[int, Literal["auto"]]] = None,
 ) -> FleetConfiguration:
     if ssh_key is None:
         ssh_key = SSHKey(public="", private=get_private_key_string())
@@ -667,10 +871,14 @@ def get_ssh_fleet_configuration(
         hosts=hosts,
         network=network,
     )
+    optional_properties: dict[str, Any] = {}
+    if blocks is not None:
+        optional_properties["blocks"] = blocks
     return FleetConfiguration(
         name=name,
         ssh_config=ssh_config,
         placement=placement,
+        **optional_properties,
     )
 
 
@@ -693,7 +901,8 @@ async def create_instance(
     backend: BackendType = BackendType.VERDA,
     termination_policy: Optional[TerminationPolicy] = None,
     termination_idle_time: int = DEFAULT_FLEET_TERMINATION_IDLE_TIME,
-    region: str = "eu-west",
+    region: Optional[str] = None,
+    availability_zone: Optional[str] = None,
     remote_connection_info: Optional[RemoteConnectionInfo] = None,
     offer: Optional[Union[InstanceOfferWithAvailability, Literal["auto"]]] = "auto",
     job_provisioning_data: Optional[Union[JobProvisioningData, Literal["auto"]]] = "auto",
@@ -703,14 +912,18 @@ async def create_instance(
     volumes: Optional[List[VolumeModel]] = None,
     price: float = 1.0,
     last_processed_at: datetime = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+    provisioning_job_id: Optional[UUID] = None,
 ) -> InstanceModel:
     if instance_id is None:
         instance_id = uuid.uuid4()
+    if region is None:
+        region = "" if backend == BackendType.KUBERNETES else "eu-west"
     if job_provisioning_data == "auto":
         job_provisioning_data = get_job_provisioning_data(
             dockerized=True,
             backend=backend,
             region=region,
+            availability_zone=availability_zone,
             spot=spot,
             hostname="running_instance.ip",
             internal_ip=None,
@@ -747,20 +960,25 @@ async def create_instance(
         created_at=created_at,
         started_at=created_at,
         finished_at=finished_at,
-        job_provisioning_data=job_provisioning_data.json() if job_provisioning_data else None,
-        offer=offer.json() if offer else None,
+        job_provisioning_data=job_provisioning_data.model_dump_json()
+        if job_provisioning_data
+        else None,
+        offer=offer.model_dump_json() if offer else None,
         price=price,
         region=region,
         backend=backend,
         termination_policy=termination_policy,
         termination_idle_time=termination_idle_time,
-        profile=profile.json(),
-        requirements=requirements.json(),
-        instance_configuration=instance_configuration.json(),
-        remote_connection_info=remote_connection_info.json() if remote_connection_info else None,
+        profile=profile.model_dump_json(),
+        requirements=requirements.model_dump_json(),
+        instance_configuration=instance_configuration.model_dump_json(),
+        remote_connection_info=remote_connection_info.model_dump_json()
+        if remote_connection_info
+        else None,
         volume_attachments=volume_attachments,
         total_blocks=total_blocks,
         busy_blocks=busy_blocks,
+        provisioning_job_id=provisioning_job_id,
     )
     if job:
         im.jobs.append(job)
@@ -816,7 +1034,6 @@ def get_instance_offer_with_availability(
                 gpus=gpus,
                 spot=spot,
                 disk=Disk(size_mib=int(disk_gib * 1024)),
-                description="",
             ),
         ),
         region=region,
@@ -833,6 +1050,8 @@ def get_remote_connection_info(
     port: int = 22,
     ssh_user: str = "ubuntu",
     ssh_keys: Optional[list[SSHKey]] = None,
+    ssh_proxy: Optional[SSHConnectionParams] = None,
+    ssh_proxy_keys: Optional[list[SSHKey]] = None,
     env: Optional[Union[Env, dict]] = None,
 ):
     if ssh_keys is None:
@@ -840,12 +1059,14 @@ def get_remote_connection_info(
     if env is None:
         env = Env()
     elif isinstance(env, dict):
-        env = Env.parse_obj(env)
+        env = Env.model_validate(env)
     return RemoteConnectionInfo(
         host=host,
         port=port,
         ssh_user=ssh_user,
         ssh_keys=ssh_keys,
+        ssh_proxy=ssh_proxy,
+        ssh_proxy_keys=ssh_proxy_keys,
         env=env,
     )
 
@@ -891,7 +1112,7 @@ async def create_volume(
     created_at: datetime = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
     last_processed_at: Optional[datetime] = None,
     last_job_processed_at: Optional[datetime] = None,
-    configuration: Optional[VolumeConfiguration] = None,
+    configuration: Optional[AnyVolumeConfiguration] = None,
     volume_provisioning_data: Optional[VolumeProvisioningData] = None,
     deleted_at: Optional[datetime] = None,
     backend: BackendType = BackendType.AWS,
@@ -909,8 +1130,8 @@ async def create_volume(
         created_at=created_at,
         last_processed_at=last_processed_at,
         last_job_processed_at=last_job_processed_at,
-        configuration=configuration.json(),
-        volume_provisioning_data=volume_provisioning_data.json()
+        configuration=configuration.model_dump_json(),
+        volume_provisioning_data=volume_provisioning_data.model_dump_json()
         if volume_provisioning_data
         else None,
         attachments=[],
@@ -927,7 +1148,7 @@ def get_volume(
     name: str = "test_volume",
     user: str = "test_user",
     project_name: str = "test_project",
-    configuration: Optional[VolumeConfiguration] = None,
+    configuration: Optional[AnyVolumeConfiguration] = None,
     external: bool = False,
     created_at: datetime = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
     last_processed_at: datetime = datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
@@ -970,14 +1191,34 @@ def get_volume_configuration(
     region: str = "eu-west-1",
     size: Optional[Memory] = Memory(100),
     volume_id: Optional[str] = None,
-    auto_cleanup_duration: Optional[Union[str, int]] = None,
-) -> VolumeConfiguration:
-    return VolumeConfiguration(
+    auto_cleanup_duration: OptionalIdleDuration = None,
+) -> AnyVolumeConfiguration:
+    assert backend != BackendType.KUBERNETES, "use get_kubernetes_volume_configuration() instead"
+    return VolumeConfiguration.model_validate(
+        dict(
+            name=name,
+            backend=backend,
+            region=region,
+            size=size,
+            volume_id=volume_id,
+            auto_cleanup_duration=auto_cleanup_duration,
+        )
+    ).root
+
+
+def get_kubernetes_volume_configuration(
+    name: str = "test-volume",
+    size: Optional[Memory] = Memory(100),
+    claim_name: Optional[str] = None,
+    auto_cleanup_duration: OptionalIdleDuration = None,
+    storage_class_name: Optional[str] = None,
+) -> KubernetesVolumeConfiguration:
+    return KubernetesVolumeConfiguration(
         name=name,
-        backend=backend,
-        region=region,
+        backend=BackendType.KUBERNETES,
         size=size,
-        volume_id=volume_id,
+        claim_name=claim_name,
+        storage_class_name=storage_class_name,
         auto_cleanup_duration=auto_cleanup_duration,
     )
 
@@ -1021,8 +1262,8 @@ async def create_placement_group(
         fleet=fleet,
         name=name,
         created_at=created_at,
-        configuration=configuration.json(),
-        provisioning_data=provisioning_data.json(),
+        configuration=configuration.model_dump_json(),
+        provisioning_data=provisioning_data.model_dump_json(),
         fleet_deleted=fleet_deleted,
         deleted=deleted,
         deleted_at=deleted_at,
@@ -1111,6 +1352,19 @@ async def create_secret(
     return secret_model
 
 
+async def list_events(session: AsyncSession) -> list[EventModel]:
+    res = await session.execute(
+        select(EventModel)
+        .order_by(EventModel.recorded_at, EventModel.id)
+        .options(joinedload(EventModel.targets))
+    )
+    return list(res.scalars().unique().all())
+
+
+async def clear_events(session: AsyncSession) -> None:
+    await session.execute(delete(EventModel))
+
+
 def get_private_key_string() -> str:
     return """
 -----BEGIN RSA PRIVATE KEY-----
@@ -1190,10 +1444,12 @@ class ComputeMockSpec(
     ComputeWithCreateInstanceSupport,
     ComputeWithGroupProvisioningSupport,
     ComputeWithPrivilegedSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     ComputeWithReservationSupport,
     ComputeWithPlacementGroupSupport,
     ComputeWithGatewaySupport,
+    ComputeWithGatewayLoadBalancerSupport,
     ComputeWithPrivateGatewaySupport,
     ComputeWithVolumeSupport,
 ):

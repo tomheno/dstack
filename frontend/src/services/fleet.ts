@@ -25,11 +25,18 @@ export const fleetApi = createApi({
                 result ? [...result.map(({ name }) => ({ type: 'Fleet' as const, id: name })), 'Fleets'] : ['Fleets'],
         }),
 
-        getProjectFleets: builder.query<IFleet[], { projectName: IProject['project_name'] }>({
-            query: ({ projectName }) => {
+        getProjectFleets: builder.query<IFleet[], { projectName: IProject['project_name']; includeImported?: boolean }>({
+            query: ({ projectName, includeImported }) => {
                 return {
                     url: API.PROJECTS.FLEETS(projectName),
                     method: 'POST',
+                    ...(typeof includeImported === 'boolean'
+                        ? {
+                              body: {
+                                  include_imported: includeImported,
+                              },
+                          }
+                        : {}),
                 };
             },
 
@@ -66,7 +73,27 @@ export const fleetApi = createApi({
 
             invalidatesTags: ['Fleets'],
         }),
+
+        applyFleet: builder.mutation<IFleet, IApplyFleetPlanRequestRequest & { projectName: IProject['project_name'] }>({
+            query: ({ projectName, ...body }) => {
+                return {
+                    url: API.PROJECTS.FLEETS_APPLY(projectName),
+                    method: 'POST',
+                    body,
+                };
+            },
+
+            invalidatesTags: ['Fleets'],
+        }),
     }),
 });
 
-export const { useGetFleetsQuery, useLazyGetFleetsQuery, useDeleteFleetMutation, useGetFleetDetailsQuery } = fleetApi;
+export const {
+    useGetFleetsQuery,
+    useLazyGetFleetsQuery,
+    useGetProjectFleetsQuery,
+    useLazyGetProjectFleetsQuery,
+    useDeleteFleetMutation,
+    useGetFleetDetailsQuery,
+    useApplyFleetMutation,
+} = fleetApi;

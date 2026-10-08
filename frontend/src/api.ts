@@ -5,6 +5,7 @@ export const API = {
 
     AUTH: {
         BASE: () => `${API.BASE()}/auth`,
+        LIST_PROVIDERS: () => `${API.AUTH.BASE()}/list_providers`,
         NEXT_REDIRECT: () => `${API.AUTH.BASE()}/get_next_redirect`,
         GITHUB: {
             BASE: () => `${API.AUTH.BASE()}/github`,
@@ -73,6 +74,7 @@ export const API = {
         ADD_MEMBERS: (name: IProject['project_name']) => `${API.PROJECTS.DETAILS(name)}/add_members`,
         REMOVE_MEMBERS: (name: IProject['project_name']) => `${API.PROJECTS.DETAILS(name)}/remove_members`,
         UPDATE: (name: IProject['project_name']) => `${API.PROJECTS.DETAILS(name)}/update`,
+        UPDATE_PUBLIC_PRESETS: (name: IProject['project_name']) => `${API.PROJECTS.DETAILS(name)}/update_public_presets`,
 
         // Repos
         REPOS: (projectName: IProject['project_name']) => `${API.BASE()}/project/${projectName}/repos`,
@@ -87,7 +89,6 @@ export const API = {
         RUN_GET_PLAN: (projectName: IProject['project_name']) => `${API.PROJECTS.RUNS(projectName)}/get_plan`,
         RUNS_DELETE: (projectName: IProject['project_name']) => `${API.PROJECTS.RUNS(projectName)}/delete`,
         RUNS_STOP: (projectName: IProject['project_name']) => `${API.PROJECTS.RUNS(projectName)}/stop`,
-        RUNS_SUBMIT: (projectName: IProject['project_name']) => `${API.PROJECTS.RUNS(projectName)}/submit`,
         RUNS_APPLY: (projectName: IProject['project_name']) => `${API.PROJECTS.RUNS(projectName)}/apply`,
 
         // Logs
@@ -99,12 +100,17 @@ export const API = {
         // Fleets
         FLEETS: (projectName: IProject['project_name']) => `${API.BASE()}/project/${projectName}/fleets/list`,
         FLEETS_DETAILS: (projectName: IProject['project_name']) => `${API.BASE()}/project/${projectName}/fleets/get`,
+        FLEETS_APPLY: (projectName: IProject['project_name']) => `${API.BASE()}/project/${projectName}/fleets/apply`,
         FLEETS_DELETE: (projectName: IProject['project_name']) => `${API.BASE()}/project/${projectName}/fleets/delete`,
         FLEET_INSTANCES_DELETE: (projectName: IProject['project_name']) =>
             `${API.BASE()}/project/${projectName}/fleets/delete_instances`,
 
         // Fleets
         VOLUMES_DELETE: (projectName: IProject['project_name']) => `${API.BASE()}/project/${projectName}/volumes/delete`,
+
+        // PRESETS
+        PRESETS_GET: (projectName: IProject['project_name']) => `${API.BASE()}/project/${projectName}/presets/get`,
+        PRESETS_DELETE: (projectName: IProject['project_name']) => `${API.BASE()}/project/${projectName}/presets/delete`,
 
         // METRICS
         JOB_METRICS: (projectName: IProject['project_name'], runName: IRun['run_spec']['run_name']) =>
@@ -118,6 +124,8 @@ export const API = {
         SECRETS_DELETE: (projectName: IProject['project_name']) => `${API.BASE()}/project/${projectName}/secrets/delete`,
         // GPUS
         GPUS_LIST: (projectName: IProject['project_name']) => `${API.BASE()}/project/${projectName}/gpus/list`,
+        // GPUS
+        TEMPLATES_LIST: (projectName: IProject['project_name']) => `${API.BASE()}/project/${projectName}/templates/list`,
     },
 
     BACKENDS: {
@@ -168,6 +176,7 @@ export const API = {
     INSTANCES: {
         BASE: () => `${API.BASE()}/instances`,
         LIST: () => `${API.INSTANCES.BASE()}/list`,
+        DETAILS: (projectName: IProject['project_name']) => `${API.BASE()}/project/${projectName}/instances/get`,
     },
 
     SERVER: {
@@ -178,5 +187,17 @@ export const API = {
     VOLUME: {
         BASE: () => `${API.BASE()}/volumes`,
         LIST: () => `${API.VOLUME.BASE()}/list`,
+    },
+
+    PRESET: {
+        BASE: () => `${API.BASE()}/presets`,
+        LIST: () => `${API.PRESET.BASE()}/list`,
+    },
+
+    USER_PUBLIC_KEYS: {
+        BASE: () => `${API.BASE()}/users/public_keys`,
+        LIST: () => `${API.USER_PUBLIC_KEYS.BASE()}/list`,
+        ADD: () => `${API.USER_PUBLIC_KEYS.BASE()}/add`,
+        DELETE: () => `${API.USER_PUBLIC_KEYS.BASE()}/delete`,
     },
 };

@@ -9,6 +9,7 @@ import dstack._internal.core.backends.configurators
 from dstack._internal.core.backends.models import (
     AnyBackendConfigWithCreds,
     AnyBackendFileConfigWithCreds,
+    BackendConfigWithCreds,
     BackendInfoYAML,
 )
 from dstack._internal.core.errors import (
@@ -142,6 +143,7 @@ class ServerConfigManager:
             backend_config = file_config_to_config(backend_file_config)
             backend_type = BackendType(backend_config.type)
             backends_to_delete.difference_update([backend_type])
+            backend_exists = any(backend_type == b.type for b in project.backends)
             try:
                 current_backend_config = await backends_services.get_backend_config(
                     project=project,
@@ -154,23 +156,34 @@ class ServerConfigManager:
                     backend_type.value,
                 )
                 continue
-            if backend_config == current_backend_config:
-                continue
-            backend_exists = any(backend_type == b.type for b in project.backends)
+            if current_backend_config is not None:
+                current_source_backend_config = await backends_services.get_source_backend_config(
+                    project=project,
+                    backend_type=backend_type,
+                )
+                # current_source_backend_config may be missing for old backend records
+                comparable_backend_config = current_source_backend_config or current_backend_config
+                if backend_config == comparable_backend_config:
+                    continue
+            # current_backend_config may be None if backend exists
+            # but it's config is invalid (e.g. cannot be decrypted).
+            # Update backend in this case.
+            if current_backend_config is None and not backend_exists:
+                apply_action = "create"
+                apply_func = backends_services.create_backend
+            else:
+                apply_action = "update"
+                apply_func = backends_services.update_backend
             try:
-                # current_backend_config may be None if backend exists
-                # but it's config is invalid (e.g. cannot be decrypted).
-                # Update backend in this case.
-                if current_backend_config is None and not backend_exists:
-                    await backends_services.create_backend(
-                        session=session, project=project, config=backend_config
-                    )
-                else:
-                    await backends_services.update_backend(
-                        session=session, project=project, config=backend_config
-                    )
+                await apply_func(session=session, project=project, config=backend_config)
             except Exception as e:
-                logger.warning("Failed to configure backend %s: %s", backend_config.type, e)
+                logger.warning(
+                    "Failed to %s backend %s in project %s: %s",
+                    apply_action,
+                    backend_config.type,
+                    project.name,
+                    e,
+                )
         await delete_backends_safe(
             session=session,
             project=project,
@@ -204,15 +217,15 @@ class ServerConfigManager:
 
     def _load_config(self) -> Optional[ServerConfig]:
         try:
-            with open(settings.SERVER_CONFIG_FILE_PATH) as f:
+            with open(settings.get_server_config_file_path()) as f:
                 content = f.read()
         except OSError:
             return
-        config_dict = yaml.load(content, yaml.FullLoader)
-        return ServerConfig.parse_obj(config_dict)
+        config_dict = yaml.safe_load(content)
+        return ServerConfig.model_validate(config_dict)
 
     def _save_config(self, config: ServerConfig):
-        with open(settings.SERVER_CONFIG_FILE_PATH, "w+") as f:
+        with open(settings.get_server_config_file_path(), "w+") as f:
             f.write(config_to_yaml(config))
 
 
@@ -249,31 +262,23 @@ async def update_backend_config_yaml(
     await backends_services.update_backend(session=session, project=project, config=config)
 
 
-class _BackendConfigWithCreds(CoreModel):
-    """
-    Model for parsing API and file YAML configs.
-    """
-
-    __root__: Annotated[AnyBackendConfigWithCreds, Field(..., discriminator="type")]
-
-
 def config_yaml_to_backend_config(config_yaml: str) -> AnyBackendConfigWithCreds:
     try:
-        config_dict = yaml.load(config_yaml, yaml.FullLoader)
+        config_dict = yaml.safe_load(config_yaml)
     except yaml.YAMLError:
         raise ServerClientError("Error parsing YAML")
     try:
-        backend_config = _BackendConfigWithCreds.parse_obj(config_dict).__root__
+        backend_config = BackendConfigWithCreds.model_validate(config_dict).root
     except ValidationError as e:
         raise ServerClientError(str(e))
     return backend_config
 
 
 def file_config_to_config(file_config: AnyBackendFileConfigWithCreds) -> AnyBackendConfigWithCreds:
-    backend_config_dict = file_config.dict()
-    backend_config = _BackendConfigWithCreds.parse_obj(backend_config_dict)
-    return backend_config.__root__
+    backend_config_dict = file_config.model_dump()
+    backend_config = BackendConfigWithCreds.model_validate(backend_config_dict)
+    return backend_config.root
 
 
 def config_to_yaml(config: CoreModel) -> str:
-    return yaml.dump(config.dict(exclude_none=True), sort_keys=False)
+    return yaml.dump(config.model_dump(exclude_none=True), sort_keys=False)

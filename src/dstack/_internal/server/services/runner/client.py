@@ -1,20 +1,31 @@
+import urllib.parse
 import uuid
 from collections.abc import Generator
 from http import HTTPStatus
+from pathlib import Path
 from typing import BinaryIO, Dict, List, Literal, Optional, TypeVar, Union, overload
 
 import packaging.version
+import pydantic
 import requests
 import requests.exceptions
+import requests_unixsocket
 from typing_extensions import Self
 
+from dstack._internal.core.consts import DSTACK_PROJECT_ENV
 from dstack._internal.core.errors import DstackError
-from dstack._internal.core.models.common import CoreModel, NetworkMode
+from dstack._internal.core.models.common import (
+    CoreModel,
+    NetworkMode,
+    validate_json_extra_ignore,
+)
 from dstack._internal.core.models.envs import Env
+from dstack._internal.core.models.instances import GpuDriverInfo
 from dstack._internal.core.models.repos.remote import RemoteRepoCreds
 from dstack._internal.core.models.resources import Memory
 from dstack._internal.core.models.runs import ClusterInfo, Job, Run
 from dstack._internal.core.models.volumes import InstanceMountPoint, Volume, VolumeMountPoint
+from dstack._internal.server import settings as server_settings
 from dstack._internal.server.schemas.instances import InstanceCheck
 from dstack._internal.server.schemas.runner import (
     ComponentInfo,
@@ -24,6 +35,8 @@ from dstack._internal.server.schemas.runner import (
     GPUDevice,
     HealthcheckResponse,
     InstanceHealthResponse,
+    InstanceInfoResponse,
+    JobInfoResponse,
     LegacyPullResponse,
     LegacyStopBody,
     LegacySubmitBody,
@@ -40,37 +53,205 @@ from dstack._internal.server.schemas.runner import (
 )
 from dstack._internal.utils.common import get_or_error
 from dstack._internal.utils.logging import get_logger
+from dstack._internal.utils.path import PathLike
 
 REQUEST_TIMEOUT = 9
 UPLOAD_CODE_REQUEST_TIMEOUT = 60
 
 logger = get_logger(__name__)
 
+LocalAddress = Union[int, Path]
+"""A local TCP port or a Unix domain socket path the client connects to."""
+
+
+_M = TypeVar("_M", bound=CoreModel)
+"""A response model parsed from a peer's response body."""
+
+_MAX_ERROR_BODY_BYTES = 512
+"""How much of an unusable response body is kept in the error message."""
+
+
+class PeerConnectionError(DstackError):
+    """
+    The shim or the runner could not be reached: the SSH tunnel could not be established or
+    broke, or the request did not get through. The counterpart of the `*ResponseError`
+    families: nothing is known about the peer's state, and retrying may help.
+    """
+
+
+class _ResponseError(DstackError):
+    """
+    A base implementation for the `*ResponseError` families: the peer was reached and answered,
+    but the answer cannot be used. Unlike `PeerConnectionError`, which means the request
+    did not get through, repeating the same request is not expected to help.
+    """
+
+    def __init__(self, response: requests.Response) -> None:
+        super().__init__()
+        self.response = response
+
+    def __str__(self) -> str:
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.response.status_code})"
+
+    @property
+    def message(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def _request_line(self) -> str:
+        request = self.response.request
+        # The full URL is noise: the authority is always localhost or a percent-encoded
+        # socket path, since the client always talks to a locally forwarded port.
+        return f"{request.method} {request.path_url}"
+
+    @property
+    def _body(self) -> str:
+        content = self.response.content
+        text = content[:_MAX_ERROR_BODY_BYTES].decode("utf-8", "replace").strip()
+        if not text:
+            return "<empty>"
+        if len(content) > _MAX_ERROR_BODY_BYTES:
+            text += "..."
+        return text
+
+
+class _ResponseStatusError(_ResponseError):
+    """
+    The peer answered with an error status. Both shim and runner use HTTP status codes as API
+    error codes and put the message in the body, so the body is worth more than the status line
+    reason, which Go generates from the status code alone.
+    """
+
+    @property
+    def status_code(self) -> int:
+        return self.response.status_code
+
+    @property
+    def message(self) -> str:
+        return f"{self._request_line}: {self.status_code}: {self._body}"
+
+
+class _ResponseBodyError(_ResponseError):
+    """
+    The peer answered with a body we cannot read: malformed JSON, or a payload that does not
+    match the expected schema, e.g. because shim or runner is too old or too new.
+    """
+
+    def __init__(self, response: requests.Response, error: pydantic.ValidationError) -> None:
+        super().__init__(response)
+        self.error = error
+
+    @property
+    def message(self) -> str:
+        errors = self.error.errors()
+        detail = f"{len(errors)} validation error(s)"
+        if errors:
+            location = ".".join(str(item) for item in errors[0]["loc"]) or "<root>"
+            detail = f"{detail}, first at {location}: {errors[0]['msg']}"
+        return f"{self._request_line}: {detail}; body: {self._body}"
+
+
+class RunnerError(DstackError):
+    pass
+
+
+class RunnerResponseError(RunnerError):
+    pass
+
+
+class RunnerResponseStatusError(_ResponseStatusError, RunnerResponseError):
+    pass
+
+
+class RunnerResponseBodyError(_ResponseBodyError, RunnerResponseError):
+    pass
+
+
+class ShimError(DstackError):
+    pass
+
+
+class ShimAPIVersionError(ShimError):
+    """Raised when a caller uses an API the peer does not support. Signals a server-side bug."""
+
+
+class ShimResponseError(ShimError):
+    pass
+
+
+class ShimResponseStatusError(_ResponseStatusError, ShimResponseError):
+    pass
+
+
+class ShimResponseBodyError(_ResponseBodyError, ShimResponseError):
+    pass
+
 
 class RunnerClient:
+    # `/api/upload_code` call is not required if there is no code
+    _OPTIONAL_CODE_UPLOAD_MIN_VERSION = (0, 20, 17)
+
+    _version_string: str
+    _version_tuple: Optional["_Version"]
+    _negotiated: bool = False
+
     def __init__(
         self,
-        port: int,
+        port: Optional[int] = None,
         hostname: str = "localhost",
+        uds: Optional[PathLike] = None,
     ):
-        self.secure = False
-        self.hostname = hostname
-        self.port = port
+        self._session, self._base_url = _make_session_and_base_url(port, hostname, uds)
+
+    @classmethod
+    def from_address(cls, address: LocalAddress) -> Self:
+        """
+        Builds a client from a TCP port (`int`) or a Unix domain socket path (`Path`).
+        """
+        if isinstance(address, int):
+            return cls(port=address)
+        return cls(uds=address)
+
+    def get_version_string(self) -> str:
+        if not self._negotiated:
+            self._negotiate()
+        return self._version_string
+
+    def get_version_tuple(self) -> Optional["_Version"]:
+        if not self._negotiated:
+            self._negotiate()
+        return self._version_tuple
+
+    def is_code_upload_optional(self) -> bool:
+        version_tuple = self.get_version_tuple()
+        return version_tuple is None or version_tuple >= self._OPTIONAL_CODE_UPLOAD_MIN_VERSION
 
     def healthcheck(self) -> Optional[HealthcheckResponse]:
+        """
+        Returns the healthcheck response, or `None` if the runner cannot be reached.
+
+        Only connection errors mean "not up yet". An error status or a body we cannot read
+        means something is listening that is not a working runner, which is not expected to
+        resolve on its own, so `RunnerResponseError` propagates instead of being reported as
+        unavailable.
+        """
         try:
-            resp = requests.get(self._url("/api/healthcheck"), timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            return HealthcheckResponse.__response__.parse_obj(resp.json())
+            healthcheck_response = self._healthcheck()
         except requests.exceptions.RequestException:
             return None
+        if not self._negotiated:
+            self._negotiate(healthcheck_response)
+        return healthcheck_response
 
     def get_metrics(self) -> Optional[MetricsResponse]:
-        resp = requests.get(self._url("/api/metrics"), timeout=REQUEST_TIMEOUT)
+        resp = self._session.get(self._url("/api/metrics"), timeout=REQUEST_TIMEOUT)
         if resp.status_code == 404:
             return None
-        resp.raise_for_status()
-        return MetricsResponse.__response__.parse_obj(resp.json())
+        self._raise_for_status(resp)
+        return self._response(MetricsResponse, resp)
 
     def submit_job(
         self,
@@ -80,18 +261,29 @@ class RunnerClient:
         secrets: Dict[str, str],
         repo_credentials: Optional[RemoteRepoCreds],
         instance_env: Optional[Union[Env, Dict[str, str]]] = None,
+        router_env: Optional[Dict[str, str]] = None,
     ):
-        # XXX: This is a quick-and-dirty hack to deliver InstanceModel-specific environment
-        # variables to the runner without runner API modification.
+        # XXX: This is a quick-and-dirty hack to deliver InstanceModel-specific
+        # and Dynamo-router environment variables to the runner without runner
+        # API modification. Both layers are merged into a deep-copied job_spec
+        # so the shared spec object held by the caller is not mutated.
         job_spec = job.job_spec
-        if instance_env is not None:
-            if isinstance(instance_env, Env):
-                merged_env = instance_env.as_dict()
-            else:
-                merged_env = instance_env.copy()
+        server_access = bool(getattr(run.run_spec.configuration, "dstack", False))
+        if instance_env is not None or router_env is not None or server_access:
+            merged_env: Dict[str, str] = {}
+            if instance_env is not None:
+                if isinstance(instance_env, Env):
+                    merged_env.update(instance_env.as_dict())
+                else:
+                    merged_env.update(instance_env)
             merged_env.update(job_spec.env)
-            job_spec = job_spec.copy(deep=True)
+            if router_env is not None:
+                merged_env.update(router_env)
+            if server_access:
+                merged_env.setdefault(DSTACK_PROJECT_ENV, run.project_name)
+            job_spec = job_spec.model_copy(deep=True)
             job_spec.env = merged_env
+        quota = server_settings.SERVER_LOG_QUOTA_PER_JOB_HOUR
         body = SubmitBody(
             run=run,
             job_spec=job_spec,
@@ -99,94 +291,76 @@ class RunnerClient:
             cluster_info=cluster_info,
             secrets=secrets,
             repo_credentials=repo_credentials,
+            log_quota_hour=quota if quota > 0 else None,
             run_spec=run.run_spec,
         )
-        resp = requests.post(
-            # use .json() to encode enums
+        resp = self._session.post(
             self._url("/api/submit"),
-            data=body.json(),
+            data=body.json_for_runner(),
             headers={"Content-Type": "application/json"},
             timeout=REQUEST_TIMEOUT,
         )
-        resp.raise_for_status()
+        self._raise_for_status(resp)
 
     def upload_archive(self, id: uuid.UUID, file: Union[BinaryIO, bytes]):
-        resp = requests.post(
+        resp = self._session.post(
             self._url("/api/upload_archive"),
             files={"archive": (str(id), file)},
             timeout=UPLOAD_CODE_REQUEST_TIMEOUT,
         )
-        resp.raise_for_status()
+        self._raise_for_status(resp)
 
     def upload_code(self, file: Union[BinaryIO, bytes]):
-        resp = requests.post(
+        resp = self._session.post(
             self._url("/api/upload_code"), data=file, timeout=UPLOAD_CODE_REQUEST_TIMEOUT
         )
-        resp.raise_for_status()
+        self._raise_for_status(resp)
 
-    def run_job(self):
-        resp = requests.post(self._url("/api/run"), timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
+    def run_job(self) -> Optional[JobInfoResponse]:
+        resp = self._session.post(self._url("/api/run"), timeout=REQUEST_TIMEOUT)
+        self._raise_for_status(resp)
+        if not _is_json_response(resp):
+            # Old runner or runner failed to get job info
+            return None
+        return self._response(JobInfoResponse, resp)
 
     def pull(self, timestamp: int) -> PullResponse:
-        resp = requests.get(
+        resp = self._session.get(
             self._url("/api/pull"), params={"timestamp": timestamp}, timeout=REQUEST_TIMEOUT
         )
-        resp.raise_for_status()
-        return PullResponse.__response__.parse_obj(resp.json())
+        self._raise_for_status(resp)
+        return self._response(PullResponse, resp)
 
     def stop(self):
-        resp = requests.post(self._url("/api/stop"), timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
+        resp = self._session.post(self._url("/api/stop"), timeout=REQUEST_TIMEOUT)
+        self._raise_for_status(resp)
 
     def _url(self, path: str) -> str:
-        return f"{'https' if self.secure else 'http'}://{self.hostname}:{self.port}/{path.lstrip('/')}"
+        return f"{self._base_url}/{path.lstrip('/')}"
 
-
-class ShimError(DstackError):
-    pass
-
-
-class ShimHTTPError(ShimError):
-    """
-    An HTTP error wrapper for `requests.exceptions.HTTPError`. Should be used as follows:
-
+    def _response(self, model_cls: type[_M], response: requests.Response) -> _M:
         try:
-            <do something>
-        except requests.exceptions.HTTPError as e:
-            raise ShimHTTPError() from e
-    """
+            return validate_json_extra_ignore(model_cls, response.content)
+        except pydantic.ValidationError as e:
+            raise RunnerResponseBodyError(response, e) from e
 
-    def __str__(self) -> str:
-        return self.message
+    def _raise_for_status(self, response: requests.Response) -> None:
+        if response.status_code >= HTTPStatus.BAD_REQUEST:
+            raise RunnerResponseStatusError(response)
 
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({self.status_code})"
+    def _healthcheck(self) -> HealthcheckResponse:
+        resp = self._session.get(self._url("/api/healthcheck"), timeout=REQUEST_TIMEOUT)
+        self._raise_for_status(resp)
+        return self._response(HealthcheckResponse, resp)
 
-    @property
-    def status_code(self) -> int:
-        cause = self._cause
-        if cause is not None and cause.response is not None:
-            return cause.response.status_code
-        return 0
-
-    @property
-    def message(self) -> str:
-        cause = self._cause
-        if cause is None:
-            return "unknown_error"
-        return str(cause)
-
-    @property
-    def _cause(self) -> Optional[requests.exceptions.HTTPError]:
-        cause = self.__cause__
-        if isinstance(cause, requests.exceptions.HTTPError):
-            return cause
-        return None
-
-
-class ShimAPIVersionError(ShimError):
-    pass
+    def _negotiate(self, healthcheck_response: Optional[HealthcheckResponse] = None) -> None:
+        if healthcheck_response is None:
+            healthcheck_response = self._healthcheck()
+        version_string = healthcheck_response.version
+        version_tuple = _parse_version(version_string)
+        self._version_string = version_string
+        self._version_tuple = version_tuple
+        self._negotiated = True
 
 
 class ComponentList:
@@ -238,11 +412,18 @@ class ShimClient:
     # `/api/instance/health`
     _INSTANCE_HEALTH_MIN_SHIM_VERSION = (0, 19, 22)
 
+    # `/api/instance/info`
+    _INSTANCE_INFO_MIN_SHIM_VERSION = (0, 20, 30)
+
     # `/api/components`
     _COMPONENTS_MIN_SHIM_VERSION = (0, 20, 0)
 
     # `/api/shutdown`
     _SHUTDOWN_MIN_SHIM_VERSION = (0, 20, 1)
+
+    # Whether it is safe to restart the shim while at least one task is still running
+    # (not terminated). Other task statuses are not restart-safe regardless of the shim version
+    _RESTART_SAFE_RUNNING_STATUS_MIN_SHIM_VERSION = (0, 21, 3)
 
     _shim_version_string: str
     _shim_version_tuple: Optional["_Version"]
@@ -251,11 +432,20 @@ class ShimClient:
 
     def __init__(
         self,
-        port: int,
+        port: Optional[int] = None,
         hostname: str = "localhost",
+        uds: Optional[PathLike] = None,
     ):
-        self._session = requests.Session()
-        self._base_url = f"http://{hostname}:{port}"
+        self._session, self._base_url = _make_session_and_base_url(port, hostname, uds)
+
+    @classmethod
+    def from_address(cls, address: LocalAddress) -> Self:
+        """
+        Builds a client from a TCP port (`int`) or a Unix domain socket path (`Path`).
+        """
+        if isinstance(address, int):
+            return cls(port=address)
+        return cls(uds=address)
 
     # Methods shared by all API versions
 
@@ -275,28 +465,16 @@ class ShimClient:
         return self._api_version == 2
 
     def is_instance_health_supported(self) -> bool:
-        if not self._negotiated:
-            self._negotiate()
-        return (
-            self._shim_version_tuple is None
-            or self._shim_version_tuple >= self._INSTANCE_HEALTH_MIN_SHIM_VERSION
-        )
+        return self._check_min_version(self._INSTANCE_HEALTH_MIN_SHIM_VERSION)
+
+    def is_instance_info_supported(self) -> bool:
+        return self._check_min_version(self._INSTANCE_INFO_MIN_SHIM_VERSION)
 
     def are_components_supported(self) -> bool:
-        if not self._negotiated:
-            self._negotiate()
-        return (
-            self._shim_version_tuple is None
-            or self._shim_version_tuple >= self._COMPONENTS_MIN_SHIM_VERSION
-        )
+        return self._check_min_version(self._COMPONENTS_MIN_SHIM_VERSION)
 
     def is_shutdown_supported(self) -> bool:
-        if not self._negotiated:
-            self._negotiate()
-        return (
-            self._shim_version_tuple is None
-            or self._shim_version_tuple >= self._SHUTDOWN_MIN_SHIM_VERSION
-        )
+        return self._check_min_version(self._SHUTDOWN_MIN_SHIM_VERSION)
 
     @overload
     def healthcheck(self) -> Optional[HealthcheckResponse]: ...
@@ -327,6 +505,18 @@ class ShimClient:
             return None
         self._raise_for_status(resp)
         return self._response(InstanceHealthResponse, resp)
+
+    def get_instance_info(self) -> Optional[InstanceInfoResponse]:
+        if not self.is_instance_info_supported():
+            logger.debug("instance info is not supported: %s", self._shim_version_string)
+            return None
+        resp = self._request("GET", "/api/instance/info")
+        if resp.status_code == HTTPStatus.NOT_FOUND:
+            # Old dev build of shim
+            logger.debug("instance info is not supported: %s", self._shim_version_string)
+            return None
+        self._raise_for_status(resp)
+        return self._response(InstanceInfoResponse, resp)
 
     def shutdown(self, *, force: bool) -> bool:
         if not self.is_shutdown_supported():
@@ -534,7 +724,7 @@ class ShimClient:
     ) -> requests.Response:
         url = f"{self._base_url}/{path.lstrip('/')}"
         if body is not None:
-            json = body.dict()
+            json = body.model_dump()
         else:
             json = None
         resp = self._session.request(method, url, json=json, timeout=REQUEST_TIMEOUT)
@@ -542,16 +732,15 @@ class ShimClient:
             self._raise_for_status(resp)
         return resp
 
-    _M = TypeVar("_M", bound=CoreModel)
-
     def _response(self, model_cls: type[_M], response: requests.Response) -> _M:
-        return model_cls.__response__.parse_obj(response.json())
+        try:
+            return validate_json_extra_ignore(model_cls, response.content)
+        except pydantic.ValidationError as e:
+            raise ShimResponseBodyError(response, e) from e
 
     def _raise_for_status(self, response: requests.Response) -> None:
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            raise ShimHTTPError() from e
+        if response.status_code >= HTTPStatus.BAD_REQUEST:
+            raise ShimResponseStatusError(response)
 
     def _negotiate(self, healthcheck_response: Optional[requests.Response] = None) -> None:
         if healthcheck_response is None:
@@ -567,17 +756,39 @@ class ShimClient:
         self._api_version = api_version
         self._negotiated = True
 
+    def _check_min_version(self, min_version: "_Version") -> bool:
+        current_version = self.get_version_tuple()
+        return current_version is None or current_version >= min_version
+
     def _get_restart_safe_task_statuses(self) -> list[TaskStatus]:
-        # TODO: Rework shim's DockerRunner.Run() so that it does not wait for container termination
-        # (this at least requires replacing .waitContainer() with periodic polling of container
-        # statuses and moving some cleanup defer calls to .Terminate() and/or .Remove()) and add
-        # TaskStatus.RUNNING to the list of restart-safe task statuses for supported shim versions.
-        return [TaskStatus.TERMINATED]
+        statuses = [TaskStatus.TERMINATED]
+        if self._check_min_version(self._RESTART_SAFE_RUNNING_STATUS_MIN_SHIM_VERSION):
+            statuses.append(TaskStatus.RUNNING)
+        return statuses
+
+
+def _make_session_and_base_url(
+    port: Optional[int], hostname: str, uds: Optional[PathLike]
+) -> tuple[requests.Session, str]:
+    """
+    Builds a session and base URL for HTTP over TCP (`port`) or over
+    a Unix domain socket (`uds`). Exactly one of the two must be specified.
+    """
+    if (port is None) == (uds is None):
+        raise ValueError("Either port or uds must be specified, not both")
+    session = requests.Session()
+    if uds is not None:
+        base_url = f"http+unix://{urllib.parse.quote(str(uds), safe='')}"
+        session.mount("http+unix://", requests_unixsocket.UnixAdapter())
+    else:
+        base_url = f"http://{hostname}:{port}"
+    return session, base_url
 
 
 def healthcheck_response_to_instance_check(
     response: HealthcheckResponse,
     instance_health_response: Optional[InstanceHealthResponse] = None,
+    gpu_driver: Optional[GpuDriverInfo] = None,
 ) -> InstanceCheck:
     if response.service == "dstack-shim":
         message: Optional[str] = None
@@ -588,12 +799,25 @@ def healthcheck_response_to_instance_check(
         ):
             message = instance_health_response.dcgm.incidents[0].error_message
         return InstanceCheck(
-            reachable=True, health_response=instance_health_response, message=message
+            reachable=True,
+            health_response=instance_health_response,
+            message=message,
+            gpu_driver=gpu_driver,
         )
     return InstanceCheck(
         reachable=False,
         message=f"unexpected service: {response.service} version: {response.version}",
         health_response=instance_health_response,
+    )
+
+
+def instance_info_response_to_gpu_driver(
+    response: Optional[InstanceInfoResponse],
+) -> Optional[GpuDriverInfo]:
+    if response is None or not response.gpu_driver_version:
+        return None
+    return GpuDriverInfo.model_validate(
+        {"vendor": response.gpu_vendor, "version": response.gpu_driver_version}
     )
 
 
@@ -637,6 +861,13 @@ def _memory_to_bytes(memory: Optional[Memory]) -> int:
     return int(memory * 1024**3)
 
 
+def _is_json_response(response: requests.Response) -> bool:
+    content_type = response.headers.get("content-type")
+    if not content_type:
+        return False
+    return content_type.split(";", maxsplit=1)[0].strip() == "application/json"
+
+
 _TaskID = Union[uuid.UUID, str]
 
 _Version = tuple[int, int, int]
@@ -644,19 +875,16 @@ _Version = tuple[int, int, int]
 
 def _parse_version(version_string: str) -> Optional[_Version]:
     """
-    Returns a (major, minor, micro) tuple if the version if final.
-    Returns `None`, which means "latest", if:
-    * the version is prerelease or dev build -- assuming that in most cases it's a build based on
-    the latest final release
-    * the version consists of only major part or not valid at all, e.g., staging builds have
-    GitHub run number (e.g., 1234) instead of the version -- assuming that it's a "bleeding edge",
-    not yet released version
+    Returns a (major, minor, micro) tuple for feature gating. The pre-release, dev, post-release,
+    and local segments are ignored, that is, `0.20.1rc1` is treated as `0.20.1` -- assuming that
+    a build carrying a version has the features released in that version.
+    Returns `None`, which means "latest", if the version consists of only major part or not valid
+    at all, e.g., staging builds have GitHub run number (e.g., 1234) instead of the version
+    -- assuming that it's a "bleeding edge", not yet released version.
     """
     try:
         version = packaging.version.parse(version_string)
     except packaging.version.InvalidVersion:
-        return None
-    if version.is_prerelease or version.is_devrelease:
         return None
     release = version.release
     if len(release) <= 1:

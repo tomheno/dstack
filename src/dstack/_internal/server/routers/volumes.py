@@ -15,8 +15,9 @@ from dstack._internal.server.schemas.volumes import (
     ListVolumesRequest,
 )
 from dstack._internal.server.security.permissions import Authenticated, ProjectMember
+from dstack._internal.server.services.pipelines import PipelineHinterProtocol, get_pipeline_hinter
 from dstack._internal.server.utils.routers import (
-    CustomORJSONResponse,
+    CustomJSONResponse,
     get_base_api_additional_responses,
 )
 
@@ -28,7 +29,7 @@ root_router = APIRouter(
 project_router = APIRouter(prefix="/api/project/{project_name}/volumes", tags=["volumes"])
 
 
-@root_router.post("/list", response_model=List[Volume])
+@root_router.post("/list", summary="List volumes", response_model=List[Volume])
 async def list_volumes(
     body: ListVolumesRequest,
     session: AsyncSession = Depends(get_session),
@@ -41,7 +42,7 @@ async def list_volumes(
     The results are paginated. To get the next page, pass `created_at` and `id` of
     the last fleet from the previous page as `prev_created_at` and `prev_id`.
     """
-    return CustomORJSONResponse(
+    return CustomJSONResponse(
         await volumes_services.list_volumes(
             session=session,
             user=user,
@@ -55,7 +56,7 @@ async def list_volumes(
     )
 
 
-@project_router.post("/list", response_model=List[Volume])
+@project_router.post("/list", summary="List project volumes", response_model=List[Volume])
 async def list_project_volumes(
     session: AsyncSession = Depends(get_session),
     user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectMember()),
@@ -64,12 +65,12 @@ async def list_project_volumes(
     Returns all volumes in the project.
     """
     _, project = user_project
-    return CustomORJSONResponse(
+    return CustomJSONResponse(
         await volumes_services.list_project_volumes(session=session, project=project)
     )
 
 
-@project_router.post("/get", response_model=Volume)
+@project_router.post("/get", summary="Get volume", response_model=Volume)
 async def get_volume(
     body: GetVolumeRequest,
     session: AsyncSession = Depends(get_session),
@@ -84,30 +85,32 @@ async def get_volume(
     )
     if volume is None:
         raise ResourceNotExistsError()
-    return CustomORJSONResponse(volume)
+    return CustomJSONResponse(volume)
 
 
-@project_router.post("/create", response_model=Volume)
+@project_router.post("/create", summary="Create volume", response_model=Volume)
 async def create_volume(
     body: CreateVolumeRequest,
     session: AsyncSession = Depends(get_session),
     user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectMember()),
+    pipeline_hinter: PipelineHinterProtocol = Depends(get_pipeline_hinter),
 ):
     """
     Creates a volume given a volume configuration.
     """
     user, project = user_project
-    return CustomORJSONResponse(
+    return CustomJSONResponse(
         await volumes_services.create_volume(
             session=session,
             project=project,
             user=user,
             configuration=body.configuration,
+            pipeline_hinter=pipeline_hinter,
         )
     )
 
 
-@project_router.post("/delete")
+@project_router.post("/delete", summary="Delete volumes")
 async def delete_volumes(
     body: DeleteVolumesRequest,
     session: AsyncSession = Depends(get_session),
@@ -116,5 +119,7 @@ async def delete_volumes(
     """
     Deletes one or more volumes.
     """
-    _, project = user_project
-    await volumes_services.delete_volumes(session=session, project=project, names=body.names)
+    user, project = user_project
+    await volumes_services.delete_volumes(
+        session=session, project=project, names=body.names, user=user
+    )

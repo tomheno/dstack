@@ -1,4 +1,6 @@
-from typing import Union
+from typing import Annotated, Union
+
+from pydantic import Field, RootModel
 
 from dstack._internal.core.backends.aws.models import (
     AWSBackendConfig,
@@ -12,9 +14,18 @@ from dstack._internal.core.backends.cloudrift.models import (
     CloudRiftBackendConfig,
     CloudRiftBackendConfigWithCreds,
 )
+from dstack._internal.core.backends.crusoe.models import (
+    CrusoeBackendConfig,
+    CrusoeBackendConfigWithCreds,
+    CrusoeBackendFileConfigWithCreds,
+)
 from dstack._internal.core.backends.cudo.models import (
     CudoBackendConfig,
     CudoBackendConfigWithCreds,
+)
+from dstack._internal.core.backends.daytona.models import (
+    DaytonaBackendConfig,
+    DaytonaBackendConfigWithCreds,
 )
 from dstack._internal.core.backends.digitalocean_base.models import (
     BaseDigitalOceanBackendConfig,
@@ -33,6 +44,11 @@ from dstack._internal.core.backends.hotaisle.models import (
     HotAisleBackendConfig,
     HotAisleBackendConfigWithCreds,
     HotAisleBackendFileConfigWithCreds,
+)
+from dstack._internal.core.backends.jarvislabs.models import (
+    JarvisLabsBackendConfig,
+    JarvisLabsBackendConfigWithCreds,
+    JarvisLabsBackendFileConfigWithCreds,
 )
 from dstack._internal.core.backends.kubernetes.models import (
     KubernetesBackendConfig,
@@ -55,6 +71,15 @@ from dstack._internal.core.backends.oci.models import (
 from dstack._internal.core.backends.runpod.models import (
     RunpodBackendConfig,
     RunpodBackendConfigWithCreds,
+)
+from dstack._internal.core.backends.seeweb.models import (
+    SeewebBackendConfig,
+    SeewebBackendConfigWithCreds,
+)
+from dstack._internal.core.backends.slurm.models import (
+    SlurmBackendConfig,
+    SlurmBackendConfigWithCreds,
+    SlurmBackendFileConfigWithCreds,
 )
 from dstack._internal.core.backends.tensordock.models import (
     TensorDockBackendConfig,
@@ -79,19 +104,24 @@ AnyBackendConfigWithoutCreds = Union[
     AWSBackendConfig,
     AzureBackendConfig,
     CloudRiftBackendConfig,
+    CrusoeBackendConfig,
     CudoBackendConfig,
+    DaytonaBackendConfig,
     BaseDigitalOceanBackendConfig,
     GCPBackendConfig,
     HotAisleBackendConfig,
+    JarvisLabsBackendConfig,
     KubernetesBackendConfig,
     LambdaBackendConfig,
     NebiusBackendConfig,
     OCIBackendConfig,
     RunpodBackendConfig,
+    SeewebBackendConfig,
     TensorDockBackendConfig,
     VastAIBackendConfig,
     VerdaBackendConfig,
     VultrBackendConfig,
+    SlurmBackendConfig,
     DstackBackendConfig,
     DstackBaseBackendConfig,
 ]
@@ -103,21 +133,43 @@ AnyBackendConfigWithCreds = Union[
     AWSBackendConfigWithCreds,
     AzureBackendConfigWithCreds,
     CloudRiftBackendConfigWithCreds,
+    CrusoeBackendConfigWithCreds,
     CudoBackendConfigWithCreds,
     VerdaBackendConfigWithCreds,
+    DaytonaBackendConfigWithCreds,
     BaseDigitalOceanBackendConfigWithCreds,
     GCPBackendConfigWithCreds,
     HotAisleBackendConfigWithCreds,
+    JarvisLabsBackendConfigWithCreds,
     KubernetesBackendConfigWithCreds,
     LambdaBackendConfigWithCreds,
     OCIBackendConfigWithCreds,
     NebiusBackendConfigWithCreds,
     RunpodBackendConfigWithCreds,
+    SeewebBackendConfigWithCreds,
     TensorDockBackendConfigWithCreds,
     VastAIBackendConfigWithCreds,
     VultrBackendConfigWithCreds,
+    SlurmBackendConfigWithCreds,
     DstackBackendConfig,
 ]
+
+# The same union tagged for validation. Without the discriminator, arm selection would depend on
+# trying each of the 20 arms in order and reporting 20 errors when none match.
+#
+# `AnyBackendConfigWithCreds` above stays a bare `Union` because it is also used as a plain type
+# annotation and as the bound of `BackendConfigWithCredsT` in `base/configurator.py`. Every site
+# that *validates* the union should use this alias instead of wrapping it again locally: two
+# `Annotated` `Field`s on the same type fail with "cannot specify multiple 'Annotated' 'Field's".
+AnyBackendConfigWithCredsTagged = Annotated[
+    AnyBackendConfigWithCreds,
+    Field(discriminator="type"),
+]
+
+
+class BackendConfigWithCreds(RootModel[AnyBackendConfigWithCredsTagged]):
+    pass
+
 
 # Backend config accepted in server/config.yaml.
 # This can be different from the API config.
@@ -126,19 +178,24 @@ AnyBackendFileConfigWithCreds = Union[
     AWSBackendConfigWithCreds,
     AzureBackendConfigWithCreds,
     CloudRiftBackendConfigWithCreds,
+    CrusoeBackendFileConfigWithCreds,
     CudoBackendConfigWithCreds,
     VerdaBackendConfigWithCreds,
+    DaytonaBackendConfigWithCreds,
     BaseDigitalOceanBackendConfigWithCreds,
     GCPBackendFileConfigWithCreds,
     HotAisleBackendFileConfigWithCreds,
+    JarvisLabsBackendFileConfigWithCreds,
     KubernetesBackendFileConfigWithCreds,
     LambdaBackendConfigWithCreds,
     OCIBackendConfigWithCreds,
     NebiusBackendFileConfigWithCreds,
     RunpodBackendConfigWithCreds,
+    SeewebBackendConfigWithCreds,
     TensorDockBackendConfigWithCreds,
     VastAIBackendConfigWithCreds,
     VultrBackendConfigWithCreds,
+    SlurmBackendFileConfigWithCreds,
 ]
 
 

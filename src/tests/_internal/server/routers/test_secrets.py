@@ -5,19 +5,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dstack._internal.core.models.users import GlobalRole, ProjectRole
 from dstack._internal.server.models import SecretModel
+from dstack._internal.server.services.permissions import DefaultPermissions
 from dstack._internal.server.services.projects import add_project_member
 from dstack._internal.server.testing.common import (
     create_project,
     create_secret,
     create_user,
+    default_permissions_context,
     get_auth_headers,
+    list_events,
 )
 
 
 class TestListSecrets:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_403_if_not_admin(
+    async def test_returns_403_if_not_authorized(
         self, test_db, session: AsyncSession, client: AsyncClient
     ):
         user = await create_user(session=session, global_role=GlobalRole.USER)
@@ -31,6 +34,43 @@ class TestListSecrets:
             json={},
         )
         assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_403_for_manager_by_default(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        manager = await create_user(session=session, name="manager", global_role=GlobalRole.USER)
+        await add_project_member(
+            session=session, project=project, user=manager, project_role=ProjectRole.MANAGER
+        )
+        response = await client.post(
+            f"/api/project/{project.name}/secrets/list",
+            headers=get_auth_headers(manager.token),
+            json={},
+        )
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_manager_can_list_when_allowed(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        manager = await create_user(session=session, name="manager", global_role=GlobalRole.USER)
+        await add_project_member(
+            session=session, project=project, user=manager, project_role=ProjectRole.MANAGER
+        )
+        with default_permissions_context(DefaultPermissions(allow_managers_manage_secrets=True)):
+            response = await client.post(
+                f"/api/project/{project.name}/secrets/list",
+                headers=get_auth_headers(manager.token),
+                json={},
+            )
+        assert response.status_code == 200
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -69,7 +109,7 @@ class TestListSecrets:
 class TestGetSecret:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_403_if_not_admin(
+    async def test_returns_403_if_not_authorized(
         self, test_db, session: AsyncSession, client: AsyncClient
     ):
         user = await create_user(session=session, global_role=GlobalRole.USER)
@@ -83,6 +123,44 @@ class TestGetSecret:
             json={"name": "my_secret"},
         )
         assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_403_for_manager_by_default(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        manager = await create_user(session=session, name="manager", global_role=GlobalRole.USER)
+        await add_project_member(
+            session=session, project=project, user=manager, project_role=ProjectRole.MANAGER
+        )
+        response = await client.post(
+            f"/api/project/{project.name}/secrets/get",
+            headers=get_auth_headers(manager.token),
+            json={"name": "my_secret"},
+        )
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_manager_can_get_when_allowed(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        manager = await create_user(session=session, name="manager", global_role=GlobalRole.USER)
+        await add_project_member(
+            session=session, project=project, user=manager, project_role=ProjectRole.MANAGER
+        )
+        await create_secret(session=session, project=project, name="secret1", value="123456")
+        with default_permissions_context(DefaultPermissions(allow_managers_manage_secrets=True)):
+            response = await client.post(
+                f"/api/project/{project.name}/secrets/get",
+                headers=get_auth_headers(manager.token),
+                json={"name": "secret1"},
+            )
+        assert response.status_code == 200
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -113,7 +191,7 @@ class TestGetSecret:
 class TestCreateOrUpdateSecret:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_403_if_not_admin(
+    async def test_returns_403_if_not_authorized(
         self, test_db, session: AsyncSession, client: AsyncClient
     ):
         user = await create_user(session=session, global_role=GlobalRole.USER)
@@ -127,6 +205,43 @@ class TestCreateOrUpdateSecret:
             json={"name": "my_secret"},
         )
         assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_403_for_manager_by_default(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        manager = await create_user(session=session, name="manager", global_role=GlobalRole.USER)
+        await add_project_member(
+            session=session, project=project, user=manager, project_role=ProjectRole.MANAGER
+        )
+        response = await client.post(
+            f"/api/project/{project.name}/secrets/create_or_update",
+            headers=get_auth_headers(manager.token),
+            json={"name": "my_secret", "value": "123456"},
+        )
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_manager_can_create_when_allowed(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        manager = await create_user(session=session, name="manager", global_role=GlobalRole.USER)
+        await add_project_member(
+            session=session, project=project, user=manager, project_role=ProjectRole.MANAGER
+        )
+        with default_permissions_context(DefaultPermissions(allow_managers_manage_secrets=True)):
+            response = await client.post(
+                f"/api/project/{project.name}/secrets/create_or_update",
+                headers=get_auth_headers(manager.token),
+                json={"name": "secret1", "value": "123456"},
+            )
+        assert response.status_code == 200
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -145,6 +260,9 @@ class TestCreateOrUpdateSecret:
         res = await session.execute(select(SecretModel))
         secret_model = res.scalar()
         assert secret_model is not None
+        events = await list_events(session)
+        assert len(events) == 1
+        assert events[0].message == "Secret created"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -165,6 +283,29 @@ class TestCreateOrUpdateSecret:
         assert response.status_code == 200
         await session.refresh(secret)
         assert secret.value.get_plaintext_or_error() == "new_value"
+        events = await list_events(session)
+        assert len(events) == 1
+        assert events[0].message == "Secret updated"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_no_event_if_value_unchanged(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.ADMIN
+        )
+        await create_secret(session=session, project=project, name="secret1", value="value")
+        response = await client.post(
+            f"/api/project/{project.name}/secrets/create_or_update",
+            headers=get_auth_headers(user.token),
+            json={"name": "secret1", "value": "value"},
+        )
+        assert response.status_code == 200
+        events = await list_events(session)
+        assert len(events) == 0
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -203,7 +344,7 @@ class TestCreateOrUpdateSecret:
 class TestDeleteSecrets:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_403_if_not_admin(
+    async def test_returns_403_if_not_authorized(
         self, test_db, session: AsyncSession, client: AsyncClient
     ):
         user = await create_user(session=session, global_role=GlobalRole.USER)
@@ -217,6 +358,44 @@ class TestDeleteSecrets:
             json={"secrets_names": ["my_secret"]},
         )
         assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_403_for_manager_by_default(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        manager = await create_user(session=session, name="manager", global_role=GlobalRole.USER)
+        await add_project_member(
+            session=session, project=project, user=manager, project_role=ProjectRole.MANAGER
+        )
+        response = await client.post(
+            f"/api/project/{project.name}/secrets/delete",
+            headers=get_auth_headers(manager.token),
+            json={"secrets_names": ["my_secret"]},
+        )
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_manager_can_delete_when_allowed(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        manager = await create_user(session=session, name="manager", global_role=GlobalRole.USER)
+        await add_project_member(
+            session=session, project=project, user=manager, project_role=ProjectRole.MANAGER
+        )
+        await create_secret(session=session, project=project, name="secret1", value="123456")
+        with default_permissions_context(DefaultPermissions(allow_managers_manage_secrets=True)):
+            response = await client.post(
+                f"/api/project/{project.name}/secrets/delete",
+                headers=get_auth_headers(manager.token),
+                json={"secrets_names": ["secret1"]},
+            )
+        assert response.status_code == 200
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -252,6 +431,11 @@ class TestDeleteSecrets:
         secrets = res.scalars().all()
         assert len(secrets) == 1
         assert secrets[0].name == "secret2"
+
+        # Verify event was emitted
+        events = await list_events(session)
+        assert len(events) == 1
+        assert events[0].message == "Secret deleted"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)

@@ -11,11 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from dstack._internal.core.models.fleets import FleetStatus
 from dstack._internal.core.models.runs import RunStatus
 from dstack._internal.core.models.users import GlobalRole, ProjectRole
-from dstack._internal.server.models import MemberModel, ProjectModel
+from dstack._internal.server.models import ExportModel, ImportModel, MemberModel, ProjectModel
 from dstack._internal.server.services.permissions import DefaultPermissions
 from dstack._internal.server.services.projects import add_project_member
 from dstack._internal.server.testing.common import (
-    create_backend,
+    create_export,
     create_fleet,
     create_project,
     create_repo,
@@ -29,17 +29,8 @@ from dstack._internal.server.testing.common import (
 
 class TestListProjects:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(self, test_db, client: AsyncClient):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/projects/list")
-        assert response.status_code in [401, 403]
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_list_only_no_fleets_returns_40x_if_not_authenticated(
-        self, test_db, client: AsyncClient
-    ):
-        response = await client.post("/api/projects/list_only_no_fleets")
         assert response.status_code in [401, 403]
 
     @pytest.mark.asyncio
@@ -65,10 +56,6 @@ class TestListProjects:
         await add_project_member(
             session=session, project=project, user=user, project_role=ProjectRole.ADMIN
         )
-        await create_backend(
-            session=session,
-            project_id=project.id,
-        )
         response = await client.post("/api/projects/list", headers=get_auth_headers(user.token))
         assert response.status_code in [200]
         assert response.json() == [
@@ -78,7 +65,7 @@ class TestListProjects:
                 "owner": {
                     "id": str(user.id),
                     "username": user.name,
-                    "created_at": "2023-01-02T03:04:00+00:00",
+                    "created_at": "2023-01-02T03:04:00Z",
                     "global_role": user.global_role,
                     "email": None,
                     "active": True,
@@ -87,10 +74,11 @@ class TestListProjects:
                     },
                     "ssh_public_key": None,
                 },
-                "created_at": "2023-01-02T03:04:00+00:00",
+                "created_at": "2023-01-02T03:04:00Z",
                 "backends": [],
                 "members": [],
                 "is_public": False,
+                "templates_repo": None,
             }
         ]
 
@@ -215,6 +203,190 @@ class TestListProjects:
         project_names = [p["project_name"] for p in projects]
         assert "public_project" in project_names
         assert "private_project" in project_names
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_paginated_projects(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(
+            session=session,
+            created_at=datetime(2023, 1, 2, 3, 0, tzinfo=timezone.utc),
+            global_role=GlobalRole.ADMIN,
+        )
+        project1 = await create_project(
+            session=session,
+            name="project1",
+            owner=user,
+            created_at=datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+        )
+        project2 = await create_project(
+            session=session,
+            name="project2",
+            owner=user,
+            created_at=datetime(2023, 1, 2, 3, 5, tzinfo=timezone.utc),
+        )
+        project3 = await create_project(
+            session=session,
+            name="project3",
+            owner=user,
+            created_at=datetime(2023, 1, 2, 3, 6, tzinfo=timezone.utc),
+        )
+        response = await client.post(
+            "/api/projects/list",
+            headers=get_auth_headers(user.token),
+            json={"limit": 1},
+        )
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "project_id": str(project3.id),
+                "project_name": project3.name,
+                "owner": {
+                    "id": str(user.id),
+                    "username": user.name,
+                    "created_at": "2023-01-02T03:00:00Z",
+                    "global_role": user.global_role,
+                    "email": None,
+                    "active": True,
+                    "permissions": {
+                        "can_create_projects": True,
+                    },
+                    "ssh_public_key": None,
+                },
+                "created_at": "2023-01-02T03:06:00Z",
+                "backends": [],
+                "members": [],
+                "is_public": False,
+                "templates_repo": None,
+            }
+        ]
+        response = await client.post(
+            "/api/projects/list",
+            headers=get_auth_headers(user.token),
+            json={
+                "prev_created_at": "2023-01-02T03:06:00Z",
+                "prev_id": str(project3.id),
+                "limit": 1,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "project_id": str(project2.id),
+                "project_name": project2.name,
+                "owner": {
+                    "id": str(user.id),
+                    "username": user.name,
+                    "created_at": "2023-01-02T03:00:00Z",
+                    "global_role": user.global_role,
+                    "email": None,
+                    "active": True,
+                    "permissions": {
+                        "can_create_projects": True,
+                    },
+                    "ssh_public_key": None,
+                },
+                "created_at": "2023-01-02T03:05:00Z",
+                "backends": [],
+                "members": [],
+                "is_public": False,
+                "templates_repo": None,
+            }
+        ]
+        response = await client.post(
+            "/api/projects/list",
+            headers=get_auth_headers(user.token),
+            json={
+                "prev_created_at": "2023-01-02T03:05:00Z",
+                "prev_id": str(project2.id),
+                "limit": 1,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "project_id": str(project1.id),
+                "project_name": project1.name,
+                "owner": {
+                    "id": str(user.id),
+                    "username": user.name,
+                    "created_at": "2023-01-02T03:00:00Z",
+                    "global_role": user.global_role,
+                    "email": None,
+                    "active": True,
+                    "permissions": {
+                        "can_create_projects": True,
+                    },
+                    "ssh_public_key": None,
+                },
+                "created_at": "2023-01-02T03:04:00Z",
+                "backends": [],
+                "members": [],
+                "is_public": False,
+                "templates_repo": None,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_total_count(self, test_db, session: AsyncSession, client: AsyncClient):
+        user = await create_user(
+            session=session,
+            created_at=datetime(2023, 1, 2, 3, 0, tzinfo=timezone.utc),
+            global_role=GlobalRole.ADMIN,
+        )
+        await create_project(
+            session=session,
+            name="project1",
+            owner=user,
+            created_at=datetime(2023, 1, 2, 3, 4, tzinfo=timezone.utc),
+        )
+        project3 = await create_project(
+            session=session,
+            name="project3",
+            owner=user,
+            created_at=datetime(2023, 1, 2, 3, 5, tzinfo=timezone.utc),
+        )
+        response = await client.post(
+            "/api/projects/list",
+            headers=get_auth_headers(user.token),
+            json={"limit": 1, "return_total_count": True},
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "total_count": 2,
+            "projects": [
+                {
+                    "project_id": str(project3.id),
+                    "project_name": project3.name,
+                    "owner": {
+                        "id": str(user.id),
+                        "username": user.name,
+                        "created_at": "2023-01-02T03:00:00Z",
+                        "global_role": user.global_role,
+                        "email": None,
+                        "active": True,
+                        "permissions": {
+                            "can_create_projects": True,
+                        },
+                        "ssh_public_key": None,
+                    },
+                    "created_at": "2023-01-02T03:05:00Z",
+                    "backends": [],
+                    "members": [],
+                    "is_public": False,
+                    "templates_repo": None,
+                }
+            ],
+        }
+
+
+class TestListOnlyNoFleets:
+    @pytest.mark.asyncio
+    async def test_list_only_no_fleets_returns_40x_if_not_authenticated(self, client: AsyncClient):
+        response = await client.post("/api/projects/list_only_no_fleets")
+        assert response.status_code in [401, 403]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -380,6 +552,48 @@ class TestListProjects:
         assert response.status_code == 200
         projects = response.json()
         assert len(projects) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_only_no_fleets_not_includes_project_with_imported_fleets(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        exporter_project = await create_project(
+            session=session, owner=user, name="exporter_project"
+        )
+        await add_project_member(
+            session=session, project=exporter_project, user=user, project_role=ProjectRole.USER
+        )
+        fleet = await create_fleet(session=session, project=exporter_project)
+        importer_project = await create_project(
+            session=session, owner=user, name="importer_project"
+        )
+        await add_project_member(
+            session=session, project=importer_project, user=user, project_role=ProjectRole.USER
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        project_no_fleets = await create_project(
+            session=session, owner=user, name="project_no_fleets"
+        )
+        await add_project_member(
+            session=session, project=project_no_fleets, user=user, project_role=ProjectRole.USER
+        )
+
+        response = await client.post(
+            "/api/projects/list_only_no_fleets",
+            headers=get_auth_headers(user.token),
+        )
+        assert response.status_code == 200
+        projects = response.json()
+
+        assert len(projects) == 1
+        assert projects[0]["project_name"] == "project_no_fleets"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -708,8 +922,7 @@ class TestListProjects:
 
 class TestCreateProject:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(self, test_db, client: AsyncClient):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/projects/create")
         assert response.status_code in [401, 403]
 
@@ -735,7 +948,7 @@ class TestCreateProject:
             "owner": {
                 "id": str(user.id),
                 "username": user.name,
-                "created_at": "2023-01-02T03:04:00+00:00",
+                "created_at": "2023-01-02T03:04:00Z",
                 "global_role": user.global_role,
                 "email": None,
                 "active": True,
@@ -744,14 +957,14 @@ class TestCreateProject:
                 },
                 "ssh_public_key": user.ssh_public_key,
             },
-            "created_at": "2023-01-02T03:04:00+00:00",
+            "created_at": "2023-01-02T03:04:00Z",
             "backends": [],
             "members": [
                 {
                     "user": {
                         "id": str(user.id),
                         "username": user.name,
-                        "created_at": "2023-01-02T03:04:00+00:00",
+                        "created_at": "2023-01-02T03:04:00Z",
                         "global_role": user.global_role,
                         "email": None,
                         "active": True,
@@ -763,10 +976,12 @@ class TestCreateProject:
                     "project_role": ProjectRole.ADMIN,
                     "permissions": {
                         "can_manage_ssh_fleets": True,
+                        "can_manage_secrets": True,
                     },
                 }
             ],
             "is_public": False,
+            "templates_repo": None,
         }
 
     @pytest.mark.asyncio
@@ -940,11 +1155,50 @@ class TestCreateProject:
         project = res.scalar_one()
         assert project.is_public is False
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_new_project_imports_global_exports(
+        self, session: AsyncSession, client: AsyncClient
+    ):
+        exporter_project = await create_project(session=session, name="ExporterProject")
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[],
+            exported_fleets=[],
+            name="non-global",
+            is_global=False,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[],
+            exported_fleets=[],
+            name="global-export",
+            is_global=True,
+        )
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+
+        response = await client.post(
+            "/api/projects/create",
+            headers=get_auth_headers(user.token),
+            json={"project_name": "new-project"},
+        )
+        assert response.status_code == 200
+
+        response = await client.post(
+            "/api/project/new-project/imports/list",
+            headers=get_auth_headers(user.token),
+        )
+        assert response.status_code == 200
+        imports = response.json()["imports"]
+        assert len(imports) == 1
+        assert imports[0]["export"]["name"] == "global-export"
+
 
 class TestDeleteProject:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(self, test_db, client: AsyncClient):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/projects/delete")
         assert response.status_code in [401, 403]
 
@@ -1153,11 +1407,67 @@ class TestDeleteProject:
         res = await session.execute(select(ProjectModel).where(ProjectModel.deleted.is_(False)))
         assert len(res.all()) == 0
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_deletes_export_models_on_project_delete(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.ADMIN)
+        project = await create_project(session=session, owner=user)
+        fleet = await create_fleet(session=session, project=project, deleted=True)
+        await create_export(
+            session=session,
+            exporter_project=project,
+            importer_projects=[],
+            exported_fleets=[fleet],
+        )
+
+        res = await session.execute(select(ExportModel))
+        assert len(res.scalars().all()) == 1
+
+        response = await client.post(
+            "/api/projects/delete",
+            headers=get_auth_headers(user.token),
+            json={"projects_names": [project.name]},
+        )
+        assert response.status_code == 200
+
+        res = await session.execute(select(ExportModel))
+        assert len(res.scalars().all()) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_deletes_import_models_on_project_delete(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.ADMIN)
+        exporter_project = await create_project(session=session, owner=user, name="exporter")
+        importer_project = await create_project(session=session, owner=user, name="importer")
+        fleet = await create_fleet(session=session, project=exporter_project, deleted=True)
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+
+        res = await session.execute(select(ImportModel))
+        assert len(res.scalars().all()) == 1
+
+        response = await client.post(
+            "/api/projects/delete",
+            headers=get_auth_headers(user.token),
+            json={"projects_names": [importer_project.name]},
+        )
+        assert response.status_code == 200
+
+        res = await session.execute(select(ImportModel))
+        assert len(res.scalars().all()) == 0
+
 
 class TestGetProject:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(self, test_db, client: AsyncClient):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/projects/test_project/get")
         assert response.status_code in [401, 403]
 
@@ -1199,7 +1509,7 @@ class TestGetProject:
             "owner": {
                 "id": str(user.id),
                 "username": user.name,
-                "created_at": "2023-01-02T03:04:00+00:00",
+                "created_at": "2023-01-02T03:04:00Z",
                 "global_role": user.global_role,
                 "email": None,
                 "active": True,
@@ -1208,14 +1518,14 @@ class TestGetProject:
                 },
                 "ssh_public_key": None,
             },
-            "created_at": "2023-01-02T03:04:00+00:00",
+            "created_at": "2023-01-02T03:04:00Z",
             "backends": [],
             "members": [
                 {
                     "user": {
                         "id": str(user.id),
                         "username": user.name,
-                        "created_at": "2023-01-02T03:04:00+00:00",
+                        "created_at": "2023-01-02T03:04:00Z",
                         "global_role": user.global_role,
                         "email": None,
                         "active": True,
@@ -1227,10 +1537,12 @@ class TestGetProject:
                     "project_role": ProjectRole.ADMIN,
                     "permissions": {
                         "can_manage_ssh_fleets": True,
+                        "can_manage_secrets": True,
                     },
                 }
             ],
             "is_public": False,
+            "templates_repo": None,
         }
 
     @pytest.mark.asyncio
@@ -1387,8 +1699,7 @@ class TestGetProject:
 
 class TestSetProjectMembers:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(self, test_db, client: AsyncClient):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/projects/test_project/get")
         assert response.status_code in [401, 403]
 
@@ -1445,7 +1756,7 @@ class TestSetProjectMembers:
                 "user": {
                     "id": str(admin.id),
                     "username": admin.name,
-                    "created_at": "2023-01-02T03:04:00+00:00",
+                    "created_at": "2023-01-02T03:04:00Z",
                     "global_role": admin.global_role,
                     "email": None,
                     "active": True,
@@ -1457,13 +1768,14 @@ class TestSetProjectMembers:
                 "project_role": ProjectRole.ADMIN,
                 "permissions": {
                     "can_manage_ssh_fleets": True,
+                    "can_manage_secrets": True,
                 },
             },
             {
                 "user": {
                     "id": str(user1.id),
                     "username": user1.name,
-                    "created_at": "2023-01-02T03:04:00+00:00",
+                    "created_at": "2023-01-02T03:04:00Z",
                     "global_role": user1.global_role,
                     "email": None,
                     "active": True,
@@ -1475,13 +1787,14 @@ class TestSetProjectMembers:
                 "project_role": ProjectRole.ADMIN,
                 "permissions": {
                     "can_manage_ssh_fleets": True,
+                    "can_manage_secrets": True,
                 },
             },
             {
                 "user": {
                     "id": str(user2.id),
                     "username": user2.name,
-                    "created_at": "2023-01-02T03:04:00+00:00",
+                    "created_at": "2023-01-02T03:04:00Z",
                     "global_role": user2.global_role,
                     "email": None,
                     "active": True,
@@ -1493,6 +1806,7 @@ class TestSetProjectMembers:
                 "project_role": ProjectRole.USER,
                 "permissions": {
                     "can_manage_ssh_fleets": True,
+                    "can_manage_secrets": True,
                 },
             },
         ]
@@ -1538,7 +1852,7 @@ class TestSetProjectMembers:
                 "user": {
                     "id": str(user1.id),
                     "username": user1.name,
-                    "created_at": "2023-01-02T03:04:00+00:00",
+                    "created_at": "2023-01-02T03:04:00Z",
                     "global_role": user1.global_role,
                     "email": user1.email,
                     "active": True,
@@ -1550,6 +1864,7 @@ class TestSetProjectMembers:
                 "project_role": ProjectRole.ADMIN,
                 "permissions": {
                     "can_manage_ssh_fleets": True,
+                    "can_manage_secrets": True,
                 },
             },
         ]
@@ -1751,8 +2066,7 @@ class TestAddProjectMembers:
 
 class TestUpdateProjectVisibility:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(self, test_db, client: AsyncClient):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/projects/test/update")
         assert response.status_code in [401, 403]
 
@@ -1871,3 +2185,171 @@ class TestUpdateProjectVisibility:
         )
         assert response.status_code == 200
         assert response.json()["is_public"] == True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_can_update_templates_repo(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        admin_user = await create_user(session=session, name="admin", global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=admin_user, is_public=False)
+        await add_project_member(
+            session=session, project=project, user=admin_user, project_role=ProjectRole.ADMIN
+        )
+
+        with patch(
+            "dstack._internal.server.services.projects.templates_service.validate_templates_repo_access"
+        ):
+            response = await client.post(
+                f"/api/projects/{project.name}/update",
+                headers=get_auth_headers(admin_user.token),
+                json={"templates_repo": "https://github.com/org/templates.git"},
+            )
+        assert response.status_code == 200
+        assert response.json()["templates_repo"] == "https://github.com/org/templates.git"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_omitted_templates_repo_does_not_clear_existing_value(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        admin_user = await create_user(session=session, name="admin", global_role=GlobalRole.USER)
+        project = await create_project(
+            session=session,
+            owner=admin_user,
+            is_public=False,
+            templates_repo="https://github.com/org/templates.git",
+        )
+        await add_project_member(
+            session=session, project=project, user=admin_user, project_role=ProjectRole.ADMIN
+        )
+
+        response = await client.post(
+            f"/api/projects/{project.name}/update",
+            headers=get_auth_headers(admin_user.token),
+            json={"is_public": True},
+        )
+        assert response.status_code == 200
+        assert response.json()["templates_repo"] == "https://github.com/org/templates.git"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_can_reset_templates_repo_with_explicit_flag(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        admin_user = await create_user(session=session, name="admin", global_role=GlobalRole.USER)
+        project = await create_project(
+            session=session,
+            owner=admin_user,
+            is_public=False,
+            templates_repo="https://github.com/org/templates.git",
+        )
+        await add_project_member(
+            session=session, project=project, user=admin_user, project_role=ProjectRole.ADMIN
+        )
+
+        response = await client.post(
+            f"/api/projects/{project.name}/update",
+            headers=get_auth_headers(admin_user.token),
+            json={"reset_templates_repo": True},
+        )
+        assert response.status_code == 200
+        assert response.json().get("templates_repo") is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_null_templates_repo_without_reset_does_not_clear_existing_value(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        admin_user = await create_user(session=session, name="admin", global_role=GlobalRole.USER)
+        project = await create_project(
+            session=session,
+            owner=admin_user,
+            is_public=False,
+            templates_repo="https://github.com/org/templates.git",
+        )
+        await add_project_member(
+            session=session, project=project, user=admin_user, project_role=ProjectRole.ADMIN
+        )
+
+        response = await client.post(
+            f"/api/projects/{project.name}/update",
+            headers=get_auth_headers(admin_user.token),
+            json={"templates_repo": None},
+        )
+        assert response.status_code == 200
+        assert response.json()["templates_repo"] == "https://github.com/org/templates.git"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_normalizes_empty_templates_repo_to_null(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        admin_user = await create_user(session=session, name="admin", global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=admin_user, is_public=False)
+        await add_project_member(
+            session=session, project=project, user=admin_user, project_role=ProjectRole.ADMIN
+        )
+
+        response = await client.post(
+            f"/api/projects/{project.name}/update",
+            headers=get_auth_headers(admin_user.token),
+            json={"templates_repo": "   "},
+        )
+        assert response.status_code == 200
+        assert response.json().get("templates_repo") is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_trims_templates_repo_url(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        admin_user = await create_user(session=session, name="admin", global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=admin_user, is_public=False)
+        await add_project_member(
+            session=session, project=project, user=admin_user, project_role=ProjectRole.ADMIN
+        )
+
+        with patch(
+            "dstack._internal.server.services.projects.templates_service.validate_templates_repo_access"
+        ):
+            response = await client.post(
+                f"/api/projects/{project.name}/update",
+                headers=get_auth_headers(admin_user.token),
+                json={"templates_repo": "  https://github.com/org/templates.git  "},
+            )
+        assert response.status_code == 200
+        assert response.json()["templates_repo"] == "https://github.com/org/templates.git"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_rejects_unreachable_templates_repo(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        admin_user = await create_user(session=session, name="admin", global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=admin_user, is_public=False)
+        await add_project_member(
+            session=session, project=project, user=admin_user, project_role=ProjectRole.ADMIN
+        )
+
+        with patch(
+            "dstack._internal.server.services.projects.templates_service.validate_templates_repo_access",
+            side_effect=ValueError(
+                "Cannot access templates repo: https://github.com/dstackai/dstack-sky-templates11"
+            ),
+        ):
+            response = await client.post(
+                f"/api/projects/{project.name}/update",
+                headers=get_auth_headers(admin_user.token),
+                json={"templates_repo": "https://github.com/dstackai/dstack-sky-templates11"},
+            )
+
+        assert response.status_code == 400
+        assert response.json() == {
+            "detail": [
+                {
+                    "code": "error",
+                    "msg": "Cannot access templates repo: https://github.com/dstackai/dstack-sky-templates11",
+                }
+            ]
+        }

@@ -1,8 +1,8 @@
 import json
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Literal, Optional, Union
 from unittest.mock import Mock, patch
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from freezegun import freeze_time
@@ -11,10 +11,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dstack._internal.core.models.backends.base import BackendType
+from dstack._internal.core.models.common import EntityReference
+from dstack._internal.core.models.envs import Env
 from dstack._internal.core.models.fleets import (
     FleetConfiguration,
+    FleetNodesSpec,
     FleetStatus,
     InstanceGroupPlacement,
+    SSHHostParams,
     SSHParams,
 )
 from dstack._internal.core.models.instances import (
@@ -25,12 +29,15 @@ from dstack._internal.core.models.instances import (
     Resources,
     SSHKey,
 )
+from dstack._internal.core.models.profiles import Profile
 from dstack._internal.core.models.users import GlobalRole, ProjectRole
 from dstack._internal.server.models import FleetModel, InstanceModel
+from dstack._internal.server.services import fleets as fleets_services
 from dstack._internal.server.services.fleets import fleet_model_to_fleet
 from dstack._internal.server.services.permissions import DefaultPermissions
 from dstack._internal.server.services.projects import add_project_member
 from dstack._internal.server.testing.common import (
+    create_export,
     create_fleet,
     create_instance,
     create_job,
@@ -55,10 +62,7 @@ pytestmark = pytest.mark.usefixtures("image_config_mock")
 
 class TestListFleets:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/fleets/list")
         assert response.status_code in [401, 403]
 
@@ -141,13 +145,227 @@ class TestListFleets:
         assert len(response_json) == 1
         assert response_json[0]["project_name"] == "project1"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    @pytest.mark.parametrize("with_project_name_filter", [True, False])
+    async def test_returns_imported_fleet_with_include_imported(
+        self, test_db, session: AsyncSession, client: AsyncClient, with_project_name_filter: bool
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.ADMIN,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        instance = await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        await create_fleet(
+            session=session,
+            project=importer_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="local-fleet")),
+        )
+        response = await client.post(
+            "/api/fleets/list",
+            headers=get_auth_headers(importer_user.token),
+            json={
+                "include_imported": True,
+                "project_name": "importer-project" if with_project_name_filter else None,
+            },
+        )
+        assert response.status_code == 200
+        response_json = response.json()
+        response_json.sort(key=lambda f: f["name"])
+        assert len(response_json) == 2
+        assert response_json[0]["name"] == "exported-fleet"
+        assert response_json[0]["project_name"] == "exporter-project"
+        assert len(response_json[0]["instances"]) == 1
+        assert response_json[0]["instances"][0]["id"] == str(instance.id)
+        assert response_json[1]["name"] == "local-fleet"
+        assert response_json[1]["project_name"] == "importer-project"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_not_returns_imported_fleet_without_include_imported(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.ADMIN,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        await create_fleet(
+            session=session,
+            project=importer_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="local-fleet")),
+        )
+        response = await client.post(
+            "/api/fleets/list",
+            headers=get_auth_headers(importer_user.token),
+            json={},
+        )
+        assert response.status_code == 200
+        response_json = response.json()
+        assert len(response_json) == 1
+        assert response_json[0]["name"] == "local-fleet"
+        assert response_json[0]["project_name"] == "importer-project"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_imported_fleet_once_when_user_member_of_both_projects(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session, name="user", global_role=GlobalRole.USER)
+        exporter_project = await create_project(session, name="exporter-project", owner=user)
+        importer_project = await create_project(session, name="importer-project", owner=user)
+        await add_project_member(
+            session=session,
+            project=exporter_project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=user,
+            project_role=ProjectRole.USER,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="shared-fleet")),
+        )
+        instance = await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="local-exporter-fleet")),
+        )
+        await create_fleet(
+            session=session,
+            project=importer_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="local-importer-fleet")),
+        )
+        response = await client.post(
+            "/api/fleets/list",
+            headers=get_auth_headers(user.token),
+            json={"include_imported": True},
+        )
+        assert response.status_code == 200
+        response_json = response.json()
+        response_json.sort(key=lambda f: f["name"])
+        assert len(response_json) == 3
+        assert response_json[0]["name"] == "local-exporter-fleet"
+        assert response_json[0]["project_name"] == "exporter-project"
+        assert response_json[1]["name"] == "local-importer-fleet"
+        assert response_json[1]["project_name"] == "importer-project"
+        assert response_json[2]["name"] == "shared-fleet"
+        assert response_json[2]["project_name"] == "exporter-project"
+        assert len(response_json[2]["instances"]) == 1
+        assert response_json[2]["instances"][0]["id"] == str(instance.id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_fleet_once_if_imported_twice(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.USER,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        instance = await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+        )
+        for name in ["export-1", "export-2"]:
+            await create_export(
+                session=session,
+                exporter_project=exporter_project,
+                importer_projects=[importer_project],
+                exported_fleets=[fleet],
+                name=name,
+            )
+        response = await client.post(
+            "/api/fleets/list",
+            headers=get_auth_headers(importer_user.token),
+            json={"include_imported": True},
+        )
+        assert response.status_code == 200
+        response_json = response.json()
+        assert len(response_json) == 1
+        assert response_json[0]["name"] == "exported-fleet"
+        assert response_json[0]["project_name"] == "exporter-project"
+        assert len(response_json[0]["instances"]) == 1
+        assert response_json[0]["instances"][0]["id"] == str(instance.id)
+
 
 class TestListProjectFleets:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/project/main/fleets/list")
         assert response.status_code in [401, 403]
 
@@ -175,22 +393,237 @@ class TestListProjectFleets:
                 "name": fleet.name,
                 "project_name": project.name,
                 "spec": json.loads(fleet.spec),
-                "created_at": "2023-01-02T03:04:00+00:00",
+                "created_at": "2023-01-02T03:04:00Z",
                 "status": fleet.status.value,
                 "status_message": None,
                 "instances": [],
             }
         ]
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_lists_fleets_newest_first(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        for name, day in [("oldest", 1), ("newest", 3), ("middle", 2)]:
+            await create_fleet(
+                session=session,
+                project=project,
+                name=name,
+                created_at=datetime(2023, 1, day, tzinfo=timezone.utc),
+            )
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/list",
+            headers=get_auth_headers(user.token),
+        )
+        assert response.status_code == 200
+        assert [f["name"] for f in response.json()] == ["newest", "middle", "oldest"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_imported_fleet_with_include_imported(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.ADMIN,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        instance = await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        await create_fleet(
+            session=session,
+            project=importer_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="local-fleet")),
+        )
+        response = await client.post(
+            f"/api/project/{importer_project.name}/fleets/list",
+            headers=get_auth_headers(importer_user.token),
+            json={"include_imported": True},
+        )
+        assert response.status_code == 200
+        response_json = response.json()
+        response_json.sort(key=lambda f: f["name"])
+        assert len(response_json) == 2
+        assert response_json[0]["name"] == "exported-fleet"
+        assert response_json[0]["project_name"] == "exporter-project"
+        assert len(response_json[0]["instances"]) == 1
+        assert response_json[0]["instances"][0]["id"] == str(instance.id)
+        assert response_json[1]["name"] == "local-fleet"
+        assert response_json[1]["project_name"] == "importer-project"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_not_returns_imported_fleet_without_include_imported(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.ADMIN,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        await create_fleet(
+            session=session,
+            project=importer_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="local-fleet")),
+        )
+        response = await client.post(
+            f"/api/project/{importer_project.name}/fleets/list",
+            headers=get_auth_headers(importer_user.token),
+            json={},  # No include_imported parameter
+        )
+        assert response.status_code == 200
+        response_json = response.json()
+        assert len(response_json) == 1
+        assert response_json[0]["name"] == "local-fleet"
+        assert response_json[0]["project_name"] == "importer-project"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_fleet_once_if_imported_twice(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.USER,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        instance = await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+        )
+        for name in ["export-1", "export-2"]:
+            await create_export(
+                session=session,
+                exporter_project=exporter_project,
+                importer_projects=[importer_project],
+                exported_fleets=[fleet],
+                name=name,
+            )
+        response = await client.post(
+            f"/api/project/{importer_project.name}/fleets/list",
+            headers=get_auth_headers(importer_user.token),
+            json={"include_imported": True},
+        )
+        assert response.status_code == 200
+        response_json = response.json()
+        assert len(response_json) == 1
+        assert response_json[0]["name"] == "exported-fleet"
+        assert response_json[0]["project_name"] == "exporter-project"
+        assert len(response_json[0]["instances"]) == 1
+        assert response_json[0]["instances"][0]["id"] == str(instance.id)
+
 
 class TestGetFleet:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/project/main/fleets/get")
         assert response.status_code in [401, 403]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    @pytest.mark.parametrize(
+        "by_id", [pytest.param(False, id="by-name"), pytest.param(True, id="by-id")]
+    )
+    async def test_returns_403_on_nonexistent_fleet_in_foreign_project(
+        self, test_db, session: AsyncSession, client: AsyncClient, by_id: bool
+    ):
+        await create_project(session, name="test-project")
+        user = await create_user(session, global_role=GlobalRole.USER)  # not a project member
+        if by_id:
+            body = {"id": str(uuid4())}
+        else:
+            body = {"name": "nonexistent"}
+        response = await client.post(
+            "/api/project/test-project/fleets/get",
+            headers=get_auth_headers(user.token),
+            json=body,
+        )
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    @pytest.mark.parametrize(
+        "by_id", [pytest.param(False, id="by-name"), pytest.param(True, id="by-id")]
+    )
+    async def test_returns_403_on_deleted_fleet_in_foreign_project(
+        self, test_db, session: AsyncSession, client: AsyncClient, by_id: bool
+    ):
+        project = await create_project(session, name="test-project")
+        user = await create_user(session, global_role=GlobalRole.USER)  # not a project member
+        fleet = await create_fleet(
+            session=session, project=project, deleted=True, name="deleted-fleet"
+        )
+        if by_id:
+            body = {"id": str(fleet.id)}
+        else:
+            body = {"name": "deleted-fleet"}
+        response = await client.post(
+            "/api/project/test-project/fleets/get",
+            headers=get_auth_headers(user.token),
+            json=body,
+        )
+        assert response.status_code == 403
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -220,7 +653,7 @@ class TestGetFleet:
             "name": fleet.name,
             "project_name": project.name,
             "spec": json.loads(fleet.spec),
-            "created_at": "2023-01-02T03:04:00+00:00",
+            "created_at": "2023-01-02T03:04:00Z",
             "status": fleet.status.value,
             "status_message": None,
             "instances": [],
@@ -262,7 +695,7 @@ class TestGetFleet:
             "name": active_fleet.name,
             "project_name": project.name,
             "spec": json.loads(active_fleet.spec),
-            "created_at": "2023-01-02T03:04:00+00:00",
+            "created_at": "2023-01-02T03:04:00Z",
             "status": active_fleet.status.value,
             "status_message": None,
             "instances": [],
@@ -303,13 +736,202 @@ class TestGetFleet:
         )
         assert response.status_code == 400
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    @pytest.mark.parametrize(
+        "by_id", [pytest.param(False, id="by-name"), pytest.param(True, id="by-id")]
+    )
+    async def test_returns_foreign_fleet_to_global_admin(
+        self, test_db, session: AsyncSession, client: AsyncClient, by_id: bool
+    ):
+        admin = await create_user(session, global_role=GlobalRole.ADMIN)
+        project = await create_project(session, name="test-project")
+        fleet = await create_fleet(session=session, project=project, name="test-fleet")
+        if by_id:
+            body = {"id": str(fleet.id)}
+        else:
+            body = {"name": "test-fleet"}
+        response = await client.post(
+            "/api/project/test-project/fleets/get",
+            headers=get_auth_headers(admin.token),
+            json=body,
+        )
+        assert response.status_code == 200
+        assert response.json()["name"] == "test-fleet"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    @pytest.mark.parametrize(
+        "by_id", [pytest.param(False, id="by-name"), pytest.param(False, id="by-id")]
+    )
+    async def test_returns_imported_fleet(
+        self, test_db, session: AsyncSession, client: AsyncClient, by_id: bool
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.ADMIN,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        instance = await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        if by_id:
+            body = {"id": str(fleet.id)}
+        else:
+            body = {"name": "exported-fleet"}
+        response = await client.post(
+            "/api/project/exporter-project/fleets/get",
+            headers=get_auth_headers(importer_user.token),
+            json=body,
+        )
+        assert response.status_code == 200
+        assert response.json()["id"] == str(fleet.id)
+        assert response.json()["name"] == "exported-fleet"
+        assert response.json()["project_name"] == "exporter-project"
+        assert len(response.json()["instances"]) == 1
+        assert response.json()["instances"][0]["id"] == str(instance.id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    @pytest.mark.parametrize(
+        "by_id", [pytest.param(False, id="by-name"), pytest.param(False, id="by-id")]
+    )
+    async def test_returns_403_on_foreign_fleet_if_not_imported(
+        self, test_db, session: AsyncSession, client: AsyncClient, by_id: bool
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        not_importer_user = await create_user(
+            session, name="not-importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(
+            session, name="exporter-project", owner=importer_user
+        )
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        not_importer_project = await create_project(
+            session, name="not-importer-project", owner=not_importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=not_importer_project,
+            user=not_importer_user,
+            project_role=ProjectRole.USER,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        if by_id:
+            body = {"id": str(fleet.id)}
+        else:
+            body = {"name": "exported-fleet"}
+        response = await client.post(
+            "/api/project/exporter-project/fleets/get",
+            headers=get_auth_headers(not_importer_user.token),
+            json=body,
+        )
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "client_version,expected_fleets",
+        [
+            (
+                "0.20.13",
+                [
+                    "my-fleet",
+                    "other-project/other-fleet",
+                ],
+            ),
+            (
+                "0.20.14",
+                [
+                    {"project": None, "name": "my-fleet"},
+                    {"project": "other-project", "name": "other-fleet"},
+                ],
+            ),
+            (
+                None,
+                [
+                    {"project": None, "name": "my-fleet"},
+                    {"project": "other-project", "name": "other-fleet"},
+                ],
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_patches_profile_fleets_for_old_clients(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        client_version: Optional[str],
+        expected_fleets: list,
+    ) -> None:
+        user = await create_user(session=session)
+        project = await create_project(session=session, owner=user)
+
+        fleets: list[Union[EntityReference, str]] = [
+            EntityReference(project=None, name="my-fleet"),
+            EntityReference(project="other-project", name="other-fleet"),
+        ]
+        spec = get_fleet_spec(
+            profile=Profile(fleets=fleets),
+        )
+        fleet = await create_fleet(session=session, project=project, spec=spec)
+
+        headers = get_auth_headers(user.token)
+        if client_version is not None:
+            headers["X-API-Version"] = client_version
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/get",
+            headers=headers,
+            json={"id": str(fleet.id)},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["spec"]["profile"]["fleets"] == expected_fleets
+
 
 class TestApplyFleetPlan:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/project/main/fleets/apply")
         assert response.status_code in [401, 403]
 
@@ -326,7 +948,7 @@ class TestApplyFleetPlan:
         response = await client.post(
             f"/api/project/{project.name}/fleets/apply",
             headers=get_auth_headers(user.token),
-            json={"plan": {"spec": spec.dict()}, "force": False},
+            json={"plan": {"spec": spec.model_dump()}, "force": False},
         )
         assert response.status_code == 200
         assert response.json() == {
@@ -340,13 +962,7 @@ class TestApplyFleetPlan:
                     "placement": None,
                     "env": {},
                     "ssh_config": None,
-                    "resources": {
-                        "cpu": {"min": 2, "max": None},
-                        "memory": {"min": 8.0, "max": None},
-                        "shm_size": None,
-                        "gpu": None,
-                        "disk": {"size": {"min": 100.0, "max": None}},
-                    },
+                    "resources": None,
                     "backends": None,
                     "regions": None,
                     "availability_zones": None,
@@ -360,6 +976,7 @@ class TestApplyFleetPlan:
                     "reservation": None,
                     "blocks": 1,
                     "tags": None,
+                    "backend_options": None,
                 },
                 "profile": {
                     "backends": None,
@@ -382,10 +999,12 @@ class TestApplyFleetPlan:
                     "reservation": None,
                     "fleets": None,
                     "tags": None,
+                    "backend_options": None,
+                    "instances": None,
                 },
                 "autocreated": False,
             },
-            "created_at": "2023-01-02T03:04:00+00:00",
+            "created_at": "2023-01-02T03:04:00Z",
             "status": "active",
             "status_message": None,
             "instances": [
@@ -403,7 +1022,8 @@ class TestApplyFleetPlan:
                     "health_status": "healthy",
                     "termination_reason": None,
                     "termination_reason_message": None,
-                    "created": "2023-01-02T03:04:00+00:00",
+                    "created": "2023-01-02T03:04:00Z",
+                    "finished_at": None,
                     "backend": None,
                     "region": None,
                     "availability_zone": None,
@@ -411,6 +1031,7 @@ class TestApplyFleetPlan:
                     "price": None,
                     "total_blocks": 1,
                     "busy_blocks": 0,
+                    "gpu_driver": None,
                 }
             ],
         }
@@ -441,7 +1062,7 @@ class TestApplyFleetPlan:
         response = await client.post(
             f"/api/project/{project.name}/fleets/apply",
             headers=get_auth_headers(user.token),
-            json={"plan": {"spec": spec.dict()}, "force": False},
+            json={"plan": {"spec": spec.model_dump()}, "force": False},
         )
         assert response.status_code == 200, response.json()
         assert response.json() == {
@@ -463,13 +1084,7 @@ class TestApplyFleetPlan:
                     },
                     "nodes": None,
                     "placement": None,
-                    "resources": {
-                        "cpu": {"min": 2, "max": None},
-                        "memory": {"min": 8.0, "max": None},
-                        "shm_size": None,
-                        "gpu": None,
-                        "disk": {"size": {"min": 100.0, "max": None}},
-                    },
+                    "resources": None,
                     "backends": None,
                     "regions": None,
                     "availability_zones": None,
@@ -483,6 +1098,7 @@ class TestApplyFleetPlan:
                     "reservation": None,
                     "blocks": 1,
                     "tags": None,
+                    "backend_options": None,
                 },
                 "profile": {
                     "backends": None,
@@ -505,10 +1121,12 @@ class TestApplyFleetPlan:
                     "reservation": None,
                     "fleets": None,
                     "tags": None,
+                    "backend_options": None,
+                    "instances": None,
                 },
                 "autocreated": False,
             },
-            "created_at": "2023-01-02T03:04:00+00:00",
+            "created_at": "2023-01-02T03:04:00Z",
             "status": "active",
             "status_message": None,
             "instances": [
@@ -525,7 +1143,7 @@ class TestApplyFleetPlan:
                             "gpus": [],
                             "spot": False,
                             "disk": {"size_mib": 102400},
-                            "description": "cpu=2 mem=0GB disk=100GB",
+                            "description": "",
                         },
                     },
                     "name": f"{spec.configuration.name}-0",
@@ -539,12 +1157,14 @@ class TestApplyFleetPlan:
                     "health_status": "healthy",
                     "termination_reason": None,
                     "termination_reason_message": None,
-                    "created": "2023-01-02T03:04:00+00:00",
+                    "created": "2023-01-02T03:04:00Z",
+                    "finished_at": None,
                     "region": "remote",
                     "availability_zone": None,
                     "price": 0.0,
                     "total_blocks": 1,
                     "busy_blocks": 0,
+                    "gpu_driver": None,
                 }
             ],
         }
@@ -555,6 +1175,56 @@ class TestApplyFleetPlan:
         res = await session.execute(select(InstanceModel))
         instance = res.unique().scalar_one()
         assert instance.remote_connection_info is not None
+
+    @pytest.mark.parametrize(
+        ["top_level_blocks", "host_blocks", "host_type", "expected_blocks"],
+        [
+            pytest.param(None, None, str, 1, id="global-default-string"),
+            pytest.param(None, None, SSHHostParams, 1, id="global-default-object"),
+            pytest.param(4, None, str, 4, id="top-level-int-string"),
+            pytest.param(4, None, SSHHostParams, 4, id="top-level-int-object"),
+            pytest.param("auto", None, str, None, id="top-level-auto-string"),
+            pytest.param("auto", None, SSHHostParams, None, id="top-level-auto-object"),
+            pytest.param("auto", 4, SSHHostParams, 4, id="host-level-int"),
+            pytest.param(4, "auto", SSHHostParams, None, id="host-level-auto"),
+        ],
+    )
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_creates_ssh_fleet_with_blocks(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        top_level_blocks: Optional[Union[int, Literal["auto"]]],
+        host_blocks: Optional[Union[int, Literal["auto"]]],
+        host_type: Union[type[str], type[SSHHostParams]],
+        expected_blocks: Optional[int],
+    ):
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        if host_type is str:
+            host = "1.1.1.1"
+        elif host_blocks is None:
+            host = SSHHostParams(hostname="1.1.1.1")
+        else:
+            host = SSHHostParams(hostname="1.1.1.1", blocks=host_blocks)
+        conf = get_ssh_fleet_configuration(blocks=top_level_blocks, hosts=[host])
+        spec = get_fleet_spec(conf=conf)
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/apply",
+            headers=get_auth_headers(user.token),
+            json={"plan": {"spec": spec.model_dump()}, "force": False},
+        )
+        assert response.status_code == 200, response.json()
+        res = await session.execute(select(FleetModel))
+        assert len(res.scalars().all()) == 1
+        res = await session.execute(select(InstanceModel))
+        instance = res.scalar_one()
+        assert instance.total_blocks == expected_blocks
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -573,7 +1243,7 @@ class TestApplyFleetPlan:
             network=None,
         )
         current_spec = get_fleet_spec(conf=current_conf)
-        spec = current_spec.copy(deep=True)
+        spec = current_spec.model_copy(deep=True)
         # 10.0.0.100 removed, 10.0.0.101 added
         spec.configuration.ssh_config.hosts = ["10.0.0.101"]
 
@@ -603,19 +1273,17 @@ class TestApplyFleetPlan:
             remote_connection_info=get_remote_connection_info(host="10.0.0.100"),
         )
 
-        with patch("uuid.uuid4") as m:
-            m.return_value = UUID("1b0e1b45-2f8c-4ab6-8010-a0d1a3e44e0e")
-            response = await client.post(
-                f"/api/project/{project.name}/fleets/apply",
-                headers=get_auth_headers(user.token),
-                json={
-                    "plan": {
-                        "spec": spec.dict(),
-                        "current_resource": _fleet_model_to_json_dict(fleet),
-                    },
-                    "force": False,
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/apply",
+            headers=get_auth_headers(user.token),
+            json={
+                "plan": {
+                    "spec": spec.model_dump(),
+                    "current_resource": _fleet_model_to_json_dict(fleet),
                 },
-            )
+                "force": False,
+            },
+        )
 
         assert response.status_code == 200, response.json()
         assert response.json() == {
@@ -637,13 +1305,7 @@ class TestApplyFleetPlan:
                     },
                     "nodes": None,
                     "placement": None,
-                    "resources": {
-                        "cpu": {"min": 2, "max": None},
-                        "memory": {"min": 8.0, "max": None},
-                        "shm_size": None,
-                        "gpu": None,
-                        "disk": {"size": {"min": 100.0, "max": None}},
-                    },
+                    "resources": None,
                     "backends": None,
                     "regions": None,
                     "availability_zones": None,
@@ -657,6 +1319,7 @@ class TestApplyFleetPlan:
                     "reservation": None,
                     "blocks": 1,
                     "tags": None,
+                    "backend_options": None,
                 },
                 "profile": {
                     "backends": None,
@@ -679,10 +1342,12 @@ class TestApplyFleetPlan:
                     "reservation": None,
                     "fleets": None,
                     "tags": None,
+                    "backend_options": None,
+                    "instances": None,
                 },
                 "autocreated": False,
             },
-            "created_at": "2023-01-02T03:04:00+00:00",
+            "created_at": "2023-01-02T03:04:00Z",
             "status": "active",
             "status_message": None,
             "instances": [
@@ -699,7 +1364,7 @@ class TestApplyFleetPlan:
                             "gpus": [],
                             "spot": False,
                             "disk": {"size_mib": 102400},
-                            "description": "cpu=2 mem=0GB disk=100GB",
+                            "description": "",
                         },
                     },
                     "name": "test-ssh-fleet-0",
@@ -711,17 +1376,19 @@ class TestApplyFleetPlan:
                     "status": "terminating",
                     "unreachable": False,
                     "health_status": "healthy",
-                    "termination_reason": None,
+                    "termination_reason": "terminated_by_user",
                     "termination_reason_message": None,
-                    "created": "2023-01-02T03:04:00+00:00",
+                    "created": "2023-01-02T03:04:00Z",
+                    "finished_at": None,
                     "region": "remote",
                     "availability_zone": None,
                     "price": 0.0,
                     "total_blocks": 1,
                     "busy_blocks": 0,
+                    "gpu_driver": None,
                 },
                 {
-                    "id": "1b0e1b45-2f8c-4ab6-8010-a0d1a3e44e0e",
+                    "id": SomeUUID4Str(),
                     "project_name": project.name,
                     "backend": "remote",
                     "instance_type": {
@@ -733,7 +1400,7 @@ class TestApplyFleetPlan:
                             "gpus": [],
                             "spot": False,
                             "disk": {"size_mib": 102400},
-                            "description": "cpu=2 mem=0GB disk=100GB",
+                            "description": "",
                         },
                     },
                     "name": "test-ssh-fleet-1",
@@ -747,12 +1414,14 @@ class TestApplyFleetPlan:
                     "health_status": "healthy",
                     "termination_reason": None,
                     "termination_reason_message": None,
-                    "created": "2023-01-02T03:04:00+00:00",
+                    "created": "2023-01-02T03:04:00Z",
+                    "finished_at": None,
                     "region": "remote",
                     "availability_zone": None,
                     "price": 0.0,
                     "total_blocks": 1,
                     "busy_blocks": 0,
+                    "gpu_driver": None,
                 },
             ],
         }
@@ -761,11 +1430,113 @@ class TestApplyFleetPlan:
         await session.refresh(instance)
         assert instance.status == InstanceStatus.TERMINATING
         res = await session.execute(
-            select(InstanceModel).where(InstanceModel.id == "1b0e1b45-2f8c-4ab6-8010-a0d1a3e44e0e")
+            select(InstanceModel).where(InstanceModel.id == response.json()["instances"][1]["id"])
         )
         instance = res.unique().scalar_one()
         assert instance.status == InstanceStatus.PENDING
         assert instance.remote_connection_info is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_updates_cloud_fleet_nodes_in_place_when_fleet_in_use(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        current_spec = get_fleet_spec(
+            conf=get_fleet_configuration(nodes=FleetNodesSpec(min=0, target=0, max=2))
+        )
+        fleet = await create_fleet(session=session, project=project, spec=current_spec)
+        repo = await create_repo(session=session, project_id=project.id)
+        run = await create_run(session=session, project=project, repo=repo, user=user, fleet=fleet)
+        job = await create_job(session=session, run=run, fleet=fleet)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            job=job,
+            status=InstanceStatus.BUSY,
+            instance_num=0,
+        )
+        spec = current_spec.model_copy(deep=True)
+        spec.configuration.nodes = FleetNodesSpec(min=1, target=1, max=3)
+
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/apply",
+            headers=get_auth_headers(user.token),
+            json={
+                "plan": {
+                    "spec": spec.model_dump(),
+                    "current_resource": _fleet_model_to_json_dict(fleet),
+                },
+                "force": False,
+            },
+        )
+
+        response_json = response.json()
+        assert response.status_code == 200, response_json
+        assert response_json["id"] == str(fleet.id)
+        assert response_json["spec"]["configuration"]["nodes"] == {"min": 1, "max": 3}
+
+        await session.refresh(fleet)
+        await session.refresh(instance)
+        assert json.loads(fleet.spec)["configuration"]["nodes"] == {"min": 1, "max": 3}
+        assert instance.status == InstanceStatus.BUSY
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_updates_cloud_fleet_nodes_target_without_changing_instance_count(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        current_spec = get_fleet_spec(
+            conf=get_fleet_configuration(nodes=FleetNodesSpec(min=0, target=0, max=1))
+        )
+        fleet = await create_fleet(session=session, project=project, spec=current_spec)
+        spec = current_spec.model_copy(deep=True)
+        spec.configuration.nodes = FleetNodesSpec(min=0, target=1, max=1)
+
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/apply",
+            headers=get_auth_headers(user.token),
+            json={
+                "plan": {
+                    "spec": spec.model_dump(),
+                    "current_resource": _fleet_model_to_json_dict(fleet),
+                },
+                "force": False,
+            },
+        )
+
+        response_json = response.json()
+        assert response.status_code == 200, response_json
+        assert response_json["id"] == str(fleet.id)
+        assert response_json["spec"]["configuration"]["nodes"] == {
+            "min": 0,
+            "target": 1,
+            "max": 1,
+        }
+
+        await session.refresh(fleet)
+        assert json.loads(fleet.spec)["configuration"]["nodes"] == {
+            "min": 0,
+            "target": 1,
+            "max": 1,
+        }
+        res = await session.execute(
+            select(InstanceModel).where(
+                InstanceModel.fleet_id == fleet.id,
+                InstanceModel.deleted == False,
+            )
+        )
+        assert list(res.scalars().all()) == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -792,9 +1563,81 @@ class TestApplyFleetPlan:
         response = await client.post(
             f"/api/project/{project.name}/fleets/apply",
             headers=get_auth_headers(user.token),
-            json={"plan": {"spec": spec.dict()}, "force": False},
+            json={"plan": {"spec": spec.model_dump()}, "force": False},
         )
         assert response.status_code == 400
+
+    @pytest.mark.parametrize(
+        ["field_name", "field_value"],
+        [
+            pytest.param("backends", [BackendType.AWS], id="backends"),
+            pytest.param("regions", ["eu-west-1"], id="regions"),
+            pytest.param("instance_types", ["g6e.24xlarge"], id="instance_types"),
+            pytest.param("idle_duration", 60, id="idle_duration"),
+            pytest.param("tags", {}, id="tags"),  # falsy value
+        ],
+    )
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_errors_if_ssh_fleet_uses_backend_only_field(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        field_name: str,
+        field_value: Any,
+    ):
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        conf = get_ssh_fleet_configuration(name="test-ssh-fleet", hosts=["1.1.1.1"])
+        setattr(conf, field_name, field_value)
+        spec = get_fleet_spec(conf=conf)
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/apply",
+            headers=get_auth_headers(user.token),
+            json={"plan": {"spec": spec.model_dump()}, "force": False},
+        )
+        assert response.status_code == 400, response.json()
+        assert response.json()["detail"][0]["msg"] == (
+            f"SSH fleet configuration does not support the following fields: ['{field_name}']"
+        )
+
+    @pytest.mark.parametrize(
+        ["field_name", "field_value"],
+        [
+            pytest.param("env", Env.model_validate({"K": "V"}), id="env"),
+        ],
+    )
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_errors_if_backend_fleet_uses_ssh_only_field(
+        self,
+        test_db,
+        session: AsyncSession,
+        client: AsyncClient,
+        field_name: str,
+        field_value: Any,
+    ):
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        conf = get_fleet_configuration()
+        setattr(conf, field_name, field_value)
+        spec = get_fleet_spec(conf=conf)
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/apply",
+            headers=get_auth_headers(user.token),
+            json={"plan": {"spec": spec.model_dump()}, "force": False},
+        )
+        assert response.status_code == 400, response.json()
+        assert response.json()["detail"][0]["msg"] == (
+            f"Backend fleet configuration does not support the following fields: ['{field_name}']"
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -823,17 +1666,57 @@ class TestApplyFleetPlan:
             response = await client.post(
                 f"/api/project/{project.name}/fleets/apply",
                 headers=get_auth_headers(user.token),
-                json={"plan": {"spec": spec.dict()}, "force": False},
+                json={"plan": {"spec": spec.model_dump()}, "force": False},
             )
         assert response.status_code in [401, 403]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_importer_member_cannot_apply_plan_on_imported_fleet(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.ADMIN,
+        )
+        spec = get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet"))
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=spec,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        response = await client.post(
+            f"/api/project/{exporter_project.name}/fleets/apply",
+            headers=get_auth_headers(importer_user.token),
+            json={"plan": {"spec": spec.model_dump()}, "force": False},
+        )
+        assert response.status_code == 403
+
+
+@pytest.fixture
+def no_lock_retry_wait(monkeypatch: pytest.MonkeyPatch):
+    """Makes tests asserting lock contention errors exhaust the retries without waiting."""
+    monkeypatch.setattr(fleets_services, "_LOCK_RETRY_INTERVAL", 0)
 
 
 class TestDeleteFleets:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/project/main/fleets/delete")
         assert response.status_code in [401, 403]
 
@@ -867,7 +1750,38 @@ class TestDeleteFleets:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_400_when_fleets_in_use(
+    async def test_returns_400_when_fleet_in_use(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        fleet = await create_fleet(session=session, project=project)
+        repo = await create_repo(
+            session=session,
+            project_id=project.id,
+        )
+        await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+        )
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/delete",
+            headers=get_auth_headers(user.token),
+            json={"names": [fleet.name]},
+        )
+        assert response.status_code == 400
+        await session.refresh(fleet)
+        assert not fleet.deleted
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_400_when_fleet_instance_in_use(
         self, test_db, session: AsyncSession, client: AsyncClient
     ):
         user = await create_user(session, global_role=GlobalRole.USER)
@@ -910,6 +1824,37 @@ class TestDeleteFleets:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_400_when_fleet_locked(
+        self, test_db, session: AsyncSession, client: AsyncClient, no_lock_retry_wait
+    ):
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        fleet = await create_fleet(session=session, project=project)
+        instance = await create_instance(
+            session=session,
+            project=project,
+        )
+        fleet.instances.append(instance)
+        fleet.lock_expires_at = datetime(2023, 1, 2, 3, 5, tzinfo=timezone.utc)
+        await session.commit()
+
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/delete",
+            headers=get_auth_headers(user.token),
+            json={"names": [fleet.name]},
+        )
+        assert response.status_code == 400
+
+        await session.refresh(fleet)
+        await session.refresh(instance)
+        assert fleet.status != FleetStatus.TERMINATING
+        assert instance.status != InstanceStatus.TERMINATING
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
     async def test_forbids_if_no_permission_to_manage_ssh_fleets(
         self, test_db, session: AsyncSession, client: AsyncClient
     ):
@@ -940,13 +1885,46 @@ class TestDeleteFleets:
             )
         assert response.status_code in [401, 403]
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_importer_member_cannot_delete_imported_fleet(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.ADMIN,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        response = await client.post(
+            f"/api/project/{exporter_project.name}/fleets/delete",
+            headers=get_auth_headers(importer_user.token),
+            json={"names": [fleet.name]},
+        )
+        assert response.status_code == 403
+
 
 class TestDeleteFleetInstances:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/project/main/fleets/delete_instances")
         assert response.status_code in [401, 403]
 
@@ -970,10 +1948,34 @@ class TestDeleteFleetInstances:
             session=session,
             project=project,
             instance_num=2,
+            status=InstanceStatus.IDLE,
+        )
+        instance3 = await create_instance(
+            session=session,
+            project=project,
+            instance_num=3,
+            status=InstanceStatus.BUSY,
         )
         fleet.instances.append(instance1)
         fleet.instances.append(instance2)
-        await session.commit()
+        fleet.instances.append(instance3)
+        repo = await create_repo(
+            session=session,
+            project_id=project.id,
+        )
+        # Run assigned to instance 3. Should not interfere with deleting instance 1.
+        run = await create_run(
+            session=session,
+            project=project,
+            repo=repo,
+            user=user,
+            fleet=fleet,
+        )
+        await create_job(
+            session=session,
+            run=run,
+            instance=instance3,
+        )
         response = await client.post(
             f"/api/project/{project.name}/fleets/delete_instances",
             headers=get_auth_headers(user.token),
@@ -985,6 +1987,84 @@ class TestDeleteFleetInstances:
         await session.refresh(instance2)
 
         assert instance1.status == InstanceStatus.TERMINATING
+        assert instance2.status != InstanceStatus.TERMINATING
+        assert fleet.status != FleetStatus.TERMINATING
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_ignores_lock_on_non_selected_instances(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        fleet = await create_fleet(session=session, project=project)
+        instance1 = await create_instance(
+            session=session,
+            project=project,
+            instance_num=1,
+        )
+        instance2 = await create_instance(
+            session=session,
+            project=project,
+            instance_num=2,
+        )
+        fleet.instances.append(instance1)
+        fleet.instances.append(instance2)
+        instance2.lock_expires_at = datetime(2023, 1, 2, 3, 5, tzinfo=timezone.utc)
+        await session.commit()
+
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/delete_instances",
+            headers=get_auth_headers(user.token),
+            json={"name": fleet.name, "instance_nums": [1]},
+        )
+        assert response.status_code == 200
+        await session.refresh(fleet)
+        await session.refresh(instance1)
+        await session.refresh(instance2)
+        assert instance1.status == InstanceStatus.TERMINATING
+        assert instance2.status != InstanceStatus.TERMINATING
+        assert fleet.status != FleetStatus.TERMINATING
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_400_when_selected_instance_locked(
+        self, test_db, session: AsyncSession, client: AsyncClient, no_lock_retry_wait
+    ):
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        fleet = await create_fleet(session=session, project=project)
+        instance1 = await create_instance(
+            session=session,
+            project=project,
+            instance_num=1,
+        )
+        instance2 = await create_instance(
+            session=session,
+            project=project,
+            instance_num=2,
+        )
+        fleet.instances.append(instance1)
+        fleet.instances.append(instance2)
+        instance1.lock_expires_at = datetime(2023, 1, 2, 3, 5, tzinfo=timezone.utc)
+        await session.commit()
+
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/delete_instances",
+            headers=get_auth_headers(user.token),
+            json={"name": fleet.name, "instance_nums": [1]},
+        )
+        assert response.status_code == 400
+        await session.refresh(fleet)
+        await session.refresh(instance1)
+        await session.refresh(instance2)
+        assert instance1.status != InstanceStatus.TERMINATING
         assert instance2.status != InstanceStatus.TERMINATING
         assert fleet.status != FleetStatus.TERMINATING
 
@@ -1034,13 +2114,113 @@ class TestDeleteFleetInstances:
         assert instance.status != InstanceStatus.TERMINATING
         assert fleet.status != FleetStatus.TERMINATING
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_400_when_fleet_locked(
+        self, test_db, session: AsyncSession, client: AsyncClient, no_lock_retry_wait
+    ):
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        fleet = await create_fleet(session=session, project=project)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            instance_num=1,
+        )
+        fleet.instances.append(instance)
+        fleet.lock_expires_at = datetime(2023, 1, 2, 3, 5, tzinfo=timezone.utc)
+        await session.commit()
+
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/delete_instances",
+            headers=get_auth_headers(user.token),
+            json={"name": fleet.name, "instance_nums": [1]},
+        )
+        assert response.status_code == 400
+
+        await session.refresh(fleet)
+        await session.refresh(instance)
+        assert fleet.status != FleetStatus.TERMINATING
+        assert instance.status != InstanceStatus.TERMINATING
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_importer_member_cannot_delete_imported_fleet_instances(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.ADMIN,
+        )
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        await create_instance(
+            session=session,
+            project=exporter_project,
+            fleet=fleet,
+            instance_num=1,
+        )
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        response = await client.post(
+            f"/api/project/{exporter_project.name}/fleets/delete_instances",
+            headers=get_auth_headers(importer_user.token),
+            json={"name": fleet.name, "instance_nums": [1]},
+        )
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_rejects_deleting_placeholder_instance(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session, global_role=GlobalRole.USER)
+        project = await create_project(session)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        fleet = await create_fleet(session=session, project=project)
+        await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            instance_num=0,
+            status=InstanceStatus.PENDING,
+            provisioning_job_id=uuid4(),
+            offer=None,
+            job_provisioning_data=None,
+        )
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/delete_instances",
+            headers=get_auth_headers(user.token),
+            json={"name": fleet.name, "instance_nums": [0]},
+        )
+        assert response.status_code == 400
+        assert "provisioning" in response.text
+
 
 class TestGetPlan:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/project/main/fleets/get_plan")
         assert response.status_code in [401, 403]
 
@@ -1075,7 +2255,7 @@ class TestGetPlan:
             response = await client.post(
                 f"/api/project/{project.name}/fleets/get_plan",
                 headers=get_auth_headers(user.token),
-                json={"spec": spec.dict()},
+                json={"spec": spec.model_dump()},
             )
             backend_mock.compute.return_value.get_offers.assert_called_once()
 
@@ -1083,14 +2263,86 @@ class TestGetPlan:
         assert response.json() == {
             "project_name": project.name,
             "user": user.name,
-            "spec": json.loads(spec.json()),
-            "effective_spec": json.loads(spec.json()),
+            "spec": json.loads(spec.model_dump_json()),
+            "effective_spec": json.loads(spec.model_dump_json()),
             "current_resource": None,
-            "offers": [json.loads(o.json()) for o in offers],
+            "offers": [json.loads(o.model_dump_json()) for o in offers],
             "total_offers": len(offers),
             "max_offer_price": 1.0,
             "action": "create",
         }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_offers_for_elastic_container_backend_fleet(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        offer = get_instance_offer_with_availability(
+            backend=BackendType.RUNPOD,
+            region="US-OR-1",
+            price=0.7185,
+        )
+        spec = get_fleet_spec(
+            conf=get_fleet_configuration(nodes=FleetNodesSpec(min=0, target=0, max=1))
+        )
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.RUNPOD
+            backend_mock.compute.return_value.get_offers.return_value = [offer]
+            response = await client.post(
+                f"/api/project/{project.name}/fleets/get_plan",
+                headers=get_auth_headers(user.token),
+                json={"spec": spec.model_dump()},
+            )
+            backend_mock.compute.return_value.get_offers.assert_called_once()
+
+        response_json = response.json()
+        assert response.status_code == 200, response_json
+        assert response_json["offers"] == [json.loads(offer.model_dump_json())]
+        assert response_json["total_offers"] == 1
+        assert response_json["max_offer_price"] == offer.price
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_no_offers_for_non_elastic_container_backend_fleet(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        offer = get_instance_offer_with_availability(
+            backend=BackendType.RUNPOD,
+            region="US-OR-1",
+            price=0.7185,
+        )
+        spec = get_fleet_spec(
+            conf=get_fleet_configuration(nodes=FleetNodesSpec(min=0, target=1, max=1))
+        )
+        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
+            backend_mock = Mock()
+            m.return_value = [backend_mock]
+            backend_mock.TYPE = BackendType.RUNPOD
+            backend_mock.compute.return_value.get_offers.return_value = [offer]
+            response = await client.post(
+                f"/api/project/{project.name}/fleets/get_plan",
+                headers=get_auth_headers(user.token),
+                json={"spec": spec.model_dump()},
+            )
+            backend_mock.compute.return_value.get_offers.assert_called_once()
+
+        response_json = response.json()
+        assert response.status_code == 200, response_json
+        assert response_json["offers"] == []
+        assert response_json["total_offers"] == 0
+        assert response_json["max_offer_price"] is None
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -1104,9 +2356,9 @@ class TestGetPlan:
         )
         conf = get_ssh_fleet_configuration(hosts=["10.0.0.100"])
         spec = get_fleet_spec(conf=conf)
-        effective_spec = spec.copy(deep=True)
+        effective_spec = spec.model_copy(deep=True)
         effective_spec.configuration.ssh_config.ssh_key = None
-        current_spec = spec.copy(deep=True)
+        current_spec = spec.model_copy(deep=True)
         # `hosts` can be updated in-place
         current_spec.configuration.ssh_config.hosts = ["10.0.0.100", "10.0.0.101"]
         fleet = await create_fleet(session=session, project=project, spec=current_spec)
@@ -1114,21 +2366,106 @@ class TestGetPlan:
         response = await client.post(
             f"/api/project/{project.name}/fleets/get_plan",
             headers=get_auth_headers(user.token),
-            json={"spec": spec.dict()},
+            json={"spec": spec.model_dump()},
         )
 
         assert response.status_code == 200
         assert response.json() == {
             "project_name": project.name,
             "user": user.name,
-            "spec": spec.dict(),
-            "effective_spec": effective_spec.dict(),
+            "spec": spec.model_dump(),
+            "effective_spec": effective_spec.model_dump(),
             "current_resource": _fleet_model_to_json_dict(fleet),
             "offers": [],
             "total_offers": 0,
             "max_offer_price": None,
             "action": "update",
         }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_update_plan_for_existing_cloud_fleet_nodes_update(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        current_spec = get_fleet_spec(
+            conf=get_fleet_configuration(nodes=FleetNodesSpec(min=0, target=0, max=1))
+        )
+        spec = current_spec.model_copy(deep=True)
+        spec.configuration.nodes = FleetNodesSpec(min=1, target=1, max=1)
+        fleet = await create_fleet(session=session, project=project, spec=current_spec)
+
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/get_plan",
+            headers=get_auth_headers(user.token),
+            json={"spec": spec.model_dump()},
+        )
+
+        response_json = response.json()
+        assert response.status_code == 200, response_json
+        assert response_json["current_resource"]["id"] == str(fleet.id)
+        assert response_json["action"] == "update"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_create_plan_for_existing_cloud_fleet_blocks_update(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        current_spec = get_fleet_spec(
+            conf=get_fleet_configuration(nodes=FleetNodesSpec(min=0, target=0, max=1))
+        )
+        spec = current_spec.model_copy(deep=True)
+        spec.configuration.blocks = 2
+        fleet = await create_fleet(session=session, project=project, spec=current_spec)
+
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/get_plan",
+            headers=get_auth_headers(user.token),
+            json={"spec": spec.model_dump()},
+        )
+
+        response_json = response.json()
+        assert response.status_code == 200, response_json
+        assert response_json["current_resource"]["id"] == str(fleet.id)
+        assert response_json["action"] == "create"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+    async def test_returns_update_plan_for_existing_cloud_fleet_provisioning_fields_update(
+        self, test_db, session: AsyncSession, client: AsyncClient
+    ):
+        user = await create_user(session=session, global_role=GlobalRole.USER)
+        project = await create_project(session=session, owner=user)
+        await add_project_member(
+            session=session, project=project, user=user, project_role=ProjectRole.USER
+        )
+        current_spec = get_fleet_spec(
+            conf=get_fleet_configuration(nodes=FleetNodesSpec(min=0, target=0, max=1))
+        )
+        spec = current_spec.model_copy(deep=True)
+        spec.configuration.backends = [BackendType.AWS]
+        spec.configuration.regions = ["us-east-1"]
+        fleet = await create_fleet(session=session, project=project, spec=current_spec)
+
+        response = await client.post(
+            f"/api/project/{project.name}/fleets/get_plan",
+            headers=get_auth_headers(user.token),
+            json={"spec": spec.model_dump()},
+        )
+
+        response_json = response.json()
+        assert response.status_code == 200, response_json
+        assert response_json["current_resource"]["id"] == str(fleet.id)
+        assert response_json["action"] == "update"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -1142,9 +2479,9 @@ class TestGetPlan:
         )
         conf = get_ssh_fleet_configuration(placement=InstanceGroupPlacement.ANY)
         spec = get_fleet_spec(conf=conf)
-        effective_spec = spec.copy(deep=True)
+        effective_spec = spec.model_copy(deep=True)
         effective_spec.configuration.ssh_config.ssh_key = None
-        current_spec = spec.copy(deep=True)
+        current_spec = spec.model_copy(deep=True)
         # `placement` cannot be updated in-place
         current_spec.configuration.placement = InstanceGroupPlacement.CLUSTER
         fleet = await create_fleet(session=session, project=project, spec=current_spec)
@@ -1152,15 +2489,15 @@ class TestGetPlan:
         response = await client.post(
             f"/api/project/{project.name}/fleets/get_plan",
             headers=get_auth_headers(user.token),
-            json={"spec": spec.dict()},
+            json={"spec": spec.model_dump()},
         )
 
         assert response.status_code == 200
         assert response.json() == {
             "project_name": project.name,
             "user": user.name,
-            "spec": spec.dict(),
-            "effective_spec": effective_spec.dict(),
+            "spec": spec.model_dump(),
+            "effective_spec": effective_spec.model_dump(),
             "current_resource": _fleet_model_to_json_dict(fleet),
             "offers": [],
             "total_offers": 0,
@@ -1168,68 +2505,39 @@ class TestGetPlan:
             "action": "create",
         }
 
-    @pytest.mark.parametrize(
-        ("client_version", "expected_availability"),
-        [
-            ("0.20.3", InstanceAvailability.NOT_AVAILABLE),
-            ("0.20.4", InstanceAvailability.NO_BALANCE),
-            (None, InstanceAvailability.NO_BALANCE),
-        ],
-    )
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_replaces_no_balance_with_not_available_for_old_clients(
-        self,
-        test_db,
-        session: AsyncSession,
-        client: AsyncClient,
-        client_version: Optional[str],
-        expected_availability: InstanceAvailability,
+    async def test_importer_member_cannot_get_plan_for_imported_fleet(
+        self, test_db, session: AsyncSession, client: AsyncClient
     ):
-        user = await create_user(session=session)
-        project = await create_project(session=session, owner=user)
-        offers = [
-            InstanceOfferWithAvailability(
-                backend=BackendType.AWS,
-                instance=InstanceType(
-                    name="instance-1",
-                    resources=Resources(cpus=1, memory_mib=512, spot=False, gpus=[]),
-                ),
-                region="us",
-                price=1.0,
-                availability=InstanceAvailability.AVAILABLE,
-            ),
-            InstanceOfferWithAvailability(
-                backend=BackendType.AWS,
-                instance=InstanceType(
-                    name="instance-2",
-                    resources=Resources(cpus=2, memory_mib=1024, spot=False, gpus=[]),
-                ),
-                region="us",
-                price=2.0,
-                availability=InstanceAvailability.NO_BALANCE,
-            ),
-        ]
-        headers = get_auth_headers(user.token)
-        if client_version is not None:
-            headers["X-API-Version"] = client_version
-        with patch("dstack._internal.server.services.backends.get_project_backends") as m:
-            backend_mock = Mock()
-            m.return_value = [backend_mock]
-            backend_mock.TYPE = BackendType.AWS
-            backend_mock.compute.return_value.get_offers.return_value = offers
-            response = await client.post(
-                f"/api/project/{project.name}/fleets/get_plan",
-                headers=headers,
-                json={"spec": get_fleet_spec().dict()},
-            )
-
-        assert response.status_code == 200
-        offers = response.json()["offers"]
-        assert len(offers) == 2
-        assert offers[0]["availability"] == InstanceAvailability.AVAILABLE.value
-        assert offers[1]["availability"] == expected_availability.value
+        importer_user = await create_user(
+            session, name="importer-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(session, name="exporter-project")
+        importer_project = await create_project(
+            session, name="importer-project", owner=importer_user
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project,
+            user=importer_user,
+            project_role=ProjectRole.ADMIN,
+        )
+        spec = get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet"))
+        fleet = await create_fleet(session=session, project=exporter_project, spec=spec)
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project],
+            exported_fleets=[fleet],
+        )
+        response = await client.post(
+            f"/api/project/{exporter_project.name}/fleets/get_plan",
+            headers=get_auth_headers(importer_user.token),
+            json={"spec": spec.model_dump()},
+        )
+        assert response.status_code == 403
 
 
 def _fleet_model_to_json_dict(fleet: FleetModel) -> dict:
-    return json.loads(fleet_model_to_fleet(fleet).json())
+    return json.loads(fleet_model_to_fleet(fleet).model_dump_json())

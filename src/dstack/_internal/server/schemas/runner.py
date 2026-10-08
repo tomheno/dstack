@@ -1,14 +1,14 @@
 from base64 import b64decode
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
-from pydantic import Field, validator
-from typing_extensions import Annotated
+from pydantic import Field, field_validator
 
 from dstack._internal.core.models.common import CoreModel, NetworkMode
 from dstack._internal.core.models.repos.remote import RemoteRepoCreds
 from dstack._internal.core.models.runs import (
     ClusterInfo,
+    ImagePullProgress,
     JobSpec,
     JobStatus,
     JobSubmission,
@@ -28,10 +28,12 @@ class JobStateEvent(CoreModel):
 
 
 class LogEvent(CoreModel):
-    timestamp: int  # milliseconds
+    timestamp: int
+    """`timestamp` is stored in milliseconds."""
     message: bytes
 
-    @validator("message", pre=True)
+    @field_validator("message", mode="before")
+    @classmethod
     def decode_message(cls, v: Union[str, bytes]) -> bytes:
         if isinstance(v, str):
             return b64decode(v)
@@ -43,73 +45,86 @@ class PullResponse(CoreModel):
     job_logs: List[LogEvent]
     runner_logs: List[LogEvent]
     last_updated: int
-    no_connections_secs: Optional[int] = None  # Optional for compatibility with old runners
+    no_connections_secs: Optional[int] = None
+    """`no_connections_secs` is optional for compatibility with old runners."""
+    has_more: Optional[bool] = None
+    """`has_more` tells whether the runner may still have logs to hand over.
+    It is optional for compatibility with runners that do not report it.
+    """
+
+
+class JobInfoResponse(CoreModel):
+    working_dir: str
+    username: str
+
+
+# What the runner is actually sent. This used to be spelled as `Field(include=...)` per field, but
+# pydantic v2 removed `include` from `Field` — it is silently ignored there, which would have sent
+# the runner every field of `Run`, `JobSpec` and `JobSubmission` instead of these subsets. It lives
+# on the model rather than at the call site so that a new caller cannot bypass it.
+#
+# A name the target model does not declare is ignored: `entrypoint` and `gateway` are listed for
+# `job_spec` but `JobSpec` has neither.
+_SUBMIT_BODY_INCLUDE: Dict[str, Any] = {
+    "run": {
+        "id": True,
+        "run_spec": {
+            "run_name",
+            "repo_id",
+            "repo_data",
+            "configuration",
+            "configuration_path",
+        },
+    },
+    "job_spec": {
+        "replica_num",
+        "job_num",
+        "jobs_per_replica",
+        "user",
+        "commands",
+        "entrypoint",
+        "env",
+        "gateway",
+        "single_branch",
+        "max_duration",
+        "ssh_key",
+        "working_dir",
+        "repo_dir",
+        "repo_data",
+        "repo_exists_action",
+        "file_archives",
+    },
+    "job_submission": {"id"},
+    "cluster_info": True,
+    "secrets": True,
+    "repo_credentials": True,
+    "log_quota_hour": True,
+    "run_spec": {
+        "run_name",
+        "repo_id",
+        "repo_data",
+        "configuration",
+        "configuration_path",
+    },
+}
 
 
 class SubmitBody(CoreModel):
-    run: Annotated[
-        Run,
-        Field(
-            include={
-                "id": True,
-                "run_spec": {
-                    "run_name",
-                    "repo_id",
-                    "repo_data",
-                    "configuration",
-                    "configuration_path",
-                },
-            }
-        ),
-    ]
-    job_spec: Annotated[
-        JobSpec,
-        Field(
-            include={
-                "replica_num",
-                "job_num",
-                "jobs_per_replica",
-                "user",
-                "commands",
-                "entrypoint",
-                "env",
-                "gateway",
-                "single_branch",
-                "max_duration",
-                "ssh_key",
-                "working_dir",
-                "repo_dir",
-                "repo_data",
-                "repo_exists_action",
-                "file_archives",
-            }
-        ),
-    ]
-    job_submission: Annotated[
-        JobSubmission,
-        Field(
-            include={
-                "id",
-            }
-        ),
-    ]
-    cluster_info: Annotated[Optional[ClusterInfo], Field(include=True)]
-    secrets: Annotated[Optional[Dict[str, str]], Field(include=True)]
-    repo_credentials: Annotated[Optional[RemoteRepoCreds], Field(include=True)]
-    # run_spec is deprecated in favor of run.run_spec
-    # TODO: Remove once we no longer support instances deployed with 0.19.8 or earlier.
-    run_spec: Annotated[
-        RunSpec,
-        Field(
-            include={
-                "run_name",
-                "repo_id",
-                "repo_data",
-                "configuration",
-                "configuration_path",
-            },
-        ),
-    ]
+    run: Run
+    job_spec: JobSpec
+    job_submission: JobSubmission
+    cluster_info: Optional[ClusterInfo] = None
+    secrets: Optional[Dict[str, str]] = None
+    repo_credentials: Optional[RemoteRepoCreds] = None
+    log_quota_hour: Optional[int] = None
+    """Maximum bytes of log output per hour. None means unlimited."""
+    # TODO: remove `run_spec` once instances deployed with 0.19.8 or earlier are no longer supported.
+    run_spec: RunSpec
+    """`run_spec` is deprecated in favor of `run.run_spec`."""
+
+    def json_for_runner(self) -> str:
+        """The JSON the runner is sent, restricted to `_SUBMIT_BODY_INCLUDE`."""
+        return self.model_dump_json(include=_SUBMIT_BODY_INCLUDE)
 
 
 class HealthcheckResponse(CoreModel):
@@ -119,6 +134,14 @@ class HealthcheckResponse(CoreModel):
 
 class InstanceHealthResponse(CoreModel):
     dcgm: Optional[DCGMHealthResponse] = None
+
+
+class InstanceInfoResponse(CoreModel):
+    gpu_vendor: Optional[str] = None
+    """`gpu_vendor` is not set on hosts without GPUs."""
+    gpu_driver_version: Optional[str] = None
+    """`gpu_driver_version` is not set on hosts without GPUs
+    and when driver detection fails."""
 
 
 class ShutdownRequest(CoreModel):
@@ -138,7 +161,8 @@ class ComponentStatus(str, Enum):
 
 
 class ComponentInfo(CoreModel):
-    name: str  # Not using ComponentName enum for compatibility of newer shim with older server
+    name: str
+    """`name` does not use `ComponentName` so newer shim versions remain compatible with the older server."""
     version: str
     status: ComponentStatus
 
@@ -171,9 +195,11 @@ class ShimVolumeInfo(CoreModel):
     volume_id: str
     init_fs: bool
     device_name: Optional[str] = None
-    # NFS mount details for SFS/network volumes
-    nfs_host: Optional[str] = None    # e.g., "nfs.fin-03.datacrunch.io"
-    nfs_pseudo: Optional[str] = None  # e.g., "/path/to/share"
+    # Fork: NFS mount details of a Verda SFS volume, for example
+    # "nfs.fin-03.datacrunch.io" and "/path/to/share". Sent only when set, so the body
+    # of every other volume stays as upstream sends it.
+    nfs_host: Optional[str] = Field(default=None, exclude_if=lambda v: v is None)
+    nfs_pseudo: Optional[str] = Field(default=None, exclude_if=lambda v: v is None)
 
 
 class PortMapping(CoreModel):
@@ -201,8 +227,10 @@ class TaskListItem(CoreModel):
 
 
 class TaskListResponse(CoreModel):
-    ids: Optional[list[str]] = None  # returned by pre-0.19.26 shim
-    tasks: Optional[list[TaskListItem]] = None  # returned by 0.19.26+ shim
+    ids: Optional[list[str]] = None
+    """`ids` is returned by pre-0.19.26 shim versions."""
+    tasks: Optional[list[TaskListItem]] = None
+    """`tasks` is returned by shim versions 0.19.26 and newer."""
 
 
 class TaskInfoResponse(CoreModel):
@@ -210,8 +238,11 @@ class TaskInfoResponse(CoreModel):
     status: TaskStatus
     termination_reason: str
     termination_message: str
-    # default value for backward compatibility with 0.18.34, could be removed after a few releases
     ports: Optional[list[PortMapping]] = []
+    """`ports` uses a default value for backward compatibility with 0.18.34.
+    It can be removed after a few releases.
+    """
+    image_pull_progress: Optional[ImagePullProgress] = None
 
 
 class TaskSubmitRequest(CoreModel):
@@ -269,4 +300,4 @@ class JobResult(CoreModel):
 
 class LegacyPullResponse(CoreModel):
     state: str
-    result: Optional[JobResult]
+    result: Optional[JobResult] = None

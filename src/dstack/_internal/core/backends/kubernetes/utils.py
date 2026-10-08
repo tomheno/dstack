@@ -1,28 +1,198 @@
-from typing import Callable, Optional, TypeVar, Union
+from collections.abc import Generator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import (
+    Annotated,
+    Any,
+    Callable,
+    Generic,
+    Literal,
+    Optional,
+    Protocol,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import yaml
-from kubernetes.client import CoreV1Api
+from kubernetes.client import V1Status, VersionApi
 from kubernetes.client.exceptions import ApiException
-from kubernetes.config import (
-    # XXX: This function is missing in the stubs package
-    new_client_from_config_dict,  # pyright: ignore[reportAttributeAccessIssue]
-)
-from typing_extensions import ParamSpec
+from kubernetes.watch import Watch
+from pydantic import Field
+from typing_extensions import ParamSpec, TypedDict
 
-from dstack._internal.utils.common import get_or_error
+from dstack._internal.core.backends.kubernetes.api_client import (
+    API_CLIENT_EXCEPTIONS,
+    ApiClient,
+    get_api_client_from_kubeconfig_dict,
+)
+from dstack._internal.core.backends.kubernetes.models import (
+    KubernetesBackendConfigWithCreds,
+    KubernetesProxyJumpConfig,
+)
+from dstack._internal.core.models.common import CoreModel, validate_extra_ignore
+from dstack._internal.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 T = TypeVar("T")
 P = ParamSpec("P")
 
 
-def get_api_from_config_data(kubeconfig_data: str) -> CoreV1Api:
-    config_dict = yaml.load(kubeconfig_data, yaml.FullLoader)
-    return get_api_from_config_dict(config_dict)
+LEGACY_CURRENT_CONTEXT_REGION = ""
 
 
-def get_api_from_config_dict(kubeconfig: dict) -> CoreV1Api:
-    api_client = new_client_from_config_dict(config_dict=kubeconfig)
-    return CoreV1Api(api_client=api_client)
+@dataclass
+class Cluster:
+    context_name: str
+    region: str
+    api_client: ApiClient
+    namespace: str
+    proxy_jump: KubernetesProxyJumpConfig
+
+    def __str__(self) -> str:
+        parts: list[str] = []
+        parts.append(f"context={self.context_name!r}")
+        if self.context_name != self.region:
+            parts.append(f"region={self.region!r}")
+        return f"({' '.join(parts)})"
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}{self}"
+
+
+def check_cluster(cluster: Cluster) -> bool:
+    version_api = VersionApi(cluster.api_client)
+    try:
+        version_info = version_api.get_code()
+    except API_CLIENT_EXCEPTIONS as e:
+        logger.debug("cluster %s check failed: %s: %s", cluster, e.__class__.__name__, e)
+        return False
+    logger.debug("cluster %s gitVersion: %s", cluster, version_info.git_version)
+    return True
+
+
+def get_clusters_from_backend_config(
+    config: KubernetesBackendConfigWithCreds,
+    *,
+    request_timeout: Optional[int] = None,
+    retries: Optional[int] = None,
+) -> list[Cluster]:
+    clusters: list[Cluster] = []
+    kubeconfig_dict = kubeconfig_data_to_kubeconfig_dict(config.kubeconfig.data)
+    kubeconfig = kubeconfig_dict_to_kubeconfig(kubeconfig_dict)
+    if config.contexts is not None:
+        for context in config.contexts:
+            if isinstance(context, str):
+                context_name = context
+                proxy_jump = None
+            else:
+                context_name = context.name
+                proxy_jump = context.proxy_jump
+            kubeconfig_context = kubeconfig.get_context(context_name)
+            api_client = get_api_client_from_kubeconfig_dict(
+                kubeconfig_dict,
+                context=context_name,
+                request_timeout=request_timeout,
+                retries=retries,
+            )
+            namespace = kubeconfig_context.namespace
+            if proxy_jump is None:
+                proxy_jump = KubernetesProxyJumpConfig()
+            clusters.append(
+                Cluster(
+                    context_name=context_name,
+                    region=context_name,
+                    api_client=api_client,
+                    namespace=namespace,
+                    proxy_jump=proxy_jump,
+                )
+            )
+    else:
+        current_kubeconfig_context = kubeconfig.get_context()
+        context_name = kubeconfig.current_context
+        # Already checked by Kubeconfig.get_context()
+        assert context_name is not None
+        api_client = get_api_client_from_kubeconfig_dict(
+            kubeconfig_dict,
+            context=context_name,
+            request_timeout=request_timeout,
+            retries=retries,
+        )
+        config_namespace = config.namespace
+        if config_namespace is None:
+            config_namespace = "default"
+        context_namespace = current_kubeconfig_context.namespace
+        if context_namespace != config_namespace:
+            logger.warning(
+                (
+                    "Namespace mismatch: kubeconfig -> '%s', backend config -> '%s'."
+                    " The current dstack version ignores kubeconfig"
+                    " and uses deprecated namespace property from backend config."
+                    " Future versions will use namespace from kubeconfig."
+                    " To keep using '%s' namespace in future versions and suppress this warning,"
+                    " set namespace to '%s' in kubeconfig context '%s'"
+                ),
+                context_namespace,
+                config_namespace,
+                config_namespace,
+                config_namespace,
+                context_name,
+            )
+        proxy_jump = config.proxy_jump
+        if proxy_jump is None:
+            proxy_jump = KubernetesProxyJumpConfig()
+        clusters.append(
+            Cluster(
+                context_name=context_name,
+                region=LEGACY_CURRENT_CONTEXT_REGION,
+                api_client=api_client,
+                # TODO: switch to context_namespace
+                namespace=config_namespace,
+                proxy_jump=proxy_jump,
+            )
+        )
+    return clusters
+
+
+class KubeconfigContext(CoreModel):
+    namespace: str = "default"
+
+
+class KubeconfigNamedContext(CoreModel):
+    name: str
+    context: KubeconfigContext
+
+
+class Kubeconfig(CoreModel):
+    """
+    `Kubeconfig` model only includes fields used by `dstack`.
+    Reference: https://kubernetes.io/docs/reference/config-api/kubeconfig.v1/
+    """
+
+    contexts: list[KubeconfigNamedContext] = []
+    current_context: Annotated[Optional[str], Field(alias="current-context")] = None
+
+    def get_context(self, name: Optional[str] = None) -> KubeconfigContext:
+        if name is None:
+            name = self.current_context
+            if name is None:
+                raise ValueError("current-context is not set")
+        for named_context in self.contexts:
+            if named_context.name == name:
+                return named_context.context
+        raise ValueError(f"context {name} not found")
+
+
+def kubeconfig_data_to_kubeconfig_dict(kubeconfig_data: str) -> dict:
+    kubeconfig_dict = yaml.safe_load(kubeconfig_data)
+    if not isinstance(kubeconfig_dict, dict):
+        raise TypeError(f"Unexpected kubeconfig_data type: {kubeconfig_dict.__class__.__name__}")
+    return kubeconfig_dict
+
+
+def kubeconfig_dict_to_kubeconfig(kubeconfig_dict: dict) -> Kubeconfig:
+    return validate_extra_ignore(Kubeconfig, kubeconfig_dict)
 
 
 def call_api_method(
@@ -54,28 +224,104 @@ def call_api_method(
     return None
 
 
-def get_cluster_public_ip(api: CoreV1Api) -> Optional[str]:
-    """
-    Returns public IP of any cluster node.
-    """
-    public_ips = get_cluster_public_ips(api)
-    if len(public_ips) == 0:
-        return None
-    return public_ips[0]
+class NamespacedNameMethod(Protocol):
+    def __call__(self, name: str, namespace: str) -> Any: ...
 
 
-def get_cluster_public_ips(api: CoreV1Api) -> list[str]:
-    """
-    Returns public IPs of all cluster nodes.
-    """
-    public_ips = []
-    for node in api.list_node().items:
-        node_status = get_or_error(node.status)
-        addresses = get_or_error(node_status.addresses)
+def try_delete_object_if_exists(
+    method: NamespacedNameMethod,
+    *,
+    namespace: str,
+    name: str,
+    description: str,
+    should_delete_manually_if_failed: bool = False,
+) -> bool:
+    try:
+        call_api_method(
+            method,
+            expected=404,
+            namespace=namespace,
+            name=name,
+        )
+    except API_CLIENT_EXCEPTIONS as e:
+        if should_delete_manually_if_failed:
+            logger.exception(
+                "Failed to delete %s %s in namespace %s. Please delete it manually",
+                description,
+                name,
+                namespace,
+            )
+        else:
+            logger.warning(
+                "Failed to delete %s %s in namespace %s: %s: %s",
+                description,
+                name,
+                namespace,
+                e.__class__.__name__,
+                e,
+            )
+        return False
+    return True
 
-        # Look for an external IP address
-        for address in addresses:
-            if address.type == "ExternalIP":
-                public_ips.append(address.address)
 
-    return public_ips
+class ObjectList(Protocol[T]):
+    items: list[T]
+
+
+@contextmanager
+def watch_events(
+    method: Callable[P, ObjectList[T]], *args: P.args, **kwargs: P.kwargs
+) -> Generator[Generator[tuple[str, T], None, None], None, None]:
+    watch = Watch()
+    inner_gen = cast(Generator[_EventDict[T], None, None], watch.stream(method, *args, **kwargs))
+    gen = _watch_events_gen(inner_gen)
+    try:
+        yield gen
+    finally:
+        gen.close()
+        watch.stop()
+
+
+class _StateEventDict(TypedDict, Generic[T]):
+    type: Literal["ADDED", "MODIFIED", "DELETED"]
+    object: T
+
+
+class _BookmarkEventDict(TypedDict, Generic[T]):
+    type: Literal["BOOKMARK"]
+    # The object is a minimal instance of the watched resource's type -- same kind and apiVersion,
+    # but only metadata.resourceVersion is populated. Everything else is empty or zero-valued.
+    object: T
+
+
+class _ErrorEventDict(TypedDict):
+    type: Literal["ERROR"]
+    object: V1Status
+
+
+_EventDict = Union[_StateEventDict[T], _BookmarkEventDict[T], _ErrorEventDict]
+
+
+def _watch_events_gen(
+    gen: Generator[_EventDict[T], None, None],
+) -> Generator[tuple[str, T], None, None]:
+    try:
+        for event in gen:
+            match event["type"]:
+                case "ADDED" | "MODIFIED" | "DELETED":
+                    yield event["type"], event["object"]
+                case "BOOKMARK":
+                    pass
+                case "ERROR":
+                    status = event["object"]
+                    logger.warning(
+                        "Got ERROR event (status=%s reason=%s code=%s): %s",
+                        status.status,
+                        status.reason,
+                        status.code,
+                        status.message,
+                    )
+                case _:
+                    logger.warning("Got unexpected event: %s", event)
+    finally:
+        gen.close()

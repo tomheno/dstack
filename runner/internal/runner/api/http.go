@@ -11,10 +11,10 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/dstackai/dstack/runner/internal/api"
-	"github.com/dstackai/dstack/runner/internal/executor"
-	"github.com/dstackai/dstack/runner/internal/log"
-	"github.com/dstackai/dstack/runner/internal/schemas"
+	"github.com/dstackai/dstack/runner/internal/common/api"
+	"github.com/dstackai/dstack/runner/internal/common/log"
+	"github.com/dstackai/dstack/runner/internal/runner/executor"
+	"github.com/dstackai/dstack/runner/internal/runner/schemas"
 )
 
 // TODO: set some reasonable value; (optional) make configurable
@@ -38,11 +38,15 @@ func (s *Server) metricsGetHandler(w http.ResponseWriter, r *http.Request) (inte
 	return metrics, nil
 }
 
+// submitPostHandler must be called first
+// It's safe to call it more than once
 func (s *Server) submitPostHandler(w http.ResponseWriter, r *http.Request) (interface{}, error) {
 	s.executor.Lock()
 	defer s.executor.Unlock()
 	state := s.executor.GetRunnerState()
-	if state != executor.WaitSubmit {
+	if state == executor.WaitRun {
+		log.Warning(r.Context(), "Job already submitted, submitting again", "current_state", state)
+	} else if state != executor.WaitSubmit {
 		log.Warning(r.Context(), "Executor doesn't wait submit", "current_state", state)
 		return nil, &api.Error{Status: http.StatusConflict}
 	}
@@ -52,20 +56,19 @@ func (s *Server) submitPostHandler(w http.ResponseWriter, r *http.Request) (inte
 		log.Error(r.Context(), "Failed to decode submit body", "err", err)
 		return nil, err
 	}
-	// todo go-playground/validator
 
 	s.executor.SetJob(body)
-	s.jobBarrierCh <- nil // notify server that job submitted
+	s.executor.SetRunnerState(executor.WaitRun)
 
 	return nil, nil
 }
 
-// uploadArchivePostHandler may be called 0 or more times, and must be called after submitPostHandler
-// and before uploadCodePostHandler
+// If uploadArchivePostHandler is called, it must be called after submitPostHandler and before runPostHandler
+// It's safe to call it more than once with the same archive
 func (s *Server) uploadArchivePostHandler(w http.ResponseWriter, r *http.Request) (interface{}, error) {
 	s.executor.Lock()
 	defer s.executor.Unlock()
-	if s.executor.GetRunnerState() != executor.WaitCode {
+	if s.executor.GetRunnerState() != executor.WaitRun {
 		return nil, &api.Error{Status: http.StatusConflict}
 	}
 
@@ -123,10 +126,12 @@ func (s *Server) uploadArchivePostHandler(w http.ResponseWriter, r *http.Request
 	return nil, nil
 }
 
+// If uploadCodePostHandler is called, it must be called after submitPostHandler and before runPostHandler
+// It's safe to call it more than once
 func (s *Server) uploadCodePostHandler(w http.ResponseWriter, r *http.Request) (interface{}, error) {
 	s.executor.Lock()
 	defer s.executor.Unlock()
-	if s.executor.GetRunnerState() != executor.WaitCode {
+	if s.executor.GetRunnerState() != executor.WaitRun {
 		return nil, &api.Error{Status: http.StatusConflict}
 	}
 
@@ -139,27 +144,46 @@ func (s *Server) uploadCodePostHandler(w http.ResponseWriter, r *http.Request) (
 		return nil, fmt.Errorf("copy request body: %w", err)
 	}
 
-	s.executor.SetRunnerState(executor.WaitRun)
-
 	return nil, nil
 }
 
 func (s *Server) runPostHandler(w http.ResponseWriter, r *http.Request) (interface{}, error) {
 	s.executor.Lock()
-	defer s.executor.Unlock()
 	if s.executor.GetRunnerState() != executor.WaitRun {
+		s.executor.Unlock()
 		return nil, &api.Error{Status: http.StatusConflict}
 	}
+	s.executor.SetRunnerState(executor.ServeLogs)
+	s.jobBarrierCh <- nil // notify server that job started
+	s.executor.Unlock()
 
 	var runCtx context.Context
 	runCtx, s.cancelRun = context.WithCancel(context.Background())
+	err := s.executor.Setup(runCtx)
 	go func() {
+		// The server waits on jobBarrierCh to start shutting down, so it must be notified even
+		// when there is no job to run. Finalize() runs first: the server goes on to wait for a
+		// final /api/pull, which is only served once the executor reports its state as final.
+		defer func() { s.jobBarrierCh <- nil }() // notify server that job finished
+		defer s.executor.Finalize(runCtx)        // a safeguard, Setup and Run finalize themselves
+		if err != nil {
+			return
+		}
 		_ = s.executor.Run(runCtx) // INFO: all errors are handled inside the Run()
-		s.jobBarrierCh <- nil      // notify server that job finished
 	}()
-	s.executor.SetRunnerState(executor.ServeLogs)
 
-	return nil, nil
+	if err != nil {
+		// Setup has recorded the failure as a job state, and that state and the logs reach the
+		// server through /api/pull. Reporting the error here would instead be seen as the
+		// runner not accepting the job submission, losing the real termination reason.
+		//nolint:nilerr
+		return nil, nil
+	}
+	username, workingDir := s.executor.JobInfo()
+	return &schemas.JobInfoResponse{
+		Username:   username,
+		WorkingDir: workingDir,
+	}, nil
 }
 
 func (s *Server) pullGetHandler(w http.ResponseWriter, r *http.Request) (interface{}, error) {
@@ -175,7 +199,7 @@ func (s *Server) pullGetHandler(w http.ResponseWriter, r *http.Request) (interfa
 	}
 
 	if s.executor.GetRunnerState() == executor.WaitLogsFinished {
-		defer func() { close(s.pullDoneCh) }()
+		defer s.closePullDone()
 	}
 	return s.executor.GetHistory(timestamp), nil
 }

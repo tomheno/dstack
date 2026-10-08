@@ -1,6 +1,6 @@
 from typing import Annotated, Dict, List, Literal, Optional, Union
 
-from pydantic import Field
+from pydantic import Field, RootModel
 
 from dstack._internal.core.models.common import CoreModel
 
@@ -9,7 +9,7 @@ class AWSOSImage(CoreModel):
     name: Annotated[str, Field(description="The AMI name")]
     owner: Annotated[
         str,
-        Field(regex=r"^(\d{12}|self)$", description="The AMI owner, account ID or `self`"),
+        Field(pattern=r"^(\d{12}|self)$", description="The AMI owner, account ID or `self`"),
     ] = "self"
     user: Annotated[str, Field(description="The OS user for provisioning")]
 
@@ -38,8 +38,8 @@ class AWSDefaultCreds(CoreModel):
 AnyAWSCreds = Union[AWSAccessKeyCreds, AWSDefaultCreds]
 
 
-class AWSCreds(CoreModel):
-    __root__: AnyAWSCreds = Field(..., discriminator="type")
+class AWSCreds(RootModel[Annotated[AnyAWSCreds, Field(discriminator="type")]]):
+    pass
 
 
 class AWSBackendConfig(CoreModel):
@@ -106,6 +106,16 @@ class AWSBackendConfig(CoreModel):
             description="The mapping of instance categories (CPU, NVIDIA GPU) to AMI configurations"
         ),
     ] = None
+    experimental_instance_types: Annotated[
+        Optional[List[str]],
+        Field(
+            description=(
+                "The list of instance type names to allow provisioning in addition to"
+                " the standard supported instance families. Only works for instance types"
+                " included in `dstack`'s pricing catalog (`gpuhunt`)"
+            )
+        ),
+    ] = None
 
 
 class AWSBackendConfigWithCreds(AWSBackendConfig):
@@ -120,7 +130,7 @@ class AWSStoredConfig(AWSBackendConfig):
 
 
 class AWSConfig(AWSStoredConfig):
-    creds: AnyAWSCreds
+    creds: Annotated[AnyAWSCreds, Field(discriminator="type")]
 
     @property
     def allocate_public_ips(self) -> bool:

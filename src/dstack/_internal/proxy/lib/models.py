@@ -1,21 +1,20 @@
 """Things stored in BaseProxyRepo implementations."""
 
 from datetime import datetime
-from typing import Iterable, Literal, Optional, Union
+from typing import Any, Iterable, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated
 
 from dstack._internal.core.models.instances import SSHConnectionParams
-from dstack._internal.core.models.routers import AnyRouterConfig
+from dstack._internal.proxy.lib.const import DEFAULT_SERVICE_READ_TIMEOUT
 from dstack._internal.proxy.lib.errors import UnexpectedProxyError
 
 
 # Models should be immutable so that they can be stored in memory and safely shared by
 # coroutines without copying on every read operation.
 class ImmutableModel(BaseModel):
-    class Config:
-        frozen = True
+    model_config = ConfigDict(frozen=True)
 
 
 class Replica(ImmutableModel):
@@ -23,10 +22,13 @@ class Replica(ImmutableModel):
     app_port: int
     ssh_destination: str
     ssh_port: int
-    ssh_proxy: Optional[SSHConnectionParams]
+    ssh_proxy: Optional[SSHConnectionParams] = None
+    ssh_proxy_private_key: Optional[str] = None
+    "`None` means same as service project's key"
     # Optional outer proxy, a head node/bastion
     ssh_head_proxy: Optional[SSHConnectionParams] = None
     ssh_head_proxy_private_key: Optional[str] = None
+    internal_ip: Optional[str] = None
 
 
 class IPAddressPartitioningKey(ImmutableModel):
@@ -35,11 +37,11 @@ class IPAddressPartitioningKey(ImmutableModel):
 
 class HeaderPartitioningKey(ImmutableModel):
     type: Literal["header"] = "header"
-    header: Annotated[str, Field(regex=r"^[a-zA-Z0-9-_]+$")]  # prevent Nginx config injection
+    header: Annotated[str, Field(pattern=r"^[a-zA-Z0-9-_]+$")]  # prevent Nginx config injection
 
 
 class RateLimit(ImmutableModel):
-    prefix: Annotated[str, Field(regex=r"^/[^\s\\{}]*$")]  # prevent Nginx config injection
+    prefix: Annotated[str, Field(pattern=r"^/[^\s\\{}]*$")]  # prevent Nginx config injection
     key: Annotated[
         Union[IPAddressPartitioningKey, HeaderPartitioningKey],
         Field(discriminator="type"),
@@ -49,16 +51,32 @@ class RateLimit(ImmutableModel):
 
 
 class Service(ImmutableModel):
+    id: Optional[str] = None
+    """Can temporarily be `None` for services registered before 0.21.0"""
     project_name: str
     run_name: str
-    domain: Optional[str]  # only used on gateways
-    https: Optional[bool]  # only used on gateways
+    domain: Optional[str] = None  # only used on gateways
+    https: Optional[bool] = None  # only used on gateways
     rate_limits: tuple[RateLimit, ...] = ()  # only used on gateways
     auth: bool
     client_max_body_size: int  # only enforced on gateways
     strip_prefix: bool = True  # only used in-server
     replicas: tuple[Replica, ...]
-    router: Optional[AnyRouterConfig] = None
+    has_router_replica: bool = False
+    cors_enabled: bool = False  # only used on gateways; enabled for openai-format models
+    proxy_buffering: bool = True
+    """Only used on gateways. Disabled for services with a model so that streamed responses
+    reach the client as the replica emits them."""
+    read_timeout: int = DEFAULT_SERVICE_READ_TIMEOUT
+    """Seconds to wait for data from a replica between two successive reads."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_router(cls, data: Any) -> Any:
+        """Ignore the dropped `router` field for compatibility with 0.19.38-0.21.3 state files."""
+        if isinstance(data, dict) and "router" in data:
+            data = {k: v for k, v in data.items() if k != "router"}
+        return data
 
     @property
     def domain_safe(self) -> str:
@@ -73,7 +91,10 @@ class Service(ImmutableModel):
         return self.https
 
     def with_replicas(self, new_replicas: Iterable[Replica]) -> "Service":
-        return Service(**{**self.dict(), "replicas": tuple(new_replicas)})
+        return Service(**{**self.model_dump(), "replicas": tuple(new_replicas)})
+
+    def with_id(self, new_id: str) -> "Service":
+        return Service(**{**self.model_dump(), "id": new_id})
 
     def find_replica(self, replica_id: str) -> Optional[Replica]:
         for replica in self.replicas:

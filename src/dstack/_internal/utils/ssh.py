@@ -1,10 +1,14 @@
+import base64
 import io
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Union
 
@@ -30,6 +34,77 @@ def get_public_key_fingerprint(text: str) -> str:
     pb = PublicBlob.from_string(text)
     pk = PKey.from_type_string(pb.key_type, pb.key_blob)
     return pk.fingerprint
+
+
+@dataclass
+class PublicKey:
+    """
+    A public key in OpenSSH disk format, parsed into fields.
+
+    Converting to str renders the key back into the one-line `type blob [comment]` form.
+
+    Attributes:
+        type: The key type, e.g. `ssh-ed25519`.
+        blob_base64: The base64-encoded key blob, as it appears in the key file.
+        comment: The comment or None if the key has no comment.
+    """
+
+    type: str
+    blob_base64: str
+    comment: Optional[str] = None
+
+    def __str__(self) -> str:
+        if not self.comment:
+            return f"{self.type} {self.blob_base64}"
+        return f"{self.type} {self.blob_base64} {self.comment}"
+
+
+def parse_public_key(key: str) -> PublicKey:
+    """
+    Parses a public key in OpenSSH disk format into its fields.
+
+    Performs basic validation -- ensures that the key consists of exactly one line, that the blob
+    is valid base64, and that the type field matches the type encoded in the blob. The key type
+    itself is not restricted, that is, keys of any type, including types unsupported by dstack,
+    are accepted.
+
+    Options (an optional field preceding the key type in the authorized_keys format) are not
+    supported -- the first field is always interpreted as a key type, so a line with options is
+    rejected as invalid.
+
+    The comment, if present, is normalized -- surrounding whitespaces are removed, adjacent
+    whitespaces are collapsed into a single space.
+
+    Args:
+        key: The public key in OpenSSH disk format, a `type blob [comment]` string.
+
+    Returns:
+        The parsed key. The blob is stored as is, without decoding.
+
+    Raises:
+        ValueError: Invalid public key.
+    """
+    lines = key.strip().splitlines()
+    if len(lines) != 1:
+        raise ValueError("Expected a single line")
+    try:
+        type_declared, blob_base64, *comment_parts = lines[0].split()
+    except ValueError:
+        raise ValueError("Not enough fields")
+    # paramiko.pkey.PublicBlob.from_string() performs the same key type check
+    try:
+        blob = base64.b64decode(blob_base64, validate=True)
+        [type_length] = struct.unpack(">I", blob[:4])
+        type_parsed = blob[4 : 4 + type_length].decode()
+    except (ValueError, struct.error) as e:
+        raise ValueError(f"Failed to parse key: {e}") from e
+    if type_declared != type_parsed:
+        raise ValueError(f"Key type mismatch: {type_declared} != {type_parsed}")
+    if comment_parts:
+        comment = " ".join(comment_parts)
+    else:
+        comment = None
+    return PublicKey(type=type_declared, blob_base64=blob_base64, comment=comment)
 
 
 def get_host_config(hostname: str, ssh_config_path: PathLike = default_ssh_config_path) -> dict:
@@ -101,12 +176,12 @@ def normalize_path(path: PathLike, *, collapse_user: bool = False) -> str:
     :param collapse_user: try to replace user home prefix with `~`. `False` by default.
     :return: Normalized path as string
     """
-    if collapse_user:
+    if collapse_user and (openssh_home := _get_openssh_home()) is not None:
         # The following "reverse" expanduser operation not only makes paths shorter and "nicer",
         # but also fixes one specific issue with OpenSSH bundled with Git for Windows (MSYS2),
         # see :func:`include_ssh_config` for details.
         try:
-            path = Path(path).relative_to(Path.home())
+            path = Path(path).relative_to(openssh_home)
             path = f"~/{path}"
         except ValueError:
             pass
@@ -128,6 +203,20 @@ def normalize_path(path: PathLike, *, collapse_user: bool = False) -> str:
         # no backslash-escaping pitfalls)
         return str(path).replace("\\", "/")
     return str(path)
+
+
+def _get_openssh_home() -> Optional[Path]:
+    if IS_WINDOWS:
+        return Path.home()
+
+    # POSIX OpenSSH expands `~` from the passwd entry, even when `HOME` is overridden.
+    # Match that behavior so paths under a temporary `HOME` remain absolute in SSH config.
+    import pwd
+
+    try:
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except KeyError:
+        return None
 
 
 def include_ssh_config(path: PathLike, ssh_config_path: PathLike = default_ssh_config_path):
@@ -254,6 +343,58 @@ def generate_public_key(private_key: PKey) -> str:
     return public_key
 
 
+def resolve_ssh_key(
+    path: PathLike,
+) -> Union[
+    tuple[str, Path, str, Path],
+    tuple[str, None, str, Path],
+    tuple[str, Path, None, None],
+]:
+    """
+    Resolves a private or public key path to key contents and paths.
+
+    If a private key is given, only supported private key types are allowed. PKCS#8 keys are
+    converted to PEM, so the returned private key may differ from the file contents. If a
+    corresponding ".pub" file exists, its contents is used as a public key without any validation
+    and its path is returned as the public key path, otherwise a public key is generated from the
+    private key and the public key path is None.
+
+    If a public key is given, any valid public key is allowed regardless of its type, and both
+    private key values are None. No corresponding private key (a file without ".pub" suffix) is
+    checked.
+
+    Args:
+        path: The private or public key path.
+
+    Returns:
+        A (public key, public key path, private key, private key path) tuple.
+
+    Raises:
+        OSError: Error reading key file(s).
+        ValueError: Unsupported or invalid private key or invalid public key.
+    """
+    path = Path(path).expanduser()
+    content = path.read_text()
+    private_key = convert_ssh_key_to_pem(content)
+    pkey: Optional[PKey] = None
+    with suppress(ValueError):
+        pkey = pkey_from_str(private_key)
+    if pkey is None:
+        # unsupported private key or public key or garbage
+        try:
+            PublicBlob.from_string(content)
+        except ValueError:
+            # unsupported private key or garbage
+            raise ValueError("Unsupported key type or invalid key")
+        # any valid public key, including unsupported (without matching SUPPORTED_KEY_TYPES PKey)
+        return content, path, None, None
+    # supported private key
+    public_key_path = path.with_name(path.name + ".pub")
+    if public_key_path.is_file():
+        return public_key_path.read_text(), public_key_path, private_key, path
+    return generate_public_key(pkey), None, private_key, path
+
+
 def check_required_ssh_version() -> bool:
     try:
         result = subprocess.run(["ssh", "-V"], capture_output=True, text=True)
@@ -344,3 +485,64 @@ def find_ssh_util(name: str) -> Optional[Path]:
     if path.exists():
         return path
     return None
+
+
+def build_ssh_command(
+    *,
+    username: Optional[str] = None,
+    hostname: str,
+    port: Optional[int] = None,
+    ssh_executable: Optional[str] = None,
+) -> list[str]:
+    """
+    Builds an SSH client command line to connect.
+
+    The resulting command is:
+
+        ssh [username@]hostname [-p port]
+
+    The port argument -p is only included if the port is not the default SSH port (22).
+
+    :param username: an optional user login name.
+    :param hostname: a hostname, required.
+    :param port: an optional SSH port, defaults to 22.
+    :param ssh_executable: an optional file name or path of the SSH client, defaults to `ssh`.
+    :return: a list of command line arguments including the executable.
+    """
+    if ssh_executable is None:
+        ssh_executable = "ssh"
+    command: list[str] = [ssh_executable]
+    if username is not None:
+        command.append(f"{username}@{hostname}")
+    else:
+        command.append(hostname)
+    if port is not None and port != 22:
+        command.extend(("-p", str(port)))
+    return command
+
+
+def build_ssh_url_authority(
+    *, username: Optional[str] = None, hostname: str, port: Optional[int] = None
+) -> str:
+    """
+    Builds an authority URL component for use with ssh:// and ssh-based URLs (e.g., vscode://).
+
+    The authority component consists of subcomponents:
+
+        authority = [userinfo "@"] host [":" port]
+
+    The port subcomponent is only included if the port is not the default SSH port (22).
+
+    :param username: an optional user login name, used as the userinfo if provided.
+    :param hostname: a hostname, required.
+    :param port: an optional SSH port, defaults to 22.
+    :return: the authority URL component as a string.
+    """
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    authority = hostname
+    if username is not None:
+        authority = f"{username}@{authority}"
+    if port is not None and port != 22:
+        authority = f"{authority}:{port}"
+    return authority

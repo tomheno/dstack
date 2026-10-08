@@ -9,6 +9,7 @@ from dstack._internal.proxy.gateway.schemas.registry import (
     RegisterEntrypointRequest,
     RegisterReplicaRequest,
     RegisterServiceRequest,
+    SetServiceIdRequest,
 )
 from dstack._internal.proxy.gateway.services.nginx import Nginx
 from dstack._internal.proxy.lib.deps import get_service_connection_pool
@@ -27,16 +28,18 @@ async def register_service(
 ) -> OkResponse:
     await registry_services.register_service(
         project_name=project_name.lower(),
+        run_id=body.id,
         run_name=body.run_name.lower(),
         domain=body.domain.lower(),
         https=body.https,
         rate_limits=body.rate_limits,
         auth=body.auth,
         client_max_body_size=body.client_max_body_size,
+        read_timeout=body.read_timeout,
         model=body.options.openai.model if body.options.openai is not None else None,
         ssh_private_key=body.ssh_private_key,
         repo=repo,
-        router=body.router,
+        has_router_replica=body.has_router_replica,
         nginx=nginx,
         service_conn_pool=service_conn_pool,
     )
@@ -61,6 +64,23 @@ async def unregister_service(
     return OkResponse()
 
 
+@router.post("/services/{run_name}/set_id")
+async def set_service_id(
+    project_name: str,
+    run_name: str,
+    body: SetServiceIdRequest,
+    repo: Annotated[GatewayProxyRepo, Depends(get_gateway_proxy_repo)],
+) -> OkResponse:
+    """Populate a missing ID for a service registered before 0.21.0"""
+    await registry_services.set_service_id(
+        project_name=project_name.lower(),
+        run_name=run_name.lower(),
+        run_id=body.id,
+        repo=repo,
+    )
+    return OkResponse()
+
+
 @router.post("/services/{run_name}/replicas/register")
 async def register_replica(
     project_name: str,
@@ -78,8 +98,10 @@ async def register_replica(
         ssh_destination=body.ssh_host,
         ssh_port=body.ssh_port,
         ssh_proxy=body.ssh_proxy,
+        ssh_proxy_private_key=body.ssh_proxy_private_key,
         ssh_head_proxy=body.ssh_head_proxy,
         ssh_head_proxy_private_key=body.ssh_head_proxy_private_key,
+        internal_ip=body.internal_ip,
         repo=repo,
         nginx=nginx,
         service_conn_pool=service_conn_pool,
@@ -118,6 +140,7 @@ async def register_entrypoint(
         project_name=project_name.lower(),
         domain=body.domain.lower(),
         https=body.https,
+        read_timeout=body.read_timeout,
         repo=repo,
         nginx=nginx,
     )

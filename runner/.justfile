@@ -5,14 +5,13 @@
 # Configuration:
 # - DSTACK_SHIM_UPLOAD_VERSION: Version of the runner and shim to upload
 # - DSTACK_SHIM_UPLOAD_S3_BUCKET: S3 bucket to upload binaries to
-# - DSTACK_SHIM_UPLOAD_ARCH: Target CPU arch, amd64 or arm64 (default amd64)
+# - DSTACK_SHIM_BUILD_ARCH: Target architecture for runner and shim (defaults to amd64)
 #
 # Build Process:
-# - Runner and shim are built+uploaded for linux/$DSTACK_SHIM_UPLOAD_ARCH (default amd64)
-# - Download URLs are arch-templated (dstack-{shim,runner}-linux-{arch}) so the server
-#   routes the correct binary to each target host's architecture. An amd64 shim on an
-#   arm64 host (or vice versa) fails to start with "Exec format error".
-# - Use the *-all recipes to build/upload BOTH amd64 and arm64 in one shot.
+# - Runner and shim are always built for linux (GOOS=linux is the only supported OS)
+# - The target architecture is configurable via DSTACK_SHIM_BUILD_ARCH (or `just build --arch ...`)
+# - CGO is enabled only for native builds (Linux host with a matching architecture);
+#   otherwise it is disabled and DCGM support is dropped
 #
 # Development Workflows:
 # - Local Development:
@@ -25,113 +24,115 @@
 #   * See README.md for instructions on running dstack server with uploaded binaries
 #   * Upload is required for testing with standard backends (including SSH fleets)
 
-default:
-    @just --list
-
 # Version of the runner and shim to upload
-export version := env("DSTACK_SHIM_UPLOAD_VERSION", "0.0.0")
+version := env("DSTACK_SHIM_UPLOAD_VERSION", "0.0.0")
 
 # S3 bucket to upload binaries to
-export s3_bucket := env("DSTACK_SHIM_UPLOAD_S3_BUCKET", "dstack-runner-downloads-stgn")
+s3_bucket := env("DSTACK_SHIM_UPLOAD_S3_BUCKET", "dstack-runner-downloads-stgn")
 
-# Target CPU architecture (amd64 or arm64). Build + upload route by this so each host
-# gets a matching binary; a cross-arch mismatch makes the shim fail with "Exec format error".
-export arch := env("DSTACK_SHIM_UPLOAD_ARCH", "amd64")
+# Target architecture for runner and shim (GOOS is always linux)
+arch := env("DSTACK_SHIM_BUILD_ARCH", "amd64")
 
-# Download URLs (arch-templated)
-export runner_download_url := "s3://" + s3_bucket + "/" + version + "/binaries/dstack-runner-linux-" + arch
-export shim_download_url := "s3://" + s3_bucket + "/" + version + "/binaries/dstack-shim-linux-" + arch
+# Go toolchain image for running tests in a container (keep in sync with go.mod)
+go_version := env("DSTACK_GO_VERSION", "1.25")
 
-# Shim build configuration
-export shim_os := ""
-export shim_arch := ""
+[doc("Build both runner and shim")]
+[arg("arch", long)]
+build arch=arch: (build-runner-binary arch) (build-shim-binary arch)
+    @echo "Build complete! linux/{{arch}} binaries are in their respective cmd directories."
 
-# Build runner
+[doc("Clean build artifacts")]
+clean:
+    rm -f ./cmd/runner/runner
+    rm -f ./cmd/shim/shim
+    @echo "Build artifacts cleaned!"
+
+[doc("Run tests for runner and shim (native; requires a Linux host)")]
+test:
+    go test -v ./...
+
+# Examples:
+#   just test-in-container  # short suite, all packages
+#   just test-in-container -run TestPullImage ./internal/shim/
+[doc("Run tests for runner and shim in a Linux container (use on macOS/Windows, where native builds are not available)")]
+test-in-container *args="-short ./...":
+    docker run --rm -t \
+        -v .:/src -w /src \
+        -v dstack-go-mod:/go/pkg/mod \
+        -v dstack-go-build:/root/.cache/go-build \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        golang:{{go_version}} \
+        go test -race {{args}}
+
+[doc("Upload both runner and shim to S3")]
+[arg("arch", long)]
+upload arch=arch: (upload-runner-binary arch) (upload-shim-binary arch)
+
 [private]
-build-runner-binary:
+[doc("Build runner")]
+[arg("arch", long)]
+[working-directory: "./cmd/runner"]
+build-runner-binary arch=arch:
+    @echo "Building runner for linux/{{arch}}"
+    CGO_ENABLED=0 GOOS=linux GOARCH={{arch}} go build -ldflags "-X 'main.Version={{version}}' -extldflags '-static'"
+    @echo "Runner build (version: {{version}}) complete!"
+
+[private]
+[doc("Build shim")]
+[arg("arch", long)]
+[working-directory: "./cmd/shim"]
+build-shim-binary arch=arch:
     #!/usr/bin/env bash
     set -e
-    echo "Building runner for linux/$arch"
-    cd {{source_directory()}}/cmd/runner && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -ldflags "-X 'main.Version=$version' -extldflags '-static'"
-    echo "Runner build complete!"
-
-# Build shim
-[private]
-build-shim-binary:
-    #!/usr/bin/env bash
-    set -e
-    cd {{source_directory()}}/cmd/shim
-    if [ -n "$shim_os" ] && [ -n "$shim_arch" ]; then
-        echo "Building shim for $shim_os/$shim_arch"
-        if [ "$shim_os" = "linux" ] && [ "$(uname -s)" != "Linux" ]; then
-            echo "WARNING: Cross-compiling to Linux, disabling CGO (DCGM unavailable)"
-            CGO_ENABLED=0 GOOS=$shim_os GOARCH=$shim_arch go build -ldflags "-X 'main.Version=$version' -extldflags '-static'"
-        else
-            CGO_ENABLED=1 GOOS=$shim_os GOARCH=$shim_arch go build -ldflags "-X 'main.Version=$version'"
-        fi
-    else
-        echo "Building shim for current platform"
-        go build -ldflags "-X 'main.Version=$version' -extldflags '-static'"
-    fi
-    echo "Shim build (version: $version) complete!"
-
-# Build both runner and shim
-build-runner: build-runner-binary build-shim-binary
-    echo "Build complete! linux/$arch binaries are in their respective cmd directories."
-
-# Clean build artifacts
-clean-runner:
-    rm -f {{source_directory()}}/cmd/runner/runner
-    rm -f {{source_directory()}}/cmd/shim/shim
-    echo "Build artifacts cleaned!"
-
-# Run tests for runner and shim
-test-runner:
-    cd {{source_directory()}} && go test -v ./...
-
-# Validate shim is built for linux/$arch
-[private]
-validate-shim-binary:
-    #!/usr/bin/env bash
-    set -e
-    case "$arch" in
-        amd64) want="x86-64" ;;
-        arm64) want="aarch64" ;;
-        *) echo "Error: unsupported arch '$arch' (use amd64 or arm64)"; exit 1 ;;
+    echo "Building shim for linux/{{arch}}"
+    host_arch=$(uname -m)
+    case "$host_arch" in
+        x86_64) host_arch=amd64 ;;
+        aarch64 | arm64) host_arch=arm64 ;;
     esac
-    if ! file {{source_directory()}}/cmd/shim/shim | grep -q "ELF 64-bit LSB executable, $want"; then
-        echo "Error: Shim must be built for linux/$arch for upload"
+    if [ "$(uname -s)" = "Linux" ] && [ "$host_arch" = "{{arch}}" ]; then
+        CGO_ENABLED=1 GOOS=linux GOARCH={{arch}} go build -ldflags "-X 'main.Version={{version}}'"
+    else
+        echo "WARNING: Cross-compiling to linux/{{arch}}, disabling CGO (DCGM unavailable)"
+        CGO_ENABLED=0 GOOS=linux GOARCH={{arch}} go build -ldflags "-X 'main.Version={{version}}' -extldflags '-static'"
+    fi
+    echo "Shim build (version: {{version}}) complete!"
+
+[private]
+[doc("Validate shim is built for the configured linux architecture")]
+[arg("arch", long)]
+validate-shim-binary arch=arch:
+    #!/usr/bin/env bash
+    set -e
+    case "{{arch}}" in
+        amd64) expected="x86-64" ;;
+        arm64) expected="ARM aarch64" ;;
+        *) echo "Error: Unsupported arch '{{arch}}'"; exit 1 ;;
+    esac
+    if [[ ! -f ./cmd/shim/shim ]]; then
+        echo "Error: Shim binary not found"
+        exit 1
+    fi
+    if ! file ./cmd/shim/shim | grep -q "ELF 64-bit LSB executable, $expected"; then
+        echo "Error: Shim must be built for linux/{{arch}} for upload"
         exit 1
     fi
 
-# Upload both runner and shim to S3 (for the arch in $arch)
-upload-runner: upload-runner-binary upload-shim-binary
-
-# Build runner + shim for BOTH linux/amd64 and linux/arm64
-build-runner-all:
-    DSTACK_SHIM_UPLOAD_ARCH=amd64 just build-runner
-    DSTACK_SHIM_UPLOAD_ARCH=arm64 just build-runner
-
-# Upload runner + shim for BOTH linux/amd64 and linux/arm64 (server routes per target arch)
-upload-runner-all:
-    DSTACK_SHIM_UPLOAD_ARCH=amd64 just upload-runner
-    DSTACK_SHIM_UPLOAD_ARCH=arm64 just upload-runner
-
-# Upload runner to S3
 [private]
-upload-runner-binary:
-    #!/usr/bin/env bash
-    set -e
-    just build-runner-binary
-    aws s3 cp {{source_directory()}}/cmd/runner/runner "{{runner_download_url}}" --acl public-read
-    echo "Uploaded runner to S3"
+[doc("Upload runner to S3")]
+[arg("arch", long)]
+upload-runner-binary arch=arch: (build-runner-binary arch)
+    aws s3 cp ./cmd/runner/runner s3://{{s3_bucket}}/{{version}}/binaries/dstack-runner-linux-{{arch}} --acl public-read
+    @echo "Uploaded runner to S3"
 
-# Upload shim to S3
 [private]
-upload-shim-binary:
-    #!/usr/bin/env bash
-    set -e
-    just --set shim_os linux --set shim_arch "$arch" build-shim-binary
-    just validate-shim-binary
-    aws s3 cp {{source_directory()}}/cmd/shim/shim "{{shim_download_url}}" --acl public-read
-    echo "Uploaded shim to S3"
+[doc("Upload shim to S3")]
+[arg("arch", long)]
+upload-shim-binary arch=arch: (build-shim-binary arch) (validate-shim-binary arch)
+    aws s3 cp ./cmd/shim/shim s3://{{s3_bucket}}/{{version}}/binaries/dstack-shim-linux-{{arch}} --acl public-read
+    @echo "Uploaded shim to S3"
+
+[default]
+[private]
+default:
+    @just --list --unsorted

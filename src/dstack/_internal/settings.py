@@ -1,7 +1,6 @@
 import os
 
 from dstack import version
-from dstack._internal.utils.env import environ
 from dstack._internal.utils.version import parse_version
 
 DSTACK_VERSION = os.getenv("DSTACK_VERSION", version.__version__)
@@ -14,27 +13,28 @@ DSTACK_RELEASE = os.getenv("DSTACK_RELEASE") is not None or version.__is_release
 DSTACK_RUNNER_VERSION = os.getenv("DSTACK_RUNNER_VERSION")
 DSTACK_RUNNER_VERSION_URL = os.getenv("DSTACK_RUNNER_VERSION_URL")
 DSTACK_RUNNER_DOWNLOAD_URL = os.getenv("DSTACK_RUNNER_DOWNLOAD_URL")
+DSTACK_RUNNER_ALLOW_DOWNGRADE = os.getenv("DSTACK_RUNNER_ALLOW_DOWNGRADE") is not None
 DSTACK_SHIM_VERSION = os.getenv("DSTACK_SHIM_VERSION")
 DSTACK_SHIM_VERSION_URL = os.getenv("DSTACK_SHIM_VERSION_URL")
 DSTACK_SHIM_DOWNLOAD_URL = os.getenv("DSTACK_SHIM_DOWNLOAD_URL")
+DSTACK_SHIM_ALLOW_DOWNGRADE = os.getenv("DSTACK_SHIM_ALLOW_DOWNGRADE") is not None
 DSTACK_USE_LATEST_FROM_BRANCH = os.getenv("DSTACK_USE_LATEST_FROM_BRANCH") is not None
+DSTACK_GATEWAY_PACKAGE_URL = os.getenv("DSTACK_GATEWAY_PACKAGE_URL")
 
 
-DSTACK_BASE_IMAGE = os.getenv("DSTACK_BASE_IMAGE", "dstackai/base")
-DSTACK_BASE_IMAGE_VERSION = os.getenv("DSTACK_BASE_IMAGE_VERSION", version.base_image)
-DSTACK_BASE_IMAGE_UBUNTU_VERSION = os.getenv(
-    "DSTACK_BASE_IMAGE_UBUNTU_VERSION", version.base_image_ubuntu_version
+DSTACK_DOCKER_BASE_IMAGE = os.getenv("DSTACK_DOCKER_BASE_IMAGE", "dstackai/base")
+DSTACK_DOCKER_BASE_IMAGE_VERSION = os.getenv(
+    "DSTACK_DOCKER_BASE_IMAGE_VERSION", version.docker_base_image
 )
+DSTACK_DOCKER_BASE_IMAGE_UBUNTU_VERSION = os.getenv(
+    "DSTACK_DOCKER_BASE_IMAGE_UBUNTU_VERSION", version.docker_base_image_ubuntu_version
+)
+DSTACK_VM_BASE_IMAGE_VERSION = os.getenv("DSTACK_VM_BASE_IMAGE_VERSION", version.vm_base_image)
+DSTACK_VM_BASE_IMAGE_PREFIX = os.getenv("DSTACK_VM_BASE_IMAGE_PREFIX", "")  # e.g. stgn-123-
 DSTACK_DIND_IMAGE = os.getenv("DSTACK_DIND_IMAGE", "dstackai/dind")
 
 CLI_LOG_LEVEL = os.getenv("DSTACK_CLI_LOG_LEVEL", "INFO").upper()
 CLI_FILE_LOG_LEVEL = os.getenv("DSTACK_CLI_FILE_LOG_LEVEL", "DEBUG").upper()
-# Can be used to disable control characters (e.g. for testing).
-CLI_RICH_FORCE_TERMINAL = environ.get_bool("DSTACK_CLI_RICH_FORCE_TERMINAL")
-
-# Development settings
-
-LOCAL_BACKEND_ENABLED = os.getenv("DSTACK_LOCAL_BACKEND_ENABLED") is not None
 
 
 class FeatureFlags:
@@ -44,6 +44,19 @@ class FeatureFlags:
     development. Feature flags are environment variables of the form DSTACK_FF_*
     """
 
-    # DSTACK_FF_AUTOCREATED_FLEETS_ENABLED enables legacy autocreated fleets:
-    # If there are no fleet suitable for the run, a new fleet is created automatically instead of an error.
-    AUTOCREATED_FLEETS_ENABLED = os.getenv("DSTACK_FF_AUTOCREATED_FLEETS_ENABLED") is not None
+    CLI_PRINT_JOB_CONNECTION_INFO = (
+        os.getenv("DSTACK_FF_CLI_PRINT_JOB_CONNECTION_INFO") is not None
+    )
+    """If DSTACK_FF_CLI_PRINT_JOB_CONNECTION_INFO enabled, `dstack apply` command prints server-provided
+    IDE URL(s) and SSH command(s) before job logs (for dev-environments only).
+    """
+
+    # TODO: Drop once offers carry the minimum reservation period and `dstack` keeps such instances
+    # idle until it ends.
+    HOTAISLE_BARE_METAL_NO_FORCE_RELEASE = (
+        os.getenv("DSTACK_FF_HOTAISLE_BARE_METAL_NO_FORCE_RELEASE", "1") != "0"
+    )
+    """Enabled unless set to `0`. If enabled, Hot Aisle bare metal servers are deleted without `force`,
+    so a server still within its minimum reservation period isn't deleted and must be released
+    manually. This prevents accidentally losing a prepaid server.
+    """

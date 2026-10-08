@@ -7,17 +7,18 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set, TypeVar
-
-import gpuhunt
-from pydantic import parse_obj_as
+from typing import Dict, List, Optional, TypeVar
 
 from dstack._internal.cli.services.args import port_mapping
 from dstack._internal.cli.services.configurators.base import (
     ApplyEnvVarsConfiguratorMixin,
     BaseApplyConfigurator,
 )
-from dstack._internal.cli.services.profile import apply_profile_args, register_profile_args
+from dstack._internal.cli.services.profile import (
+    apply_profile_args,
+    load_profile_from_args,
+    register_profile_args,
+)
 from dstack._internal.cli.services.repos import (
     get_repo_from_dir,
     get_repo_from_url,
@@ -28,10 +29,16 @@ from dstack._internal.cli.services.repos import (
 from dstack._internal.cli.services.resources import apply_resources_args, register_resources_args
 from dstack._internal.cli.utils.common import confirm_ask, console
 from dstack._internal.cli.utils.rich import MultiItemStatus
-from dstack._internal.cli.utils.run import get_runs_table, print_run_plan
+from dstack._internal.cli.utils.run import (
+    RunWaitStatus,
+    get_run_wait_status,
+    get_runs_table,
+    print_run_plan,
+)
 from dstack._internal.core.errors import (
     CLIError,
     ConfigurationError,
+    RepoInvalidCredentialsError,
     ResourceNotExistsError,
     ServerClientError,
 )
@@ -48,26 +55,29 @@ from dstack._internal.core.models.configurations import (
     TaskConfiguration,
 )
 from dstack._internal.core.models.repos import RepoHeadWithCreds
+from dstack._internal.core.models.repos.base import Repo
 from dstack._internal.core.models.repos.remote import RemoteRepo, RemoteRepoCreds
-from dstack._internal.core.models.resources import CPUSpec
-from dstack._internal.core.models.runs import JobStatus, JobSubmission, RunSpec, RunStatus
-from dstack._internal.core.services.diff import diff_models
-from dstack._internal.core.services.repos import (
-    InvalidRepoCredentialsError,
-    get_repo_creds_and_default_branch,
+from dstack._internal.core.models.runs import (
+    JobStatus,
+    JobSubmission,
+    JobTerminationReason,
+    RunPlan,
+    RunSpec,
+    RunStatus,
 )
+from dstack._internal.core.services.diff import diff_models
+from dstack._internal.core.services.repos import get_repo_creds_and_default_branch
+from dstack._internal.core.services.ssh.ports import PortUsedError
+from dstack._internal.settings import FeatureFlags
 from dstack._internal.utils.common import local_time
 from dstack._internal.utils.interpolator import InterpolatorError, VariablesInterpolator
 from dstack._internal.utils.logging import get_logger
 from dstack._internal.utils.nested_list import NestedList, NestedListItem
+from dstack._internal.utils.nodes_interpolator import is_valid_groups_ip_ref
 from dstack._internal.utils.path import is_absolute_posix_path
+from dstack._internal.utils.ssh import resolve_ssh_key
 from dstack.api._public.runs import Run
-from dstack.api.utils import load_profile
 
-_KNOWN_AMD_GPUS = {gpu.name.lower() for gpu in gpuhunt.KNOWN_AMD_GPUS}
-_KNOWN_NVIDIA_GPUS = {gpu.name.lower() for gpu in gpuhunt.KNOWN_NVIDIA_GPUS}
-_KNOWN_TPU_VERSIONS = {gpu.name.lower() for gpu in gpuhunt.KNOWN_TPUS}
-_KNOWN_TENSTORRENT_GPUS = {gpu.name.lower() for gpu in gpuhunt.KNOWN_TENSTORRENT_ACCELERATORS}
 _BIND_ADDRESS_ARG = "bind_address"
 
 logger = get_logger(__name__)
@@ -86,12 +96,33 @@ class BaseRunConfigurator(
         command_args: argparse.Namespace,
         configurator_args: argparse.Namespace,
     ):
+        ssh_key_pub, ssh_identity_file = self.get_ssh_key(configurator_args)
+        run_plan, repo = self.get_plan(
+            conf=conf,
+            configuration_path=configuration_path,
+            configurator_args=configurator_args,
+            ssh_key_pub=ssh_key_pub,
+        )
+        return self.apply_plan(
+            run_plan=run_plan,
+            repo=repo,
+            command_args=command_args,
+            configurator_args=configurator_args,
+            ssh_identity_file=ssh_identity_file,
+        )
+
+    def get_plan(
+        self,
+        conf: RunConfigurationT,
+        configuration_path: str,
+        configurator_args: argparse.Namespace,
+        ssh_key_pub: Optional[str],
+    ) -> tuple[RunPlan, Repo]:
+        """Apply CLI arguments and validation, then return the run plan and its repo."""
         if configurator_args.repo and configurator_args.no_repo:
             raise CLIError("Either --repo or --no-repo can be specified")
 
         self.apply_args(conf, configurator_args)
-        self.validate_gpu_vendor_and_image(conf)
-        self.validate_cpu_arch_and_image(conf)
 
         if conf.working_dir is not None and not is_absolute_posix_path(conf.working_dir):
             raise ConfigurationError("working_dir must be absolute")
@@ -99,26 +130,48 @@ class BaseRunConfigurator(
         repo = self.get_repo(conf, configuration_path, configurator_args)
         if repo is None:
             repo = init_default_virtual_repo(api=self.api)
-        profile = load_profile(Path.cwd(), configurator_args.profile)
+        profile = load_profile_from_args(args=configurator_args, repo_dir=Path.cwd())
         with console.status("Getting apply plan..."):
             run_plan = self.api.runs.get_run_plan(
                 configuration=conf,
                 repo=repo,
                 configuration_path=configuration_path,
                 profile=profile,
-                ssh_identity_file=configurator_args.ssh_identity_file,
+                ssh_key_pub=ssh_key_pub,
+                max_offers=configurator_args.max_offers,
+                full_offers=configurator_args.full_offers,
+                unallocated_resources=configurator_args.unallocated,
             )
+        return run_plan, repo
+
+    def apply_plan(
+        self,
+        run_plan: RunPlan,
+        repo: Repo,
+        command_args: argparse.Namespace,
+        configurator_args: argparse.Namespace,
+        ssh_identity_file: Optional[Path],
+        plan_properties: Optional[Dict[str, str]] = None,
+    ):
+        """Apply a run plan using the standard CLI behavior."""
+        run_name = run_plan.run_spec.run_name
 
         no_fleets = False
         if len(run_plan.job_plans[0].offers) == 0:
-            if len(self.api.client.fleets.list(self.api.project)) == 0:
+            if len(self.api.client.fleets.list(self.api.project, include_imported=True)) == 0:
                 no_fleets = True
 
-        print_run_plan(run_plan, max_offers=configurator_args.max_offers, no_fleets=no_fleets)
+        print_run_plan(
+            run_plan,
+            max_offers=configurator_args.max_offers,
+            no_fleets=no_fleets,
+            verbose=command_args.verbose,
+            extra_properties=plan_properties,
+        )
 
         confirm_message = "Submit a new run?"
-        if conf.name:
-            confirm_message = f"Submit the run [code]{conf.name}[/]?"
+        if run_name:
+            confirm_message = f"Submit the run [code]{run_name}[/]?"
         stop_run_name = None
         if run_plan.current_resource is not None:
             diff = render_run_spec_diff(
@@ -127,14 +180,14 @@ class BaseRunConfigurator(
             )
             if run_plan.action == ApplyAction.UPDATE and diff is not None:
                 console.print(
-                    f"Active run [code]{conf.name}[/] already exists."
+                    f"Active run [code]{run_name}[/] already exists."
                     f" Detected changes that [code]can[/] be updated in-place:\n{diff}"
                 )
                 confirm_message = "Update the run?"
             elif run_plan.action == ApplyAction.UPDATE and diff is None:
                 stop_run_name = run_plan.current_resource.run_spec.run_name
                 console.print(
-                    f"Active run [code]{conf.name}[/] already exists. Detected no changes."
+                    f"Active run [code]{run_name}[/] already exists. Detected no changes."
                 )
                 if command_args.yes and not command_args.force:
                     console.print("Use --force to apply anyway.")
@@ -142,8 +195,10 @@ class BaseRunConfigurator(
                 confirm_message = "Stop and override the run?"
             elif not run_plan.current_resource.status.is_finished():
                 stop_run_name = run_plan.current_resource.run_spec.run_name
+                # TODO: Highlight only the fields that block in-place update instead of
+                # showing the full detected diff here.
                 console.print(
-                    f"Active run [code]{conf.name}[/] already exists."
+                    f"Active run [code]{run_name}[/] already exists."
                     f" Detected changes that [error]cannot[/] be updated in-place:\n{diff}"
                 )
                 confirm_message = "Stop and override the run?"
@@ -168,6 +223,13 @@ class BaseRunConfigurator(
                 )
         except ServerClientError as e:
             raise CLIError(e.msg)
+        except PortUsedError as e:
+            console.print(
+                f"[error]Failed to submit: port [code]{e.port}[/code] is already in use."
+                f" Use [code]-p[/code] in [code]dstack apply[/code] to override the local"
+                f" port mapping, e.g. [code]-p {e.port + 1}:{e.port}[/code].[/]"
+            )
+            exit(1)
 
         if command_args.detach:
             detach_message = f"Run [code]{run.name}[/] submitted, detaching..."
@@ -180,11 +242,17 @@ class BaseRunConfigurator(
         try:
             # We can attach to run multiple times if it goes from running to pending (retried).
             while True:
-                with MultiItemStatus(f"Launching [code]{run.name}[/]...", console=console) as live:
+                with MultiItemStatus(_get_apply_status(run), console=console) as live:
+                    ready_wait_attempt = 0
                     while not _is_ready_to_attach(run):
                         table = get_runs_table([run])
-                        live.update(table)
-                        time.sleep(5)
+                        live.update(
+                            table,
+                            *_get_apply_wait_renderables(run),
+                            status=_get_apply_status(run),
+                        )
+                        time.sleep(_get_ready_wait_interval(ready_wait_attempt))
+                        ready_wait_attempt += 1
                         run.refresh()
 
                 console.print(
@@ -202,11 +270,24 @@ class BaseRunConfigurator(
                 current_job_submission = run._run.latest_job_submission
                 if run.status in (RunStatus.RUNNING, RunStatus.DONE):
                     _print_service_urls(run)
+                    _print_dev_environment_connection_info(run)
                     bind_address: Optional[str] = getattr(
                         configurator_args, _BIND_ADDRESS_ARG, None
                     )
                     try:
-                        if run.attach(bind_address=bind_address):
+                        try:
+                            attached = run.attach(
+                                ssh_identity_file=ssh_identity_file,
+                                bind_address=bind_address,
+                            )
+                        except PortUsedError as e:
+                            console.print(
+                                f"[error]Failed to attach: port [code]{e.port}[/code] is already in use."
+                                f" Use [code]-p[/code] in [code]dstack attach[/code] to override the local"
+                                f" port mapping, e.g. [code]-p {e.port + 1}:{e.port}[/code].[/]"
+                            )
+                            exit(1)
+                        if attached:
                             for entry in run.logs():
                                 sys.stdout.buffer.write(entry)
                                 sys.stdout.buffer.flush()
@@ -308,6 +389,16 @@ class BaseRunConfigurator(
             type=int,
             default=3,
         )
+        configuration_group.add_argument(
+            "--full-offers",
+            action="store_true",
+            help="Show full offers not adjusted by requirements",
+        )
+        configuration_group.add_argument(
+            "--unallocated",
+            action="store_true",
+            help="Subtract allocated resources to show only unallocated resources",
+        )
         cls.register_env_args(configuration_group)
         register_resources_args(configuration_group)
         register_profile_args(parser)
@@ -354,7 +445,7 @@ class BaseRunConfigurator(
                     password=interpolator.interpolate_or_error(conf.registry_auth.password),
                 )
             if isinstance(conf, ServiceConfiguration):
-                for probe in conf.probes:
+                for probe in conf.probes or []:
                     for header in probe.headers:
                         header.value = interpolator.interpolate_or_error(header.value)
                     if probe.url:
@@ -363,90 +454,6 @@ class BaseRunConfigurator(
                         probe.body = interpolator.interpolate_or_error(probe.body)
         except InterpolatorError as e:
             raise ConfigurationError(e.args[0])
-
-    def validate_gpu_vendor_and_image(self, conf: RunConfigurationT) -> None:
-        """
-        Infers and sets `resources.gpu.vendor` if not set, requires `image` if the vendor is AMD.
-        """
-        gpu_spec = conf.resources.gpu
-        if gpu_spec is None:
-            return
-        if gpu_spec.count.max == 0:
-            return
-        has_amd_gpu: bool
-        has_tt_gpu: bool
-        vendor = gpu_spec.vendor
-        if vendor is None:
-            names = gpu_spec.name
-            if names:
-                # None is a placeholder for an unknown vendor.
-                vendors: Set[Optional[gpuhunt.AcceleratorVendor]] = set()
-                for name in names:
-                    name = name.lower()
-                    if name in _KNOWN_NVIDIA_GPUS:
-                        vendors.add(gpuhunt.AcceleratorVendor.NVIDIA)
-                    elif name in _KNOWN_AMD_GPUS:
-                        vendors.add(gpuhunt.AcceleratorVendor.AMD)
-                    elif name in _KNOWN_TENSTORRENT_GPUS:
-                        vendors.add(gpuhunt.AcceleratorVendor.TENSTORRENT)
-                    else:
-                        maybe_tpu_version, _, maybe_tpu_cores = name.partition("-")
-                        if maybe_tpu_version in _KNOWN_TPU_VERSIONS and maybe_tpu_cores.isdigit():
-                            vendors.add(gpuhunt.AcceleratorVendor.GOOGLE)
-                        else:
-                            vendors.add(None)
-                if len(vendors) == 1:
-                    # Only one vendor or all names are not known.
-                    vendor = next(iter(vendors))
-                else:
-                    # More than one vendor or some names are not known; in either case, we
-                    # cannot set the vendor to a specific value, will use only names for matching.
-                    vendor = None
-                # If some names are unknown, let's assume they are _not_ AMD products, otherwise
-                # ConfigurationError message may be confusing. In worst-case scenario we'll try
-                # to execute a run on an instance with an AMD accelerator with a default
-                # CUDA image, not a big deal.
-                has_amd_gpu = gpuhunt.AcceleratorVendor.AMD in vendors
-                has_tt_gpu = gpuhunt.AcceleratorVendor.TENSTORRENT in vendors
-            else:
-                # If neither gpu.vendor nor gpu.name is set, assume Nvidia.
-                vendor = gpuhunt.AcceleratorVendor.NVIDIA
-                has_amd_gpu = False
-                has_tt_gpu = False
-            gpu_spec.vendor = vendor
-        else:
-            has_amd_gpu = vendor == gpuhunt.AcceleratorVendor.AMD
-            has_tt_gpu = vendor == gpuhunt.AcceleratorVendor.TENSTORRENT
-        # When docker=True, the system uses Docker-in-Docker image, so no custom image is required
-        if has_amd_gpu and conf.image is None and conf.docker is not True:
-            raise ConfigurationError("`image` is required if `resources.gpu.vendor` is `amd`")
-        if has_tt_gpu and conf.image is None and conf.docker is not True:
-            raise ConfigurationError(
-                "`image` is required if `resources.gpu.vendor` is `tenstorrent`"
-            )
-
-    def validate_cpu_arch_and_image(self, conf: RunConfigurationT) -> None:
-        """
-        Infers `resources.cpu.arch` if not set, requires `image` if the architecture is ARM.
-        """
-        # TODO: Remove in 0.20. Use conf.resources.cpu directly
-        cpu_spec = parse_obj_as(CPUSpec, conf.resources.cpu)
-        arch = cpu_spec.arch
-        if arch is None:
-            gpu_spec = conf.resources.gpu
-            if (
-                gpu_spec is not None
-                and gpu_spec.vendor in [None, gpuhunt.AcceleratorVendor.NVIDIA]
-                and gpu_spec.name
-                and any(map(gpuhunt.is_nvidia_superchip, gpu_spec.name))
-            ):
-                arch = gpuhunt.CPUArchitecture.ARM
-            else:
-                arch = gpuhunt.CPUArchitecture.X86
-        # NOTE: We don't set the inferred resources.cpu.arch for compatibility with older servers.
-        # Servers with ARM support set the arch using the same logic.
-        if arch == gpuhunt.CPUArchitecture.ARM and conf.image is None:
-            raise ConfigurationError("`image` is required if `resources.cpu.arch` is `arm`")
 
     def get_repo(
         self,
@@ -517,8 +524,6 @@ class BaseRunConfigurator(
         else:
             assert False, "should not reach here"
 
-        assert repo.repo_url is not None
-
         if repo_head is not None and repo_head.repo_creds is not None:
             if git_identity_file is None and oauth_token is None:
                 git_private_key = repo_head.repo_creds.private_key
@@ -533,22 +538,36 @@ class BaseRunConfigurator(
                 private_key=git_private_key,
                 oauth_token=oauth_token,
             )
-        except InvalidRepoCredentialsError as e:
-            raise CLIError(*e.args) from e
+        except RepoInvalidCredentialsError:
+            raise CLIError(
+                "No valid default Git credentials found. Pass valid `--token` or `--git-identity`."
+            )
 
         repo.run_repo_data.repo_branch = repo_branch
         if repo_hash is not None:
             repo.run_repo_data.repo_hash = repo_hash
 
         if init:
-            self.api.repos.init(
-                repo=repo,
-                git_identity_file=git_identity_file,
-                oauth_token=oauth_token,
-                creds=repo_creds,
-            )
+            self.api.repos.init(repo=repo, creds=repo_creds)
 
         return repo
+
+    def get_ssh_key(
+        self, configurator_args: argparse.Namespace
+    ) -> tuple[Optional[str], Optional[Path]]:
+        """Resolve the `--ssh-identity` argument to a (public key, private key path) pair."""
+        ssh_identity_file: Optional[Path] = configurator_args.ssh_identity_file
+        if ssh_identity_file is None:
+            return None, None
+        try:
+            public_key, _, _, private_key_path = resolve_ssh_key(ssh_identity_file)
+        except OSError as e:
+            raise CLIError(f"Unable to read the SSH key at {ssh_identity_file}") from e
+        except ValueError as e:
+            raise CLIError(f"Unsupported or invalid SSH key at {ssh_identity_file}") from e
+        if private_key_path is None:
+            raise CLIError(f"Expected a private key at {ssh_identity_file}, got a public key")
+        return public_key, private_key_path
 
 
 class RunWithPortsConfiguratorMixin:
@@ -593,19 +612,27 @@ class RunWithCommandsConfiguratorMixin:
             metavar="RUN_ARGS",
         )
 
-    def apply_commands_args(
-        self,
-        conf: ConfigurationWithCommandsParams,
-        args: argparse.Namespace,
-    ):
-        commands = conf.commands
+    def _interpolate_commands(self, commands: list[str], args: argparse.Namespace) -> None:
         run_args = shlex.join(args.run_args)
-        interpolator = VariablesInterpolator({"run": {"args": run_args}}, skip=["secrets"])
+        interpolator = VariablesInterpolator(
+            {"run": {"args": run_args}},
+            skip={
+                "secrets": VariablesInterpolator.validate_name,
+                "groups": is_valid_groups_ip_ref,
+            },
+        )
         try:
             for i, command in enumerate(commands):
                 commands[i] = interpolator.interpolate_or_error(command)
         except InterpolatorError as e:
             raise ConfigurationError(e.args[0])
+
+    def apply_commands_args(
+        self,
+        conf: ConfigurationWithCommandsParams,
+        args: argparse.Namespace,
+    ):
+        self._interpolate_commands(conf.commands, args)
 
 
 class TaskConfigurator(
@@ -623,6 +650,9 @@ class TaskConfigurator(
         super().apply_args(conf, args)
         self.apply_ports_args(conf, args)
         self.apply_commands_args(conf, args)
+        if conf.groups is not None:
+            for group in conf.groups:
+                self._interpolate_commands(group.commands, args)
 
 
 class DevEnvironmentConfigurator(RunWithPortsConfiguratorMixin, BaseRunConfigurator):
@@ -670,9 +700,18 @@ class ServiceConfigurator(RunWithCommandsConfiguratorMixin, BaseRunConfigurator)
         super().register_args(parser)
         cls.register_commands_args(parser)
 
-    def apply_args(self, conf: TaskConfiguration, args: argparse.Namespace):
+    def apply_args(self, conf: ServiceConfiguration, args: argparse.Namespace):
         super().apply_args(conf, args)
         self.apply_commands_args(conf, args)
+        if conf.groups is not None:
+            for group in conf.groups:
+                self._interpolate_commands(group.commands, args)
+
+
+def _get_ready_wait_interval(attempt: int) -> float:
+    if attempt < 5:
+        return 1
+    return 5
 
 
 def _merge_ports(conf: List[PortMapping], args: List[PortMapping]) -> Dict[int, PortMapping]:
@@ -763,10 +802,58 @@ def _detect_windsurf_version(exe: str = "windsurf") -> Optional[str]:
 def _print_service_urls(run: Run) -> None:
     if run._run.run_spec.configuration.type != RunConfigurationType.SERVICE.value:
         return
-    console.print(f"Service is published at:\n  [link={run.service_url}]{run.service_url}[/]")
+    console.print(_get_service_url_renderable(run))
     if model := run.service_model:
         console.print(
             f"Model [code]{model.name}[/] is published at:\n  [link={model.url}]{model.url}[/]"
+        )
+    console.print()
+
+
+def _get_apply_status(run: Run) -> str:
+    wait_status = get_run_wait_status(run._run)
+    if wait_status is None:
+        return f"Launching [code]{run.name}[/]..."
+    return f"[code]{run.name}[/] is {wait_status.value}..."
+
+
+def _get_apply_wait_renderables(run: Run) -> list[str]:
+    wait_status = get_run_wait_status(run._run)
+    if wait_status is RunWaitStatus.WAITING_FOR_REQUESTS and run._run.service is not None:
+        return [_get_service_url_renderable(run)]
+    if (
+        wait_status is RunWaitStatus.WAITING_FOR_SCHEDULE
+        and run._run.next_triggered_at is not None
+    ):
+        next_run = run._run.next_triggered_at.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+        return [f"Next run: {next_run}"]
+    return []
+
+
+def _get_service_url_renderable(run: Run) -> str:
+    return f"Service is published at:\n  [link={run.service_url}]{run.service_url}[/]"
+
+
+def _print_dev_environment_connection_info(run: Run) -> None:
+    if not FeatureFlags.CLI_PRINT_JOB_CONNECTION_INFO:
+        return
+    if run._run.run_spec.configuration.type != RunConfigurationType.DEV_ENVIRONMENT.value:
+        return
+    jci = run._run.jobs[0].job_connection_info
+    if jci is None:
+        return
+    if jci.ide_name:
+        urls = [u for u in (jci.attached_ide_url, jci.proxied_ide_url) if u]
+        if urls:
+            console.print(
+                f"To open in {jci.ide_name}, use link{'s' if len(urls) > 1 else ''} below:\n"
+            )
+            for link in urls:
+                console.print(f"  [link={link}]{link}[/]\n")
+    ssh_commands = [" ".join(c) for c in (jci.attached_ssh_command, jci.proxied_ssh_command) if c]
+    if ssh_commands:
+        console.print(
+            f"To connect via SSH, use: {' or '.join(f'[code]{c}[/]' for c in ssh_commands)}\n"
         )
     console.print()
 
@@ -800,9 +887,15 @@ def print_finished_message(run: Run):
         console.print(str)
 
         if termination_reason_message:
-            console.print(f"[error]{termination_reason_message}[/error]")
+            # Backend errors reported in the message contain square brackets and numbers,
+            # which rich would otherwise parse as markup or repaint.
+            console.print(termination_reason_message, style="error", markup=False, highlight=False)
 
-        if termination_reason:
+        if (
+            termination_reason
+            # A run that never started has no runner logs to read.
+            and termination_reason != JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY.value
+        ):
             console.print(f"Check [code]dstack logs -d {run.name}[/code] for more details.")
 
 
@@ -821,8 +914,12 @@ def _is_ready_to_attach(run: Run) -> bool:
             RunStatus.PROVISIONING,
             RunStatus.TERMINATING,
         ]
-        or run._run.jobs[0].job_submissions[-1].status
-        in [JobStatus.SUBMITTED, JobStatus.PROVISIONING, JobStatus.PULLING]
+        or (
+            run._run.jobs
+            and run._run.jobs[0].job_submissions
+            and run._run.jobs[0].job_submissions[-1].status
+            in [JobStatus.SUBMITTED, JobStatus.PROVISIONING, JobStatus.PULLING]
+        )
         or run._run.is_deployment_in_progress()
     )
 

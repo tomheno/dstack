@@ -1,5 +1,8 @@
 import { groupBy as _groupBy } from 'lodash';
 
+import { formatBackend } from 'libs/fleet';
+import { formatResources } from 'libs/resources';
+
 import { getBaseUrl } from 'App/helpers';
 
 import { finishedJobs, finishedRunStatuses } from '../constants';
@@ -14,7 +17,8 @@ export const getRunListItemResources = (run: IRun) => {
         return '-';
     }
 
-    return run.latest_job_submission?.job_provisioning_data?.instance_type?.resources?.description ?? '-';
+    const resources = run.latest_job_submission?.job_provisioning_data?.instance_type?.resources;
+    return resources ? formatResources(resources) : '-';
 };
 
 export const getRunListItemSpotLabelKey = (run: IRun) => {
@@ -84,7 +88,7 @@ export const getRunListItemBackend = (run: IRun) => {
         return '-';
     }
 
-    return run.latest_job_submission?.job_provisioning_data?.backend ?? '-';
+    return formatBackend(run.latest_job_submission?.job_provisioning_data?.backend);
 };
 
 export const getRunListItemServiceUrl = (run: IRun) => {

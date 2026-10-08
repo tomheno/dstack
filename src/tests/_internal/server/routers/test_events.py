@@ -3,15 +3,22 @@ from datetime import datetime
 from unittest.mock import patch
 
 import pytest
+import pytest_asyncio
 from freezegun import freeze_time
 from httpx import AsyncClient
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dstack._internal.core.models.users import GlobalRole, ProjectRole
+from dstack._internal.server.models import GatewayModel, InstanceModel, JobModel
 from dstack._internal.server.services import events
 from dstack._internal.server.services.projects import add_project_member
 from dstack._internal.server.testing.common import (
+    create_backend,
+    create_export,
     create_fleet,
+    create_gateway,
+    create_gateway_replica,
     create_instance,
     create_job,
     create_project,
@@ -19,6 +26,8 @@ from dstack._internal.server.testing.common import (
     create_run,
     create_user,
     get_auth_headers,
+    get_fleet_spec,
+    get_ssh_fleet_configuration,
 )
 
 pytestmark = [
@@ -65,7 +74,7 @@ class TestListEventsGeneral:
             {
                 "id": str(event_ids[1]),
                 "message": "Project updated",
-                "recorded_at": "2026-01-01T12:00:01+00:00",
+                "recorded_at": "2026-01-01T12:00:01Z",
                 "actor_user_id": None,
                 "actor_user": None,
                 "is_actor_user_deleted": None,
@@ -83,7 +92,7 @@ class TestListEventsGeneral:
             {
                 "id": str(event_ids[0]),
                 "message": "User added to project",
-                "recorded_at": "2026-01-01T12:00:00+00:00",
+                "recorded_at": "2026-01-01T12:00:00Z",
                 "actor_user_id": str(user.id),
                 "actor_user": "test_user",
                 "is_actor_user_deleted": False,
@@ -719,6 +728,55 @@ class TestListEventsFilters:
         resp.raise_for_status()
         assert len(resp.json()) == 2
 
+    async def test_target_gateway_replicas(
+        self, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        user = await create_user(session=session)
+        project = await create_project(session=session, owner=user)
+        backend = await create_backend(session=session, project_id=project.id)
+        gateway = await create_gateway(
+            session=session, project_id=project.id, backend_id=backend.id
+        )
+        replica_a = await create_gateway_replica(
+            session=session, backend=backend, gateway_id=gateway.id, replica_num=0
+        )
+        replica_b = await create_gateway_replica(
+            session=session, backend=backend, gateway_id=gateway.id, replica_num=1
+        )
+        # Target.from_model requires the gateway relationship to be loaded.
+        replica_a.gateway = gateway
+        replica_b.gateway = gateway
+        events.emit(
+            session,
+            "Gateway replica provisioned",
+            actor=events.SystemActor(),
+            targets=[events.Target.from_model(replica_a)],
+        )
+        events.emit(
+            session,
+            "Gateway replica provisioned",
+            actor=events.SystemActor(),
+            targets=[events.Target.from_model(replica_b)],
+        )
+        await session.commit()
+
+        resp = await client.post(
+            "/api/events/list",
+            headers=get_auth_headers(user.token),
+            json={"target_gateway_replicas": [str(replica_a.id)]},
+        )
+        resp.raise_for_status()
+        assert len(resp.json()) == 1
+        assert resp.json()[0]["targets"][0]["id"] == str(replica_a.id)
+
+        resp = await client.post(
+            "/api/events/list",
+            headers=get_auth_headers(user.token),
+            json={"target_gateway_replicas": [str(replica_a.id), str(replica_b.id)]},
+        )
+        resp.raise_for_status()
+        assert len(resp.json()) == 2
+
     async def test_within_projects(self, session: AsyncSession, client: AsyncClient) -> None:
         user = await create_user(session=session)
         project_a = await create_project(session=session, name="project_a", owner=user)
@@ -853,6 +911,32 @@ class TestListEventsFilters:
         resp.raise_for_status()
         assert len(resp.json()) == 3
 
+    async def test_within_fleets_finds_events_of_deleted_instances(
+        self, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        user = await create_user(session=session)
+        project = await create_project(session=session, owner=user)
+        fleet = await create_fleet(session=session, project=project)
+        instance = await create_instance(session=session, project=project, fleet=fleet)
+        events.emit(
+            session,
+            "Instance created for job",
+            actor=events.SystemActor(),
+            targets=[events.Target.from_model(instance)],
+        )
+        await session.commit()
+        # Placeholder instances that never provisioned are deleted on job termination
+        await session.execute(delete(InstanceModel).where(InstanceModel.id == instance.id))
+        await session.commit()
+
+        resp = await client.post(
+            "/api/events/list",
+            headers=get_auth_headers(user.token),
+            json={"within_fleets": [str(fleet.id)]},
+        )
+        resp.raise_for_status()
+        assert len(resp.json()) == 1
+
     async def test_within_runs(self, session: AsyncSession, client: AsyncClient) -> None:
         user = await create_user(session=session)
         project = await create_project(session=session, owner=user)
@@ -924,6 +1008,135 @@ class TestListEventsFilters:
         )
         resp.raise_for_status()
         assert len(resp.json()) == 3
+
+    async def test_within_runs_finds_events_of_deleted_jobs(
+        self, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        user = await create_user(session=session)
+        project = await create_project(session=session, owner=user)
+        repo = await create_repo(session=session, project_id=project.id)
+        run = await create_run(session=session, project=project, repo=repo, user=user)
+        job = await create_job(session=session, run=run)
+        events.emit(
+            session,
+            "Job created on new submission",
+            actor=events.SystemActor(),
+            targets=[events.Target.from_model(job)],
+        )
+        await session.commit()
+        # Superseded no-capacity submissions are deleted on resubmission
+        await session.execute(delete(JobModel).where(JobModel.id == job.id))
+        await session.commit()
+
+        resp = await client.post(
+            "/api/events/list",
+            headers=get_auth_headers(user.token),
+            json={"within_runs": [str(run.id)]},
+        )
+        resp.raise_for_status()
+        assert len(resp.json()) == 1
+
+    async def test_within_gateways(self, session: AsyncSession, client: AsyncClient) -> None:
+        user = await create_user(session=session)
+        project = await create_project(session=session, owner=user)
+        backend = await create_backend(session=session, project_id=project.id)
+        gateway_a = await create_gateway(
+            session=session, project_id=project.id, backend_id=backend.id, name="gateway_a"
+        )
+        gateway_b = await create_gateway(
+            session=session, project_id=project.id, backend_id=backend.id, name="gateway_b"
+        )
+        replica_a = await create_gateway_replica(
+            session=session, backend=backend, gateway_id=gateway_a.id, replica_num=0
+        )
+        replica_a.gateway = gateway_a
+        events.emit(
+            session,
+            "Project created",
+            actor=events.UserActor.from_user(user),
+            targets=[events.Target.from_model(project)],
+        )
+        events.emit(
+            session,
+            "Gateway created",
+            actor=events.UserActor.from_user(user),
+            targets=[events.Target.from_model(gateway_a)],
+        )
+        events.emit(
+            session,
+            "Gateway created",
+            actor=events.UserActor.from_user(user),
+            targets=[events.Target.from_model(gateway_b)],
+        )
+        events.emit(
+            session,
+            "Gateway replica provisioned",
+            actor=events.SystemActor(),
+            targets=[events.Target.from_model(replica_a)],
+        )
+        await session.commit()
+
+        resp = await client.post(
+            "/api/events/list",
+            headers=get_auth_headers(user.token),
+            json={"within_gateways": [str(gateway_a.id)]},
+        )
+        resp.raise_for_status()
+        assert len(resp.json()) == 2
+
+        resp = await client.post(
+            "/api/events/list",
+            headers=get_auth_headers(user.token),
+            json={"within_gateways": [str(gateway_b.id)]},
+        )
+        resp.raise_for_status()
+        assert len(resp.json()) == 1
+
+        resp = await client.post(
+            "/api/events/list",
+            headers=get_auth_headers(user.token),
+            json={"within_gateways": [str(gateway_a.id), str(gateway_b.id)]},
+        )
+        resp.raise_for_status()
+        assert len(resp.json()) == 3
+
+    async def test_within_gateways_finds_events_of_hard_deleted_gateway(
+        self, session: AsyncSession, client: AsyncClient
+    ) -> None:
+        user = await create_user(session=session)
+        project = await create_project(session=session, owner=user)
+        backend = await create_backend(session=session, project_id=project.id)
+        gateway = await create_gateway(
+            session=session, project_id=project.id, backend_id=backend.id
+        )
+        replica = await create_gateway_replica(
+            session=session, backend=backend, gateway_id=gateway.id
+        )
+        replica.gateway = gateway
+        events.emit(
+            session,
+            "Gateway created",
+            actor=events.UserActor.from_user(user),
+            targets=[events.Target.from_model(gateway)],
+        )
+        events.emit(
+            session,
+            "Gateway replica provisioned",
+            actor=events.SystemActor(),
+            targets=[events.Target.from_model(replica)],
+        )
+        await session.commit()
+        gateway_id = gateway.id
+        await session.execute(delete(GatewayModel).where(GatewayModel.id == gateway_id))
+        await session.commit()
+
+        resp = await client.post(
+            "/api/events/list",
+            headers=get_auth_headers(user.token),
+            json={"within_gateways": [str(gateway_id)]},
+        )
+        resp.raise_for_status()
+        assert len(resp.json()) == 2
 
     async def test_include_target_types(self, session: AsyncSession, client: AsyncClient) -> None:
         user = await create_user(session=session)
@@ -1326,3 +1539,227 @@ class TestListEventsPagination:
         )
         resp.raise_for_status()
         assert len(resp.json()) == 2
+
+
+class TestListEventsWithExportedFleet:
+    @pytest_asyncio.fixture
+    async def exported_fleet_setup(self, session: AsyncSession):
+        # Create exporter user and project
+        exporter_user = await create_user(
+            session, name="exporter-user", global_role=GlobalRole.USER
+        )
+        exporter_project = await create_project(
+            session, name="exporter-project", owner=exporter_user
+        )
+        await add_project_member(
+            session=session,
+            project=exporter_project,
+            user=exporter_user,
+            project_role=ProjectRole.USER,
+        )
+
+        # Create first importer user and project
+        importer_user_1 = await create_user(
+            session, name="importer-user-1", global_role=GlobalRole.USER
+        )
+        importer_project_1 = await create_project(
+            session, name="importer-project-1", owner=importer_user_1
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project_1,
+            user=importer_user_1,
+            project_role=ProjectRole.USER,
+        )
+
+        # Create second importer user and project
+        importer_user_2 = await create_user(
+            session, name="importer-user-2", global_role=GlobalRole.USER
+        )
+        importer_project_2 = await create_project(
+            session, name="importer-project-2", owner=importer_user_2
+        )
+        await add_project_member(
+            session=session,
+            project=importer_project_2,
+            user=importer_user_2,
+            project_role=ProjectRole.USER,
+        )
+
+        # Create fleet and instance
+        fleet = await create_fleet(
+            session=session,
+            project=exporter_project,
+            spec=get_fleet_spec(get_ssh_fleet_configuration(name="exported-fleet")),
+        )
+        events.emit(
+            session=session,
+            message="Fleet created",
+            actor=events.UserActor.from_user(exporter_user),
+            targets=[events.Target.from_model(fleet)],
+        )
+        instance = await create_instance(
+            session=session, project=exporter_project, fleet=fleet, name="exported-fleet-0"
+        )
+        events.emit(
+            session=session,
+            message="Instance created",
+            actor=events.SystemActor(),
+            targets=[events.Target.from_model(instance)],
+        )
+
+        # Create export
+        await create_export(
+            session=session,
+            exporter_project=exporter_project,
+            importer_projects=[importer_project_1, importer_project_2],
+            exported_fleets=[fleet],
+        )
+
+        # Create first importer run and job
+        importer_run_1 = await create_run(
+            session=session,
+            project=importer_project_1,
+            user=importer_user_1,
+            repo=await create_repo(session=session, project_id=importer_project_1.id),
+            run_name="importer-run-1",
+        )
+        events.emit(
+            session=session,
+            message="Run created",
+            actor=events.UserActor.from_user(importer_user_1),
+            targets=[events.Target.from_model(importer_run_1)],
+        )
+        importer_job_1 = await create_job(
+            session=session,
+            run=importer_run_1,
+            fleet=fleet,
+            instance=instance,
+        )
+        events.emit(
+            session=session,
+            message="Job assigned to instance",
+            actor=events.SystemActor(),
+            targets=[events.Target.from_model(importer_job_1), events.Target.from_model(instance)],
+        )
+
+        # Create second importer run and job
+        importer_run_2 = await create_run(
+            session=session,
+            project=importer_project_2,
+            user=importer_user_2,
+            repo=await create_repo(session=session, project_id=importer_project_2.id),
+            run_name="importer-run-2",
+        )
+        events.emit(
+            session=session,
+            message="Run created",
+            actor=events.UserActor.from_user(importer_user_2),
+            targets=[events.Target.from_model(importer_run_2)],
+        )
+        importer_job_2 = await create_job(
+            session=session,
+            run=importer_run_2,
+            fleet=fleet,
+            instance=instance,
+        )
+        events.emit(
+            session=session,
+            message="Job assigned to instance",
+            actor=events.SystemActor(),
+            targets=[events.Target.from_model(importer_job_2), events.Target.from_model(instance)],
+        )
+
+        await session.commit()
+
+        return {
+            "exporter_user": exporter_user,
+            "importer_user_1": importer_user_1,
+            "importer_user_2": importer_user_2,
+            "exported_fleet": fleet,
+        }
+
+    @pytest.mark.parametrize("with_filter", [True, False])
+    async def test_exporter_user_sees_all_events_targeting_exported_fleet(
+        self,
+        session: AsyncSession,
+        client: AsyncClient,
+        exported_fleet_setup: dict,
+        with_filter: bool,
+    ) -> None:
+        filters = {}
+        if with_filter:
+            filters = {"within_fleets": [str(exported_fleet_setup["exported_fleet"].id)]}
+        resp = await client.post(
+            "/api/events/list",
+            headers=get_auth_headers(exported_fleet_setup["exporter_user"].token),
+            json={"ascending": True, **filters},
+        )
+        resp.raise_for_status()
+        assert resp.json()[0]["message"] == "Fleet created"
+        assert resp.json()[1]["message"] == "Instance created"
+        assert resp.json()[2]["message"] == "Job assigned to instance"
+        assert {t["name"] for t in resp.json()[2]["targets"]} == {
+            "exported-fleet-0",
+            "importer-run-1-0-0",
+        }
+        assert resp.json()[3]["message"] == "Job assigned to instance"
+        assert {t["name"] for t in resp.json()[3]["targets"]} == {
+            "exported-fleet-0",
+            "importer-run-2-0-0",
+        }
+        assert len(resp.json()) == 4
+
+    @pytest.mark.parametrize(
+        ("user_key", "job_name"),
+        [
+            ("importer_user_1", "importer-run-1-0-0"),
+            ("importer_user_2", "importer-run-2-0-0"),
+        ],
+    )
+    async def test_importer_user_sees_only_events_about_their_own_run(
+        self,
+        session: AsyncSession,
+        client: AsyncClient,
+        exported_fleet_setup: dict,
+        user_key: str,
+        job_name: str,
+    ) -> None:
+        resp = await client.post(
+            "/api/events/list",
+            headers=get_auth_headers(exported_fleet_setup[user_key].token),
+            json={"ascending": True},
+        )
+        resp.raise_for_status()
+        assert resp.json()[0]["message"] == "Run created"
+        assert resp.json()[1]["message"] == "Job assigned to instance"
+        assert {t["name"] for t in resp.json()[1]["targets"]} == {"exported-fleet-0", job_name}
+        assert len(resp.json()) == 2
+
+    @pytest.mark.parametrize(
+        ("user_key", "job_name"),
+        [
+            ("importer_user_1", "importer-run-1-0-0"),
+            ("importer_user_2", "importer-run-2-0-0"),
+        ],
+    )
+    async def test_importer_user_can_filter_by_imported_fleet(
+        self,
+        session: AsyncSession,
+        client: AsyncClient,
+        exported_fleet_setup: dict,
+        user_key: str,
+        job_name: str,
+    ) -> None:
+        resp = await client.post(
+            "/api/events/list",
+            headers=get_auth_headers(exported_fleet_setup[user_key].token),
+            json={
+                "ascending": True,
+                "within_fleets": [str(exported_fleet_setup["exported_fleet"].id)],
+            },
+        )
+        resp.raise_for_status()
+        assert resp.json()[0]["message"] == "Job assigned to instance"
+        assert {t["name"] for t in resp.json()[0]["targets"]} == {"exported-fleet-0", job_name}
+        assert len(resp.json()) == 1

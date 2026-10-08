@@ -6,8 +6,8 @@ from typing import Iterable, Optional
 
 import dstack._internal.proxy.gateway.schemas.registry as schemas
 from dstack._internal.core.models.instances import SSHConnectionParams
-from dstack._internal.core.models.routers import AnyRouterConfig, RouterType
 from dstack._internal.proxy.gateway import models as gateway_models
+from dstack._internal.proxy.gateway.const import SERVICE_ALREADY_REGISTERED_ERROR_TEMPLATE
 from dstack._internal.proxy.gateway.repo.repo import GatewayProxyRepo
 from dstack._internal.proxy.gateway.services.nginx import (
     LimitReqConfig,
@@ -19,6 +19,7 @@ from dstack._internal.proxy.gateway.services.nginx import (
     ServiceConfig,
 )
 from dstack._internal.proxy.lib import models
+from dstack._internal.proxy.lib.const import ROUTER_WHITELISTED_PATHS
 from dstack._internal.proxy.lib.errors import ProxyError, UnexpectedProxyError
 from dstack._internal.proxy.lib.repo import BaseProxyRepo
 from dstack._internal.proxy.lib.services.service_connection import (
@@ -34,20 +35,24 @@ lock = Lock()
 
 async def register_service(
     project_name: str,
+    run_id: Optional[str],
     run_name: str,
     domain: str,
     https: bool,
     rate_limits: tuple[models.RateLimit, ...],
     auth: bool,
     client_max_body_size: int,
+    read_timeout: int,
     model: Optional[schemas.AnyModel],
     ssh_private_key: str,
     repo: GatewayProxyRepo,
     nginx: Nginx,
     service_conn_pool: ServiceConnectionPool,
-    router: Optional[AnyRouterConfig] = None,
+    has_router_replica: bool = False,
 ) -> None:
+    cors_enabled = model is not None and model.type == "chat" and model.format == "openai"
     service = models.Service(
+        id=run_id,
         project_name=project_name,
         run_name=run_name,
         domain=domain,
@@ -56,12 +61,17 @@ async def register_service(
         auth=auth,
         client_max_body_size=client_max_body_size,
         replicas=(),
-        router=router,
+        has_router_replica=has_router_replica,
+        cors_enabled=cors_enabled,
+        proxy_buffering=model is None,
+        read_timeout=read_timeout,
     )
 
     async with lock:
         if await repo.get_service(project_name, run_name) is not None:
-            raise ProxyError(f"Service {service.fmt()} is already registered")
+            raise ProxyError(SERVICE_ALREADY_REGISTERED_ERROR_TEMPLATE.format(ref=service.fmt()))
+        if await repo.get_service_by_domain(domain) is not None:
+            raise ProxyError(f"Domain name {domain!r} is already taken by another service")
 
         old_project = await repo.get_project(project_name)
         new_project = models.Project(name=project_name, ssh_private_key=ssh_private_key)
@@ -116,11 +126,30 @@ async def unregister_service(
             ids=(r.id for r in service.replicas),
             service_conn_pool=service_conn_pool,
         )
-        await nginx.unregister(service.domain_safe)
+        await nginx.unregister(service)
         await repo.delete_models_by_run(project_name, run_name)
         await repo.delete_service(project_name, run_name)
 
     logger.info("Service %s is unregistered now", service.fmt())
+
+
+async def set_service_id(
+    project_name: str,
+    run_name: str,
+    run_id: str,
+    repo: GatewayProxyRepo,
+) -> None:
+    async with lock:
+        service = await repo.get_service(project_name, run_name)
+        if service is None:
+            raise ProxyError(f"Service {project_name}/{run_name} does not exist, cannot set ID")
+        if service.id is not None:
+            raise ProxyError(f"Service {project_name}/{run_name} already has an ID")
+
+        service = service.with_id(run_id)
+        await repo.set_service(service)
+
+    logger.info("Service %s id is set to %s", service.fmt(), run_id)
 
 
 async def register_replica(
@@ -131,11 +160,13 @@ async def register_replica(
     ssh_destination: str,
     ssh_port: int,
     ssh_proxy: Optional[SSHConnectionParams],
+    ssh_proxy_private_key: Optional[str],
     ssh_head_proxy: Optional[SSHConnectionParams],
     ssh_head_proxy_private_key: Optional[str],
     repo: GatewayProxyRepo,
     nginx: Nginx,
     service_conn_pool: ServiceConnectionPool,
+    internal_ip: Optional[str] = None,
 ) -> None:
     replica = models.Replica(
         id=replica_id,
@@ -143,8 +174,10 @@ async def register_replica(
         ssh_destination=ssh_destination,
         ssh_port=ssh_port,
         ssh_proxy=ssh_proxy,
+        ssh_proxy_private_key=ssh_proxy_private_key,
         ssh_head_proxy=ssh_head_proxy,
         ssh_head_proxy_private_key=ssh_head_proxy_private_key,
+        internal_ip=internal_ip,
     )
 
     async with lock:
@@ -221,6 +254,7 @@ async def register_model_entrypoint(
     project_name: str,
     domain: str,
     https: bool,
+    read_timeout: int,
     repo: GatewayProxyRepo,
     nginx: Nginx,
 ) -> None:
@@ -228,6 +262,7 @@ async def register_model_entrypoint(
         project_name=project_name,
         domain=domain,
         https=https,
+        read_timeout=read_timeout,
     )
     logger.debug("Registering entrypoint %s in project %s", domain, project_name)
     await apply_entrypoint(entrypoint, repo, nginx)
@@ -258,7 +293,12 @@ async def apply_service(
         service, repo, service_conn_pool
     )
     replica_configs = [
-        ReplicaConfig(id=replica.id, socket=conn.app_socket_path)
+        ReplicaConfig(
+            id=replica.id,
+            socket=conn.app_socket_path,
+            port=replica.app_port,
+            internal_ip=replica.internal_ip,
+        )
         for replica, conn in replica_conns.items()
     ]
     service_config = await get_nginx_service_config(service, replica_configs)
@@ -309,12 +349,6 @@ async def get_nginx_service_config(
 ) -> ServiceConfig:
     limit_req_zones: list[LimitReqZoneConfig] = []
     locations: list[LocationConfig] = []
-    is_sglang = service.router and service.router.type == RouterType.SGLANG
-    sglang_whitelisted_paths = [
-        "/generate",
-        "/v1/",
-        "/chat/completions",
-    ]  # Prefix match for paths that end with a slash and exact match for paths that don't
     sglang_limits: dict[str, LimitReqConfig] = {}
     sglang_prefix_lengths: dict[str, int] = {}  # Track prefix lengths for most-specific selection
 
@@ -329,8 +363,8 @@ async def get_nginx_service_config(
         limit_req_zones.append(
             LimitReqZoneConfig(name=zone_name, key=key, rpm=round(rate_limit.rps * 60))
         )
-        if is_sglang:
-            for path in sglang_whitelisted_paths:
+        if service.has_router_replica:
+            for path in ROUTER_WHITELISTED_PATHS:
                 if rate_limit.prefix == path or path.startswith(rate_limit.prefix):
                     # Use the longest prefix if multiple prefixes match the same path
                     current_prefix_len = len(rate_limit.prefix)
@@ -349,9 +383,9 @@ async def get_nginx_service_config(
                 )
             )
 
-    # Add SGLang whitelisted paths as locations
-    if is_sglang:
-        for path in sglang_whitelisted_paths:
+    # Add router whitelisted paths as locations
+    if service.has_router_replica:
+        for path in ROUTER_WHITELISTED_PATHS:
             # Use prefix match for paths that end with a slash and exact match for paths that don't
             if path.endswith("/"):
                 locations.append(LocationConfig(prefix=path, limit_req=sglang_limits.get(path)))
@@ -360,8 +394,11 @@ async def get_nginx_service_config(
                     LocationConfig(prefix=f"= {path}", limit_req=sglang_limits.get(path))
                 )
 
-    # Don't auto-add / location for SGLang routers (catch-all 403 handles it)
-    if not any(location.prefix == "/" for location in locations) and not is_sglang:
+    # Don't auto-add / location for router-based services (catch-all 403 handles it)
+    if (
+        not any(location.prefix == "/" for location in locations)
+        and not service.has_router_replica
+    ):
         locations.append(LocationConfig(prefix="/", limit_req=None))
     return ServiceConfig(
         domain=service.domain_safe,
@@ -373,7 +410,10 @@ async def get_nginx_service_config(
         limit_req_zones=limit_req_zones,
         locations=locations,
         replicas=sorted(replicas, key=lambda r: r.id),  # sort for reproducible configs
-        router=service.router,
+        has_router_replica=service.has_router_replica,
+        cors_enabled=service.cors_enabled,
+        proxy_buffering=service.proxy_buffering,
+        read_timeout=service.read_timeout,
     )
 
 
@@ -384,14 +424,40 @@ async def apply_entrypoint(
         domain=entrypoint.domain,
         https=entrypoint.https,
         project_name=entrypoint.project_name,
+        read_timeout=entrypoint.read_timeout,
     )
     acme = (await repo.get_config()).acme_settings
     await nginx.register(config, acme)
 
 
+async def _migrate_cors_enabled(repo: GatewayProxyRepo) -> None:
+    """Migrate services registered before the cors_enabled field was added.
+
+    Old gateway versions didn't persist cors_enabled on services. This derives it
+    from the associated model's format so that CORS is enabled for openai-format
+    models on gateway restart without requiring service re-registration.
+    """
+    services = await repo.list_services()
+    openai_run_names: set[tuple[str, str]] = set()
+    for service in services:
+        for model in await repo.list_models(service.project_name):
+            if model.run_name == service.run_name and isinstance(
+                model.format_spec, models.OpenAIChatModelFormat
+            ):
+                openai_run_names.add((service.project_name, service.run_name))
+    for service in services:
+        if (
+            not service.cors_enabled
+            and (service.project_name, service.run_name) in openai_run_names
+        ):
+            updated = models.Service(**{**service.model_dump(), "cors_enabled": True})
+            await repo.set_service(updated)
+
+
 async def apply_all(
     repo: GatewayProxyRepo, nginx: Nginx, service_conn_pool: ServiceConnectionPool
 ) -> None:
+    await _migrate_cors_enabled(repo)
     service_tasks = [
         apply_service(
             service=service,

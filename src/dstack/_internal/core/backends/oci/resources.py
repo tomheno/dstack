@@ -22,7 +22,7 @@ from typing import (
 import oci
 from oci.object_storage.models import CreatePreauthenticatedRequestDetails
 
-from dstack import version
+from dstack._internal import settings
 from dstack._internal.core.backends.base.compute import requires_nvidia_proprietary_kernel_modules
 from dstack._internal.core.backends.oci.region import OCIRegionClient
 from dstack._internal.core.consts import DSTACK_OS_IMAGE_WITH_PROPRIETARY_NVIDIA_KERNEL_MODULES
@@ -140,7 +140,7 @@ def list_shapes_in_region(region: OCIRegionClient, compartment_id: str) -> Dict[
     """
 
     result = {}
-    for availability_domain in region.availability_domains:
+    for availability_domain in region.availability_domains_in(compartment_id):
         result[availability_domain.name] = list_shapes_in_domain(
             availability_domain.name, region.compute_client, compartment_id
         )
@@ -214,7 +214,7 @@ def check_availability_per_domain(
     all_shapes = set(shape_names)
     available_shapes_per_domain = {}
 
-    for availability_domain in region.availability_domains:
+    for availability_domain in region.availability_domains_in(compartment_id):
         shapes_to_check = {
             shape
             for shape in all_shapes
@@ -277,7 +277,7 @@ def get_available_domains(
     `shape_name` is available and within `shapes_quota`.
     """
     domains = []
-    for domain in region.availability_domains:
+    for domain in region.availability_domains_in(compartment_id):
         if shapes_quota.is_within_domain_quota(
             shape_name, domain.name
         ) and check_availability_in_domain(
@@ -356,10 +356,11 @@ def terminate_instance_if_exists(client: oci.core.ComputeClient, instance_id: st
 def get_marketplace_listing_and_package(
     gpu_name: Optional[str], client: oci.marketplace.MarketplaceClient
 ) -> Tuple[oci.marketplace.models.Listing, oci.marketplace.models.ImageListingPackage]:
-    listing_name = f"dstack-{version.base_image}"
+    prefix = settings.DSTACK_VM_BASE_IMAGE_PREFIX
+    listing_name = f"{prefix}dstack-{settings.DSTACK_VM_BASE_IMAGE_VERSION}"
     if gpu_name is not None:
         if not requires_nvidia_proprietary_kernel_modules(gpu_name):
-            listing_name = f"dstack-cuda-{version.base_image}"
+            listing_name = f"{prefix}dstack-cuda-{settings.DSTACK_VM_BASE_IMAGE_VERSION}"
         else:
             listing_name = f"dstack-cuda-{DSTACK_OS_IMAGE_WITH_PROPRIETARY_NVIDIA_KERNEL_MODULES}"
 
@@ -728,6 +729,12 @@ def create_pre_authenticated_request(
 def delete_bucket(
     namespace: str, bucket_name: str, client: oci.object_storage.ObjectStorageClient
 ) -> None:
+    in_progress_uploads: Iterable[oci.object_storage.models.MultipartUpload] = (
+        chain_paginated_responses(client.list_multipart_uploads, namespace, bucket_name)
+    )
+    for upload in in_progress_uploads:
+        client.abort_multipart_upload(namespace, bucket_name, upload.object, upload.upload_id)
+
     par_ids = {
         par.id
         for par in chain_paginated_responses(

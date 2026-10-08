@@ -1,12 +1,18 @@
+import itertools
 import math
+import uuid
+from collections.abc import Hashable, Mapping
+from dataclasses import dataclass
+from enum import Enum
 from typing import Optional, Union
 
-from sqlalchemy import and_, not_, or_, select
+from sqlalchemy import and_, exists, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import contains_eager, noload
 
 from dstack._internal.core.backends.base.backend import Backend
-from dstack._internal.core.models.fleets import Fleet, InstanceGroupPlacement
+from dstack._internal.core.models.common import EntityReference
+from dstack._internal.core.models.fleets import FleetSpec, InstanceGroupPlacement
 from dstack._internal.core.models.instances import (
     InstanceAvailability,
     InstanceOfferWithAvailability,
@@ -21,27 +27,40 @@ from dstack._internal.core.models.runs import (
     RunSpec,
 )
 from dstack._internal.core.models.volumes import Volume
-from dstack._internal.server.models import FleetModel, InstanceModel, ProjectModel, RunModel
+from dstack._internal.server.models import (
+    ExportedFleetModel,
+    FleetModel,
+    ImportModel,
+    InstanceModel,
+    ProjectModel,
+    RunModel,
+)
 from dstack._internal.server.services.fleets import (
     check_can_create_new_cloud_instance_in_fleet,
-    fleet_model_to_fleet,
     get_fleet_master_instance_provisioning_data,
     get_fleet_requirements,
+    get_fleet_spec,
 )
 from dstack._internal.server.services.instances import (
-    filter_pool_instances,
+    filter_instances,
     get_instance_offer,
     get_pool_instances,
-    get_shared_pool_instances_with_offers,
+    get_shared_instances_with_offers,
+    is_placeholder_instance,
+    select_instances_by_selectors,
 )
 from dstack._internal.server.services.jobs import (
     get_instances_ids_with_detaching_volumes,
     get_job_configured_volumes,
     get_jobs_from_run_spec,
+    is_master_job,
     is_multinode_job,
     remove_job_spec_sensitive_info,
 )
-from dstack._internal.server.services.offers import get_offers_by_requirements
+from dstack._internal.server.services.offers import (
+    get_offers_by_requirements,
+    merge_offer_iterables,
+)
 from dstack._internal.server.services.requirements.combine import (
     combine_fleet_and_run_profiles,
     combine_fleet_and_run_requirements,
@@ -51,7 +70,6 @@ from dstack._internal.server.services.runs.spec import (
     get_nodes_required_num,
 )
 from dstack._internal.server.services.secrets import get_project_secrets_mapping
-from dstack._internal.settings import FeatureFlags
 from dstack._internal.utils import common as common_utils
 from dstack._internal.utils.logging import get_logger
 
@@ -68,70 +86,161 @@ _PER_FLEET_MAX_OFFERS = 100
 async def get_job_plans(
     session: AsyncSession,
     project: ProjectModel,
-    profile: Profile,
     run_spec: RunSpec,
     max_offers: Optional[int],
+    full_offers: bool,
+    unallocated_resources: bool,
+    for_offers_only: bool,
 ) -> list[JobPlan]:
+    """
+    Returns job plans for the given run spec.
+
+    Normal run planning (`dstack apply`) selects the best fleet candidate for each planned job
+    and builds offers from that path. `dstack offer` without `--group-by` uses the same
+    `/runs/get_plan` API but with `for_offers_only=True`. In that case, planning skips
+    best-fleet-candidate selection and collects offers directly: global offers when no fleets
+    are specified, or offers from the selected fleets when `--fleet` is used.
+
+    Services are planned per replica group. Tasks are planned per node group so each
+    group's requirements get their own offers (heterogeneous `groups:`). Other run types
+    are planned once and then expanded into per-job `JobPlan` results.
+    """
     run_name = run_spec.run_name
     if run_spec.run_name is None:
         # Set/unset dummy run name to generate job names for run plan.
         run_spec.run_name = "dry-run"
 
     secrets = await get_project_secrets_mapping(session=session, project=project)
-    jobs = await get_jobs_from_run_spec(
-        run_spec=run_spec,
-        secrets=secrets,
-        replica_num=0,
-    )
+
+    job_plans = []
+
     volumes = await get_job_configured_volumes(
         session=session,
         project=project,
         run_spec=run_spec,
         job_num=0,
     )
-    candidate_fleet_models = await _select_candidate_fleet_models(
-        session=session,
-        project=project,
-        run_model=None,
-        run_spec=run_spec,
-    )
-    fleet_model, instance_offers, backend_offers = await find_optimal_fleet_with_offers(
-        project=project,
-        fleet_models=candidate_fleet_models,
-        run_model=None,
-        run_spec=run_spec,
-        job=jobs[0],
-        master_job_provisioning_data=None,
-        volumes=volumes,
-        exclude_not_available=False,
-    )
-    if _should_force_non_fleet_offers(run_spec) or (
-        FeatureFlags.AUTOCREATED_FLEETS_ENABLED and profile.fleets is None and fleet_model is None
-    ):
-        # Keep the old behavior returning all offers irrespective of fleets.
-        # Needed for supporting offers with autocreated fleets flow (and for `dstack offer`).
-        instance_offers, backend_offers = await _get_non_fleet_offers(
+
+    if not for_offers_only and run_spec.merged_profile.instances is None:
+        candidate_fleet_models = await _select_candidate_fleet_models(
             session=session,
             project=project,
-            profile=profile,
+            run_model=None,
             run_spec=run_spec,
-            job=jobs[0],
-            volumes=volumes,
         )
+    else:
+        candidate_fleet_models = None
 
-    job_plans = []
-    for job in jobs:
-        job_plan = _get_job_plan(
-            instance_offers=instance_offers,
-            backend_offers=backend_offers,
-            profile=profile,
-            job=job,
-            max_offers=max_offers,
-        )
-        job_plans.append(job_plan)
+    skip_backend_offers = (
+        run_spec.merged_profile.creation_policy == CreationPolicy.REUSE
+        or run_spec.merged_profile.instances is not None
+    )
+
+    job_batches = await _get_job_batches_for_planning(
+        run_spec=run_spec,
+        secrets=secrets,
+    )
+
+    for jobs in job_batches:
+        plan_job = jobs[0]
+        if candidate_fleet_models is not None:
+            # Regular job planning
+            fleet_model, instance_offers, backend_offers = await find_optimal_fleet_with_offers(
+                project=project,
+                fleet_models=candidate_fleet_models,
+                run_model=None,
+                run_spec=run_spec,
+                job=plan_job,
+                master_job_provisioning_data=None,
+                volumes=volumes,
+                exclude_not_available=False,
+                skip_backend_offers=skip_backend_offers,
+                full_offers=full_offers,
+                unallocated_resources=unallocated_resources,
+            )
+        elif run_spec.merged_profile.instances is not None:
+            # Regular job planning or offer collection
+            instance_offers = await get_targeted_instance_offers(
+                session=session,
+                project=project,
+                run_spec=run_spec,
+                job=plan_job,
+                volumes=volumes,
+            )
+            backend_offers = []
+        elif run_spec.merged_profile.fleets is not None:
+            # Offer collection
+            instance_offers, backend_offers = await get_offers_in_run_candidate_fleets(
+                session=session,
+                project=project,
+                run_spec=run_spec,
+                job=plan_job,
+                volumes=volumes,
+                skip_backend_offers=skip_backend_offers,
+                full_offers=full_offers,
+                unallocated_resources=unallocated_resources,
+            )
+        else:
+            # Offer collection
+            instance_offers, backend_offers = await get_non_fleet_offers(
+                session=session,
+                project=project,
+                run_spec=run_spec,
+                job=plan_job,
+                volumes=volumes,
+                skip_backend_offers=skip_backend_offers,
+                full_offers=full_offers,
+                unallocated_resources=unallocated_resources,
+            )
+
+        for job in jobs:
+            job_plan = _get_job_plan(
+                instance_offers=instance_offers,
+                backend_offers=backend_offers,
+                job=job,
+                max_offers=max_offers,
+            )
+            job_plans.append(job_plan)
 
     run_spec.run_name = run_name
     return job_plans
+
+
+async def _get_job_batches_for_planning(
+    run_spec: RunSpec,
+    secrets: dict[str, str],
+) -> list[list[Job]]:
+    """Split jobs into batches that share the same offer/fleet planning pass.
+
+    Each batch is planned from its first job (group master / only job). Services
+    use one batch per replica group; tasks use one batch per node group.
+    """
+    if run_spec.configuration.type == "service":
+        batches: list[list[Job]] = []
+        for replica_group_name in [g.name for g in run_spec.configuration.replica_groups]:
+            jobs = await get_jobs_from_run_spec(
+                run_spec=run_spec,
+                secrets=secrets,
+                replica_num=0,
+                replica_group_name=replica_group_name,
+            )
+            if jobs:
+                batches.append(jobs)
+        return batches
+
+    jobs = await get_jobs_from_run_spec(
+        run_spec=run_spec,
+        secrets=secrets,
+        replica_num=0,
+    )
+    if run_spec.configuration.type != "task" or not jobs:
+        return [jobs] if jobs else []
+
+    # Jobs are emitted in node-group order; group consecutive same index.
+    return [
+        list(group_jobs)
+        for _, group_jobs in itertools.groupby(jobs, key=lambda j: j.job_spec.node_group_index)
+    ]
 
 
 async def get_run_candidate_fleet_models_filters(
@@ -146,14 +255,38 @@ async def get_run_candidate_fleet_models_filters(
     # If another job freed the instance but is still trying to detach volumes,
     # do not provision on it to prevent attaching volumes that are currently detaching.
     detaching_instances_ids = await get_instances_ids_with_detaching_volumes(session)
+    is_fleet_imported_subquery = exists().where(
+        ImportModel.project_id == project.id,
+        ImportModel.export_id == ExportedFleetModel.export_id,
+        ExportedFleetModel.fleet_id == FleetModel.id,
+    )
     fleet_filters = [
-        FleetModel.project_id == project.id,
+        or_(
+            FleetModel.project_id == project.id,
+            is_fleet_imported_subquery,
+        ),
         FleetModel.deleted == False,
     ]
     if run_model is not None and run_model.fleet is not None:
         fleet_filters.append(FleetModel.id == run_model.fleet_id)
     if run_spec.merged_profile.fleets is not None:
-        fleet_filters.append(FleetModel.name.in_(run_spec.merged_profile.fleets))
+        fleet_conditions = []
+        for ref in map(EntityReference.parse, run_spec.merged_profile.fleets):
+            if ref.project is None:
+                fleet_conditions.append(
+                    and_(
+                        FleetModel.name == ref.name,
+                        FleetModel.project_id == project.id,
+                    )
+                )
+            else:
+                fleet_conditions.append(
+                    and_(
+                        FleetModel.name == ref.name,
+                        ProjectModel.name == ref.project,
+                    )
+                )
+        fleet_filters.append(or_(*fleet_conditions))
     instance_filters = [
         InstanceModel.deleted == False,
         InstanceModel.id.not_in(detaching_instances_ids),
@@ -172,6 +305,7 @@ async def select_run_candidate_fleet_models_with_filters(
     # Then select left out fleets without instances.
     stmt = (
         select(FleetModel)
+        .join(FleetModel.project)  # can be referenced by fleet_filters
         .join(FleetModel.instances)
         .where(*fleet_filters)
         .where(*instance_filters)
@@ -179,14 +313,18 @@ async def select_run_candidate_fleet_models_with_filters(
         .execution_options(populate_existing=True)
     )
     if lock_instances:
-        stmt = stmt.order_by(InstanceModel.id).with_for_update(  # take locks in order
-            key_share=True, of=InstanceModel
-        )
+        # Skip locked instances since waiting for all the instances to unlock may take indefinite time.
+        # TODO: Switch to optimistic locking – implement select-lock-reselect loop.
+        stmt = stmt.where(InstanceModel.lock_expires_at.is_(None))
+        stmt = stmt.order_by(
+            InstanceModel.id  # take locks in order
+        ).with_for_update(skip_locked=True, key_share=True, of=InstanceModel)
     res = await session.execute(stmt)
     fleet_models_with_instances = list(res.unique().scalars().all())
     fleet_models_with_instances_ids = [f.id for f in fleet_models_with_instances]
     res = await session.execute(
         select(FleetModel)
+        .join(FleetModel.project)  # can be referenced by fleet_filters
         .outerjoin(FleetModel.instances)
         .where(
             *fleet_filters,
@@ -205,6 +343,22 @@ async def select_run_candidate_fleet_models_with_filters(
     return fleet_models_with_instances, fleet_models_without_instances
 
 
+@dataclass
+class _FleetCandidate:
+    fleet_model: FleetModel
+    fleet_spec: FleetSpec
+    instance_offers: list[tuple[InstanceModel, InstanceOfferWithAvailability]]
+    min_instance_offer_price: float
+    has_pool_capacity: bool
+
+
+@dataclass
+class _FleetCandidateWithBackendOffers:
+    candidate: _FleetCandidate
+    backend_offers: list[tuple[Backend, InstanceOfferWithAvailability]]
+    sort_key: tuple[bool, float, float]
+
+
 async def find_optimal_fleet_with_offers(
     project: ProjectModel,
     fleet_models: list[FleetModel],
@@ -214,6 +368,10 @@ async def find_optimal_fleet_with_offers(
     master_job_provisioning_data: Optional[JobProvisioningData],
     volumes: Optional[list[list[Volume]]],
     exclude_not_available: bool,
+    skip_backend_offers: bool = False,
+    skip_backend_offers_on_pool_capacity: bool = False,
+    full_offers: bool = False,
+    unallocated_resources: bool = False,
 ) -> tuple[
     Optional[FleetModel],
     list[tuple[InstanceModel, InstanceOfferWithAvailability]],
@@ -229,15 +387,14 @@ async def find_optimal_fleet_with_offers(
     """
     if run_model is not None and run_model.fleet is not None:
         # Using the fleet that was already chosen by the master job
-        instance_offers = _get_instance_offers_in_fleet(
+        instance_offers = get_instance_offers_in_fleet(
             fleet_model=run_model.fleet,
             run_spec=run_spec,
             job=job,
             master_job_provisioning_data=master_job_provisioning_data,
             volumes=volumes,
+            exclude_not_available=exclude_not_available,
         )
-        if exclude_not_available:
-            instance_offers = _exclude_non_available_instance_offers(instance_offers)
         return run_model.fleet, instance_offers, []
 
     nodes_required_num = get_nodes_required_num(run_spec)
@@ -246,119 +403,129 @@ async def find_optimal_fleet_with_offers(
     # Then choose a fleet with the cheapest pool offer among all fleets with pool offers.
     # If there are no fleets with pool offers, choose a fleet with a cheapest backend offer.
     # TODO: Consider trying all backend offers and then choosing a fleet.
-    candidate_fleets_with_offers: list[
-        tuple[
-            FleetModel,
-            list[tuple[InstanceModel, InstanceOfferWithAvailability]],
-            list[tuple[Backend, InstanceOfferWithAvailability]],
-            int,
-            int,
-            tuple[int, float, float],
-        ]
-    ] = []
-    for candidate_fleet_model in fleet_models:
-        candidate_fleet = fleet_model_to_fleet(candidate_fleet_model)
+
+    # First step: consider instance offers.
+    candidates: list[_FleetCandidate] = []
+    for fleet_model in fleet_models:
+        fleet_spec = get_fleet_spec(fleet_model)
         if (
             is_multinode_job(job)
-            and candidate_fleet.spec.configuration.placement != InstanceGroupPlacement.CLUSTER
+            and fleet_spec.configuration.placement != InstanceGroupPlacement.CLUSTER
         ):
             # Limit multinode runs to cluster fleets to guarantee best connectivity.
             continue
 
-        if not _run_can_fit_into_fleet(run_spec, candidate_fleet):
+        if not _run_can_fit_into_fleet(run_spec, fleet_model, fleet_spec):
             logger.debug(
                 "Skipping fleet %s from consideration: run cannot fit into fleet",
-                candidate_fleet.name,
+                fleet_model.name,
             )
             continue
 
-        instance_offers = _get_instance_offers_in_fleet(
-            fleet_model=candidate_fleet_model,
+        all_instance_offers = get_instance_offers_in_fleet(
+            fleet_model=fleet_model,
             run_spec=run_spec,
             job=job,
             # No need to pass master_job_provisioning_data for master job
             # as all pool offers are suitable.
             master_job_provisioning_data=None,
             volumes=volumes,
+            exclude_not_available=False,
         )
-        available_instance_offers = _exclude_non_available_instance_offers(instance_offers)
-        if exclude_not_available:
-            instance_offers = available_instance_offers
-        has_pool_capacity = nodes_required_num <= len(available_instance_offers)
-        min_instance_offer_price = _get_min_instance_or_backend_offer_price(
-            available_instance_offers
-        )
-
-        backend_offers = await _get_backend_offers_in_fleet(
-            project=project,
-            fleet_model=candidate_fleet_model,
-            fleet=candidate_fleet,
-            run_spec=run_spec,
-            job=job,
-            volumes=volumes,
-            max_offers=_PER_FLEET_MAX_OFFERS,
-        )
-
-        available_backend_offers = _exclude_non_available_backend_offers(backend_offers)
-        min_backend_offer_price = _get_min_instance_or_backend_offer_price(
-            available_backend_offers
-        )
-
-        fleet_priority = (
-            not has_pool_capacity,
-            min_instance_offer_price,
-            min_backend_offer_price,
-        )
-        candidate_fleets_with_offers.append(
-            (
-                candidate_fleet_model,
-                instance_offers,
-                backend_offers,
-                len(available_instance_offers),
-                len(available_backend_offers),
-                fleet_priority,
+        available_instance_offers = _exclude_non_available_instance_offers(all_instance_offers)
+        candidates.append(
+            _FleetCandidate(
+                fleet_model=fleet_model,
+                fleet_spec=fleet_spec,
+                instance_offers=(
+                    available_instance_offers if exclude_not_available else all_instance_offers
+                ),
+                min_instance_offer_price=_get_min_instance_or_backend_offer_price(
+                    available_instance_offers
+                ),
+                # Require at least one available instance so that fleets without matching
+                # instances are not treated as having capacity when nodes_required_num is 0
+                # (e.g. a service scaling from zero replicas).
+                has_pool_capacity=(
+                    len(available_instance_offers) > 0
+                    and nodes_required_num <= len(available_instance_offers)
+                ),
             )
         )
 
-    if len(candidate_fleets_with_offers) == 0:
-        return None, [], []
-
-    if (
-        FeatureFlags.AUTOCREATED_FLEETS_ENABLED
-        and run_spec.merged_profile.fleets is None
-        and all(t[3] == 0 and t[4] == 0 for t in candidate_fleets_with_offers)
-    ):
-        # If fleets are not specified and no fleets have available pool
-        # or backend offers, create a new fleet.
-        # This is for compatibility with non-fleet-first UX when runs created new fleets
-        # if there are no instances to reuse.
-        return None, [], []
-
-    candidate_fleets_with_offers.sort(key=lambda t: t[-1])
-    optimal_fleet_model, instance_offers = candidate_fleets_with_offers[0][:2]
-    # Refetch backend offers without limit to return all offers for the optimal fleet.
-    backend_offers = await _get_backend_offers_in_fleet(
-        project=project,
-        fleet_model=optimal_fleet_model,
-        run_spec=run_spec,
-        job=job,
-        volumes=volumes,
-        max_offers=None,
+    _skip_backend_offers = skip_backend_offers or (
+        # If any candidate fleet has pool capacity, the optimal fleet will be one of
+        # those, so backend offers from any fleet won't affect selection — skip them entirely when allowed.
+        skip_backend_offers_on_pool_capacity
+        and any(candidate.has_pool_capacity for candidate in candidates)
     )
-    if exclude_not_available:
-        backend_offers = _exclude_non_available_backend_offers(backend_offers)
+
+    # Second step: gather backend offers unless skipped.
+    candidates_with_backend_offers: list[_FleetCandidateWithBackendOffers] = []
+    for candidate in candidates:
+        backend_offers: list[tuple[Backend, InstanceOfferWithAvailability]]
+        if _skip_backend_offers:
+            backend_offers = []
+        else:
+            backend_offers = await _get_backend_offers_in_fleet(
+                project=project,
+                fleet_model=candidate.fleet_model,
+                fleet_spec=candidate.fleet_spec,
+                run_spec=run_spec,
+                job=job,
+                volumes=volumes,
+                max_offers=_PER_FLEET_MAX_OFFERS,
+                full_offers=full_offers,
+                unallocated_resources=unallocated_resources,
+            )
+        available_backend_offers = _exclude_non_available_backend_offers(backend_offers)
+        candidates_with_backend_offers.append(
+            _FleetCandidateWithBackendOffers(
+                candidate=candidate,
+                backend_offers=backend_offers,
+                # Pool-capacity fleets first; then cheapest pool offer; then cheapest backend.
+                sort_key=(
+                    not candidate.has_pool_capacity,
+                    candidate.min_instance_offer_price,
+                    _get_min_instance_or_backend_offer_price(available_backend_offers),
+                ),
+            )
+        )
+
+    if not candidates_with_backend_offers:
+        return None, [], []
+
+    optimal = min(candidates_with_backend_offers, key=lambda c: c.sort_key)
+    optimal_fleet_model = optimal.candidate.fleet_model
+    instance_offers = optimal.candidate.instance_offers
+    if _skip_backend_offers:
+        backend_offers = []
+    else:
+        # Refetch backend offers without limit to return all offers for the optimal fleet.
+        backend_offers = await _get_backend_offers_in_fleet(
+            project=project,
+            fleet_model=optimal_fleet_model,
+            run_spec=run_spec,
+            job=job,
+            volumes=volumes,
+            max_offers=None,
+            full_offers=full_offers,
+            unallocated_resources=unallocated_resources,
+        )
+        if exclude_not_available:
+            backend_offers = _exclude_non_available_backend_offers(backend_offers)
     return optimal_fleet_model, instance_offers, backend_offers
 
 
 def get_run_profile_and_requirements_in_fleet(
     job: Job,
     run_spec: RunSpec,
-    fleet: Fleet,
+    fleet_spec: FleetSpec,
 ) -> tuple[Profile, Requirements]:
-    profile = combine_fleet_and_run_profiles(fleet.spec.merged_profile, run_spec.merged_profile)
+    profile = combine_fleet_and_run_profiles(fleet_spec.merged_profile, run_spec.merged_profile)
     if profile is None:
         raise ValueError("Cannot combine fleet profile")
-    fleet_requirements = get_fleet_requirements(fleet.spec)
+    fleet_requirements = get_fleet_requirements(fleet_spec)
     requirements = combine_fleet_and_run_requirements(
         fleet_requirements, job.job_spec.requirements
     )
@@ -391,41 +558,168 @@ async def _select_candidate_fleet_models(
     return fleet_models_with_instances + fleet_models_without_instances
 
 
-def _get_instance_offers_in_fleet(
+def get_instance_offers_in_fleet(
     fleet_model: FleetModel,
     run_spec: RunSpec,
     job: Job,
     master_job_provisioning_data: Optional[JobProvisioningData] = None,
     volumes: Optional[list[list[Volume]]] = None,
+    exclude_not_available: bool = False,
 ) -> list[tuple[InstanceModel, InstanceOfferWithAvailability]]:
-    pool_instances = fleet_model.instances
+    return get_instance_offers_from_instances(
+        instances=fleet_model.instances,
+        run_spec=run_spec,
+        job=job,
+        master_job_provisioning_data=master_job_provisioning_data,
+        volumes=volumes,
+        exclude_not_available=exclude_not_available,
+    )
+
+
+def get_instance_offers_from_instances(
+    instances: list[InstanceModel],
+    run_spec: RunSpec,
+    job: Job,
+    master_job_provisioning_data: Optional[JobProvisioningData] = None,
+    volumes: Optional[list[list[Volume]]] = None,
+    exclude_not_available: bool = False,
+) -> list[tuple[InstanceModel, InstanceOfferWithAvailability]]:
     profile = run_spec.merged_profile
     multinode = is_multinode_job(job)
-    nonshared_instances = filter_pool_instances(
-        pool_instances=pool_instances,
+    nonshared_instances = filter_instances(
+        instances=instances,
         profile=profile,
         requirements=job.job_spec.requirements,
-        fleet_model=fleet_model,
         multinode=multinode,
         master_job_provisioning_data=master_job_provisioning_data,
         volumes=volumes,
         shared=False,
     )
     instances_with_offers = _get_offers_from_instances(nonshared_instances)
-    shared_instances_with_offers = get_shared_pool_instances_with_offers(
-        pool_instances=pool_instances,
+    shared_instances_with_offers = get_shared_instances_with_offers(
+        instances=instances,
         profile=profile,
         requirements=job.job_spec.requirements,
-        fleet_model=fleet_model,
         multinode=multinode,
         volumes=volumes,
     )
     instances_with_offers.extend(shared_instances_with_offers)
     instances_with_offers.sort(key=lambda o: o[0].price or 0)
+    if exclude_not_available:
+        return _exclude_non_available_instance_offers(instances_with_offers)
     return instances_with_offers
 
 
-def _run_can_fit_into_fleet(run_spec: RunSpec, fleet: Fleet) -> bool:
+async def get_targeted_instance_offers(
+    session: AsyncSession,
+    project: ProjectModel,
+    run_spec: RunSpec,
+    job: Job,
+    master_job_provisioning_data: Optional[JobProvisioningData] = None,
+    volumes: Optional[list[list[Volume]]] = None,
+    exclude_not_available: bool = False,
+    fleet_id: Optional[uuid.UUID] = None,
+    instance_ids: Optional[list[uuid.UUID]] = None,
+    lock_instances: bool = False,
+) -> list[tuple[InstanceModel, InstanceOfferWithAvailability]]:
+    selectors = common_utils.get_or_error(run_spec.merged_profile.instances)
+    detaching_instance_ids = await get_instances_ids_with_detaching_volumes(session)
+    instances = await select_instances_by_selectors(
+        session=session,
+        project=project,
+        selectors=selectors,
+        fleets=run_spec.merged_profile.fleets,
+        detaching_instance_ids=detaching_instance_ids,
+        fleet_id=fleet_id,
+        instance_ids=instance_ids,
+        lock_instances=lock_instances,
+    )
+    return select_targeted_instance_offers(
+        instances=instances,
+        run_spec=run_spec,
+        job=job,
+        master_job_provisioning_data=master_job_provisioning_data,
+        volumes=volumes,
+        exclude_not_available=exclude_not_available,
+    )
+
+
+def select_targeted_instance_offers(
+    instances: list[InstanceModel],
+    run_spec: RunSpec,
+    job: Job,
+    master_job_provisioning_data: Optional[JobProvisioningData] = None,
+    volumes: Optional[list[list[Volume]]] = None,
+    exclude_not_available: bool = False,
+) -> list[tuple[InstanceModel, InstanceOfferWithAvailability]]:
+    candidates: list[_TargetedInstanceOffersCandidate] = []
+    for fleet_instances in _group_instances_by_fleet(instances).values():
+        fleet = common_utils.get_or_error(fleet_instances[0].fleet)
+        fleet_spec = get_fleet_spec(fleet)
+        if (
+            is_multinode_job(job)
+            and fleet_spec.configuration.placement != InstanceGroupPlacement.CLUSTER
+        ):
+            continue
+        all_offers = get_instance_offers_from_instances(
+            instances=fleet_instances,
+            run_spec=run_spec,
+            job=job,
+            master_job_provisioning_data=master_job_provisioning_data,
+            volumes=volumes,
+            exclude_not_available=False,
+        )
+        if len(all_offers) < _get_required_instance_offers(run_spec, job):
+            continue
+        available_offers = _exclude_non_available_instance_offers(all_offers)
+        if exclude_not_available:
+            all_offers = available_offers
+        if all_offers:
+            has_capacity = len(available_offers) >= _get_required_instance_offers(run_spec, job)
+            candidates.append(
+                _TargetedInstanceOffersCandidate(
+                    lacks_capacity=not has_capacity,
+                    available_price=_get_min_instance_or_backend_offer_price(available_offers),
+                    selected_price=_get_min_instance_or_backend_offer_price(all_offers),
+                    offers=all_offers,
+                )
+            )
+    if not candidates:
+        return []
+    return min(candidates, key=lambda candidate: candidate.sort_key()).offers
+
+
+@dataclass(frozen=True)
+class _TargetedInstanceOffersCandidate:
+    lacks_capacity: bool
+    available_price: float
+    selected_price: float
+    offers: list[tuple[InstanceModel, InstanceOfferWithAvailability]]
+
+    def sort_key(self) -> tuple[bool, float, float]:
+        return self.lacks_capacity, self.available_price, self.selected_price
+
+
+def _group_instances_by_fleet(
+    instances: list[InstanceModel],
+) -> dict[uuid.UUID, list[InstanceModel]]:
+    instances_by_fleet: dict[uuid.UUID, list[InstanceModel]] = {}
+    for instance in instances:
+        if instance.fleet_id is None:
+            continue
+        instances_by_fleet.setdefault(instance.fleet_id, []).append(instance)
+    return instances_by_fleet
+
+
+def _get_required_instance_offers(run_spec: RunSpec, job: Job) -> int:
+    if is_multinode_job(job) and is_master_job(job):
+        return get_nodes_required_num(run_spec)
+    return 1
+
+
+def _run_can_fit_into_fleet(
+    run_spec: RunSpec, fleet_model: FleetModel, fleet_spec: FleetSpec
+) -> bool:
     """
     Returns `False` if the run cannot fit into fleet for sure.
     This is helpful heuristic to avoid even considering fleets too small for a run.
@@ -438,24 +732,31 @@ def _run_can_fit_into_fleet(run_spec: RunSpec, fleet: Fleet) -> bool:
     # how many jobs such fleets can accommodate.
     nodes_required_num = get_nodes_required_num(run_spec)
     if (
-        fleet.spec.configuration.nodes is not None
-        and fleet.spec.configuration.blocks == 1
-        and fleet.spec.configuration.nodes.max is not None
+        fleet_spec.configuration.nodes is not None
+        and fleet_spec.configuration.blocks == 1
+        and fleet_spec.configuration.nodes.max is not None
     ):
-        busy_instances = [i for i in fleet.instances if i.busy_blocks > 0]
-        fleet_available_capacity = fleet.spec.configuration.nodes.max - len(busy_instances)
+        occupied_instances = _get_occupied_instances(fleet_model.instances)
+        fleet_available_capacity = fleet_spec.configuration.nodes.max - len(occupied_instances)
         if fleet_available_capacity < nodes_required_num:
             return False
-    elif fleet.spec.configuration.ssh_config is not None:
+    elif fleet_spec.configuration.ssh_config is not None:
         # Currently assume that each idle block can run a job.
         # TODO: Take resources / eligible offers into account.
         total_idle_blocks = 0
-        for instance in fleet.instances:
+        for instance in fleet_model.instances:
             total_blocks = instance.total_blocks or 1
             total_idle_blocks += total_blocks - instance.busy_blocks
         if total_idle_blocks < nodes_required_num:
             return False
     return True
+
+
+def _get_occupied_instances(instance_models: list[InstanceModel]) -> list[InstanceModel]:
+    # A placeholder has busy_blocks == 0 but reserves a `nodes.max` slot
+    # (unlike an IDLE instance, which can be reused by this run), so count
+    # it here the same as a busy instance.
+    return [i for i in instance_models if i.busy_blocks > 0 or is_placeholder_instance(i)]
 
 
 async def _get_backend_offers_in_fleet(
@@ -464,17 +765,19 @@ async def _get_backend_offers_in_fleet(
     run_spec: RunSpec,
     job: Job,
     volumes: Optional[list[list[Volume]]],
-    fleet: Optional[Fleet] = None,
+    fleet_spec: Optional[FleetSpec] = None,
     max_offers: Optional[int] = None,
+    full_offers: bool = False,
+    unallocated_resources: bool = False,
 ) -> list[tuple[Backend, InstanceOfferWithAvailability]]:
-    if fleet is None:
-        fleet = fleet_model_to_fleet(fleet_model)
+    if fleet_spec is None:
+        fleet_spec = get_fleet_spec(fleet_model)
     try:
-        check_can_create_new_cloud_instance_in_fleet(fleet)
+        check_can_create_new_cloud_instance_in_fleet(fleet_model, fleet_spec)
         profile, requirements = get_run_profile_and_requirements_in_fleet(
             job=job,
             run_spec=run_spec,
-            fleet=fleet,
+            fleet_spec=fleet_spec,
         )
     except ValueError:
         backend_offers = []
@@ -482,7 +785,7 @@ async def _get_backend_offers_in_fleet(
         # Master job offers must be in the same cluster as existing instances.
         master_instance_provisioning_data = get_fleet_master_instance_provisioning_data(
             fleet_model=fleet_model,
-            fleet_spec=fleet.spec,
+            fleet_spec=fleet_spec,
         )
         # Handle multinode for old jobs that don't have requirements.multinode set.
         # TODO: Drop multinode param.
@@ -497,6 +800,8 @@ async def _get_backend_offers_in_fleet(
             privileged=job.job_spec.privileged,
             instance_mounts=check_run_spec_requires_instance_mounts(run_spec),
             max_offers=max_offers,
+            full_offers=full_offers,
+            unallocated_resources=unallocated_resources,
         )
     return backend_offers
 
@@ -506,15 +811,15 @@ async def _get_pool_offers(
     project: ProjectModel,
     run_spec: RunSpec,
     job: Job,
-    volumes: list[list[Volume]],
+    volumes: Optional[list[list[Volume]]],
 ) -> list[tuple[InstanceModel, InstanceOfferWithAvailability]]:
     pool_offers: list[tuple[InstanceModel, InstanceOfferWithAvailability]] = []
     detaching_instances_ids = await get_instances_ids_with_detaching_volumes(session)
     pool_instances = await get_pool_instances(session, project)
     pool_instances = [i for i in pool_instances if i.id not in detaching_instances_ids]
     multinode = is_multinode_job(job)
-    shared_instances_with_offers = get_shared_pool_instances_with_offers(
-        pool_instances=pool_instances,
+    shared_instances_with_offers = get_shared_instances_with_offers(
+        instances=pool_instances,
         profile=run_spec.merged_profile,
         requirements=job.job_spec.requirements,
         volumes=volumes,
@@ -523,8 +828,8 @@ async def _get_pool_offers(
     for offer in shared_instances_with_offers:
         pool_offers.append(offer)
 
-    nonshared_instances = filter_pool_instances(
-        pool_instances=pool_instances,
+    nonshared_instances = filter_instances(
+        instances=pool_instances,
         profile=run_spec.merged_profile,
         requirements=job.job_spec.requirements,
         multinode=multinode,
@@ -537,19 +842,21 @@ async def _get_pool_offers(
     return pool_offers
 
 
-async def _get_non_fleet_offers(
+async def get_non_fleet_offers(
     session: AsyncSession,
     project: ProjectModel,
-    profile: Profile,
     run_spec: RunSpec,
     job: Job,
-    volumes: list[list[Volume]],
+    volumes: Optional[list[list[Volume]]] = None,
+    skip_backend_offers: bool = False,
+    full_offers: bool = False,
+    unallocated_resources: bool = False,
 ) -> tuple[
     list[tuple[InstanceModel, InstanceOfferWithAvailability]],
     list[tuple[Backend, InstanceOfferWithAvailability]],
 ]:
     """
-    Returns instance and backend offers for job irrespective of fleets,
+    Returns instance and backend offers for job irrespective of fleets or instances,
     i.e. all pool instances and project backends matching the spec.
     """
     instance_offers = await _get_pool_offers(
@@ -559,30 +866,180 @@ async def _get_non_fleet_offers(
         job=job,
         volumes=volumes,
     )
-    backend_offers = await get_offers_by_requirements(
-        project=project,
-        profile=profile,
-        requirements=job.job_spec.requirements,
-        exclude_not_available=False,
-        multinode=is_multinode_job(job),
-        volumes=volumes,
-        privileged=job.job_spec.privileged,
-        instance_mounts=check_run_spec_requires_instance_mounts(run_spec),
-    )
+    backend_offers: list[tuple[Backend, InstanceOfferWithAvailability]]
+    if skip_backend_offers:
+        backend_offers = []
+    else:
+        backend_offers = await get_offers_by_requirements(
+            project=project,
+            profile=run_spec.merged_profile,
+            requirements=job.job_spec.requirements,
+            exclude_not_available=False,
+            multinode=is_multinode_job(job),
+            volumes=volumes,
+            privileged=job.job_spec.privileged,
+            instance_mounts=check_run_spec_requires_instance_mounts(run_spec),
+            full_offers=full_offers,
+            unallocated_resources=unallocated_resources,
+        )
     return instance_offers, backend_offers
+
+
+async def get_backend_offers_in_run_candidate_fleets(
+    session: AsyncSession,
+    project: ProjectModel,
+    run_spec: RunSpec,
+    job: Job,
+    volumes: Optional[list[list[Volume]]],
+    max_offers_per_fleet: Optional[int] = None,
+    full_offers: bool = False,
+    unallocated_resources: bool = False,
+) -> list[tuple[Backend, InstanceOfferWithAvailability]]:
+    """
+    Returns backend offers across the run's selected candidate fleets.
+
+    Helper of `get_offers_in_run_candidate_fleets()` that collects the backend part of its offers.
+    It resolves the selected fleets from `run_spec`, requests backend offers in each fleet,
+    merges them, and deduplicates identical backend offers across fleets.
+    """
+    if run_spec.merged_profile.instances is not None:
+        return []
+
+    candidate_fleet_models = await _select_candidate_fleet_models(
+        session=session,
+        project=project,
+        run_model=None,
+        run_spec=run_spec,
+    )
+    seen_offer_identities = set()
+    offers: list[tuple[Backend, InstanceOfferWithAvailability]] = []
+    for candidate_fleet_model in candidate_fleet_models:
+        offers_from_fleet = []
+        for backend, offer in await _get_backend_offers_in_fleet(
+            project=project,
+            fleet_model=candidate_fleet_model,
+            run_spec=run_spec,
+            job=job,
+            volumes=volumes,
+            max_offers=max_offers_per_fleet,
+            full_offers=full_offers,
+            unallocated_resources=unallocated_resources,
+        ):
+            offer_identity = _get_backend_offer_identity(offer)
+            if offer_identity not in seen_offer_identities:
+                offers_from_fleet.append((backend, offer))
+                seen_offer_identities.add(offer_identity)
+        offers = list(merge_offer_iterables(offers, offers_from_fleet))
+    return offers
+
+
+async def get_offers_in_run_candidate_fleets(
+    session: AsyncSession,
+    project: ProjectModel,
+    run_spec: RunSpec,
+    job: Job,
+    volumes: Optional[list[list[Volume]]] = None,
+    skip_backend_offers: bool = False,
+    full_offers: bool = False,
+    unallocated_resources: bool = False,
+) -> tuple[
+    list[tuple[InstanceModel, InstanceOfferWithAvailability]],
+    list[tuple[Backend, InstanceOfferWithAvailability]],
+]:
+    """
+    Returns existing-instance and backend offers across the run's candidate fleets.
+
+    Used by `dstack offer --fleet ...` (with or without `--group-by`). Unlike normal
+    `dstack apply`, it does not choose a single best fleet. Instead, it gathers existing-instance
+    and backend offers from each selected fleet, keeps existing instances as separate reusable
+    options, and deduplicates identical backend offers across fleets.
+    """
+    candidate_fleet_models = await _select_candidate_fleet_models(
+        session=session,
+        project=project,
+        run_model=None,
+        run_spec=run_spec,
+    )
+    instance_offers: list[tuple[InstanceModel, InstanceOfferWithAvailability]] = []
+    for candidate_fleet_model in candidate_fleet_models:
+        instance_offers.extend(
+            get_instance_offers_in_fleet(
+                fleet_model=candidate_fleet_model,
+                run_spec=run_spec,
+                job=job,
+                volumes=volumes,
+                exclude_not_available=False,
+            )
+        )
+    instance_offers.sort(key=lambda offer: offer[1].price or 0)
+
+    backend_offers: list[tuple[Backend, InstanceOfferWithAvailability]]
+    if skip_backend_offers:
+        backend_offers = []
+    else:
+        # TODO: Intentionally pass `max_offers_per_fleet=None` here. `dstack offer --fleet ...`
+        # is expected to return the exact `total_offers`, so capping backend offers per selected
+        # fleet would make that total approximate. We already deduplicate identical backend offers
+        # while merging selected fleets via `_get_backend_offer_identity()`. Revisit adding a cap
+        # only if this path causes real performance or memory problems.
+        backend_offers = await get_backend_offers_in_run_candidate_fleets(
+            session=session,
+            project=project,
+            run_spec=run_spec,
+            job=job,
+            volumes=volumes,
+            max_offers_per_fleet=None,
+            full_offers=full_offers,
+            unallocated_resources=unallocated_resources,
+        )
+    return instance_offers, backend_offers
+
+
+def _get_backend_offer_identity(offer: InstanceOfferWithAvailability) -> Hashable:
+    """
+    Returns a hashable identity for a backend offer using the full offer payload.
+
+    Needed to deduplicate identical backend offers when merging offers from multiple fleets for
+    `dstack offer --fleet ...`.
+    """
+    return _freeze_offer_identity_value(offer.model_dump())
+
+
+def _freeze_offer_identity_value(value: object) -> Hashable:
+    """Converts nested offer payload values into a deterministic hashable form."""
+    if isinstance(value, Mapping):
+        return tuple(
+            sorted(
+                (
+                    (
+                        _freeze_offer_identity_value(key),
+                        _freeze_offer_identity_value(nested_value),
+                    )
+                    for key, nested_value in value.items()
+                ),
+                key=repr,
+            )
+        )
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_offer_identity_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((_freeze_offer_identity_value(item) for item in value), key=repr))
+    if not isinstance(value, Hashable):
+        raise TypeError(f"Unsupported backend offer identity value: {type(value)!r}")
+    return value
 
 
 def _get_job_plan(
     instance_offers: list[tuple[InstanceModel, InstanceOfferWithAvailability]],
     backend_offers: list[tuple[Backend, InstanceOfferWithAvailability]],
-    profile: Profile,
     job: Job,
     max_offers: Optional[int],
 ) -> JobPlan:
     job_offers: list[InstanceOfferWithAvailability] = []
     job_offers.extend(offer for _, offer in instance_offers)
-    if profile.creation_policy == CreationPolicy.REUSE_OR_CREATE:
-        job_offers.extend(offer for _, offer in backend_offers)
+    job_offers.extend(offer for _, offer in backend_offers)
     job_offers.sort(key=lambda offer: not offer.availability.is_available())
     remove_job_spec_sensitive_info(job.job_spec)
     return JobPlan(
@@ -591,13 +1048,6 @@ def _get_job_plan(
         total_offers=len(job_offers),
         max_price=max((offer.price for offer in job_offers), default=None),
     )
-
-
-def _should_force_non_fleet_offers(run_spec: RunSpec) -> bool:
-    # A hack to force non-fleet offers for `dstack offer` command that uses
-    # get run plan API to show offers and the only way to distinguish it is commands.
-    # Assuming real runs will not use such commands.
-    return run_spec.configuration.type == "task" and run_spec.configuration.commands == [":"]
 
 
 def _get_offers_from_instances(

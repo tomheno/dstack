@@ -1,31 +1,38 @@
-from typing import List
+from typing import Annotated, List
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import dstack._internal.server.services.instances as instances_services
+from dstack._internal.core.errors import ResourceNotExistsError
 from dstack._internal.core.models.instances import Instance
 from dstack._internal.server.db import get_session
+from dstack._internal.server.deps import Project
 from dstack._internal.server.models import ProjectModel, UserModel
 from dstack._internal.server.schemas.instances import (
     GetInstanceHealthChecksRequest,
     GetInstanceHealthChecksResponse,
+    GetInstanceRequest,
     ListInstancesRequest,
 )
-from dstack._internal.server.security.permissions import Authenticated, ProjectMember
+from dstack._internal.server.security.permissions import (
+    Authenticated,
+    ProjectMember,
+    check_can_access_instance,
+)
 from dstack._internal.server.utils.routers import (
-    CustomORJSONResponse,
+    CustomJSONResponse,
     get_base_api_additional_responses,
 )
 
 root_router = APIRouter(
     prefix="/api/instances",
-    tags=["instances"],
+    tags=["fleets"],
     responses=get_base_api_additional_responses(),
 )
 project_router = APIRouter(
     prefix="/api/project/{project_name}/instances",
-    tags=["instances"],
+    tags=["fleets"],
     responses=get_base_api_additional_responses(),
 )
 
@@ -43,13 +50,14 @@ async def list_instances(
     The results are paginated. To get the next page, pass `created_at` and `id` of
     the last instance from the previous page as `prev_created_at` and `prev_id`.
     """
-    return CustomORJSONResponse(
+    return CustomJSONResponse(
         await instances_services.list_user_instances(
             session=session,
             user=user,
             project_names=body.project_names,
             fleet_ids=body.fleet_ids,
             only_active=body.only_active,
+            include_imported=body.include_imported,
             prev_created_at=body.prev_created_at,
             prev_id=body.prev_id,
             limit=body.limit,
@@ -74,4 +82,25 @@ async def get_instance_health_checks(
         before=body.before,
         limit=body.limit,
     )
-    return CustomORJSONResponse(GetInstanceHealthChecksResponse(health_checks=health_checks))
+    return CustomJSONResponse(GetInstanceHealthChecksResponse(health_checks=health_checks))
+
+
+@project_router.post("/get", response_model=Instance)
+async def get_instance(
+    body: GetInstanceRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    user: Annotated[UserModel, Depends(Authenticated())],
+    project: Annotated[ProjectModel, Depends(Project())],
+):
+    """
+    Returns an instance given its ID.
+    """
+    await check_can_access_instance(
+        session=session, user=user, instance_project=project, instance_id=body.id
+    )
+    instance = await instances_services.get_instance(
+        session=session, project=project, instance_id=body.id
+    )
+    if instance is None:
+        raise ResourceNotExistsError()
+    return CustomJSONResponse(instance)

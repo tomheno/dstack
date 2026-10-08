@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 import gpuhunt
-from pydantic import root_validator
+from pydantic import model_validator
 
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.common import (
@@ -14,7 +14,7 @@ from dstack._internal.core.models.common import (
 from dstack._internal.core.models.envs import Env
 from dstack._internal.core.models.health import HealthStatus
 from dstack._internal.core.models.volumes import Volume
-from dstack._internal.utils.common import pretty_resources
+from dstack._internal.utils.common import format_mib_as_gb, pretty_resources
 from dstack._internal.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -23,11 +23,13 @@ logger = get_logger(__name__)
 class Gpu(CoreModel):
     name: str
     memory_mib: int
-    # Although it's declared as Optional, in fact it always has a value set by the root validator,
-    # that is, `assert gpu.vendor is not None` should be a safe type narrowing.
     vendor: Optional[gpuhunt.AcceleratorVendor] = None
+    """`vendor` is declared as optional, but the root validator always sets a value.
+    `assert gpu.vendor is not None` should be a safe type narrowing.
+    """
 
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
     def validate_name_and_vendor(cls, values):
         is_tpu = False
         name = values.get("name")
@@ -45,8 +47,15 @@ class Gpu(CoreModel):
         return values
 
 
+class GpuDriverInfo(CoreModel):
+    vendor: Optional[gpuhunt.AcceleratorVendor] = None
+    """`vendor` is not set on hosts where shim could not detect it."""
+    version: str
+
+
 class Disk(CoreModel):
     size_mib: int
+    """`size_mib=0` has a special meaning -- size is unknown"""
 
 
 class Resources(CoreModel):
@@ -54,34 +63,14 @@ class Resources(CoreModel):
     memory_mib: int
     gpus: List[Gpu]
     spot: bool
-    disk: Disk = Disk(size_mib=102400)  # the default value (100GB) for backward compatibility
+    disk: Disk = Disk(size_mib=102400)
+    """`disk` defaults to 100GB for backward compatibility."""
     cpu_arch: Optional[gpuhunt.CPUArchitecture] = None
-    # TODO: make description a computed field after migrating to pydanticV2
+    # TODO: remove `description` in 0.22.
     description: str = ""
-
-    @root_validator
-    def _description(cls, values) -> Dict:
-        try:
-            description = values["description"]
-            if not description:
-                cpus = values["cpus"]
-                memory_mib = values["memory_mib"]
-                gpus = values["gpus"]
-                disk_size_mib = values["disk"].size_mib
-                spot = values["spot"]
-                cpu_arch = values["cpu_arch"]
-                values["description"] = Resources._pretty_format(
-                    cpus=cpus,
-                    cpu_arch=cpu_arch,
-                    memory_mib=memory_mib,
-                    disk_size_mib=disk_size_mib,
-                    gpus=gpus,
-                    spot=spot,
-                    include_spot=True,
-                )
-        except KeyError:
-            return values
-        return values
+    """Never set by the server since 0.21. Kept because pre-0.21 clients echo it back inside
+    `current_resource` on apply, and requests reject extra fields.
+    """
 
     def pretty_format(self, include_spot: bool = False, gpu_only: bool = False) -> str:
         return Resources._pretty_format(
@@ -93,20 +82,6 @@ class Resources(CoreModel):
             self.spot,
             include_spot,
             gpu_only,
-        )
-
-    def update_description(self):
-        """
-        Call to update `description` after patching other properties.
-        """
-        self.description = Resources._pretty_format(
-            cpus=self.cpus,
-            cpu_arch=self.cpu_arch,
-            memory_mib=self.memory_mib,
-            disk_size_mib=self.disk.size_mib,
-            gpus=self.gpus,
-            spot=self.spot,
-            include_spot=True,
         )
 
     @staticmethod
@@ -129,7 +104,7 @@ class Resources(CoreModel):
                 "gpu_count": len(gpus),
             }
             if gpu.memory_mib > 0:
-                gpu_resources["gpu_memory"] = f"{gpu.memory_mib / 1024:.0f}GB"
+                gpu_resources["gpu_memory"] = format_mib_as_gb(gpu.memory_mib)
             output = pretty_resources(**gpu_resources)
             if include_spot and spot:
                 output += " (spot)"
@@ -140,15 +115,15 @@ class Resources(CoreModel):
             resources["cpus"] = cpus
             resources["cpu_arch"] = cpu_arch
         if memory_mib > 0:
-            resources["memory"] = f"{memory_mib / 1024:.0f}GB"
+            resources["memory"] = format_mib_as_gb(memory_mib)
         if disk_size_mib > 0:
-            resources["disk_size"] = f"{disk_size_mib / 1024:.0f}GB"
+            resources["disk_size"] = format_mib_as_gb(disk_size_mib)
         if gpus:
             gpu = gpus[0]
             resources["gpu_name"] = gpu.name
             resources["gpu_count"] = len(gpus)
             if gpu.memory_mib > 0:
-                resources["gpu_memory"] = f"{gpu.memory_mib / 1024:.0f}GB"
+                resources["gpu_memory"] = format_mib_as_gb(gpu.memory_mib)
         output = pretty_resources(**resources)
         if include_spot and spot:
             output += " (spot)"
@@ -184,7 +159,8 @@ class RemoteConnectionInfo(CoreModel):
 class InstanceConfiguration(CoreModel):
     project_name: str
     instance_name: str
-    user: str  # dstack user name
+    user: str
+    """`user` stores the dstack user name."""
     ssh_keys: List[SSHKey]
     instance_id: Optional[str] = None
     reservation: Optional[str] = None
@@ -205,7 +181,8 @@ class InstanceAvailability(Enum):
     AVAILABLE = "available"
     NOT_AVAILABLE = "not_available"
     NO_QUOTA = "no_quota"
-    NO_BALANCE = "no_balance"  # For dstack Sky
+    NO_BALANCE = "no_balance"
+    """`NO_BALANCE` is used for dstack Sky."""
     IDLE = "idle"
     BUSY = "busy"
 
@@ -223,6 +200,12 @@ class InstanceOffer(CoreModel):
     region: str
     price: float
     backend_data: dict[str, Any] = {}
+
+    def with_availability(self, **kwargs) -> "InstanceOfferWithAvailability":
+        """Convert to InstanceOfferWithAvailability without re-serializing/re-validating fields.
+        The result shares nested objects with self. This is generally safe because callers
+        discard the original InstanceOffer after conversion."""
+        return InstanceOfferWithAvailability.model_construct(**{**self.__dict__, **kwargs})
 
 
 class InstanceOfferWithAvailability(InstanceOffer):
@@ -256,6 +239,7 @@ class InstanceStatus(str, Enum):
 
 
 class InstanceTerminationReason(str, Enum):
+    TERMINATED_BY_USER = "terminated_by_user"
     IDLE_TIMEOUT = "idle_timeout"
     PROVISIONING_TIMEOUT = "provisioning_timeout"
     ERROR = "error"
@@ -264,7 +248,9 @@ class InstanceTerminationReason(str, Enum):
     NO_OFFERS = "no_offers"
     MASTER_FAILED = "master_failed"
     MAX_INSTANCES_LIMIT = "max_instances_limit"
-    NO_BALANCE = "no_balance"  # used in dstack Sky
+    FLEET_SPEC_MISMATCH = "fleet_spec_mismatch"
+    NO_BALANCE = "no_balance"
+    """`NO_BALANCE` is used in dstack Sky."""
 
     @classmethod
     def from_legacy_str(cls, v: str) -> "InstanceTerminationReason":
@@ -328,18 +314,23 @@ class Instance(CoreModel):
     fleet_id: Optional[UUID] = None
     fleet_name: Optional[str] = None
     instance_num: int
-    job_name: Optional[str] = None  # deprecated, always None (instance can have more than one job)
+    job_name: Optional[str] = None
+    """`job_name` is deprecated and always `None` because an instance can have more than one job."""
     hostname: Optional[str] = None
     status: InstanceStatus
     unreachable: bool = False
     health_status: HealthStatus = HealthStatus.HEALTHY
-    # termination_reason stores InstanceTerminationReason.
-    # str allows adding new enum members without breaking compatibility with old clients.
     termination_reason: Optional[str] = None
+    """`termination_reason` stores `InstanceTerminationReason`.
+    `str` allows adding new enum members without breaking compatibility with old clients.
+    """
     termination_reason_message: Optional[str] = None
     created: datetime.datetime
+    finished_at: Optional[datetime.datetime] = None
     region: Optional[str] = None
     availability_zone: Optional[str] = None
     price: Optional[float] = None
     total_blocks: Optional[int] = None
     busy_blocks: int = 0
+    gpu_driver: Optional[GpuDriverInfo] = None
+    """`gpu_driver` is the accelerator driver installed on the host, when known."""

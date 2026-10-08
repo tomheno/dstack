@@ -1,8 +1,7 @@
 from typing import List, Literal, Optional, cast
 
-from pydantic import parse_obj_as
-
 from dstack._internal.core.compatibility.gpus import get_list_gpus_excludes
+from dstack._internal.core.models.common import validate_extra_ignore
 from dstack._internal.core.models.gpus import GpuGroup
 from dstack._internal.core.models.runs import RunSpec
 from dstack._internal.server.schemas.gpus import ListGpusRequest, ListGpusResponse
@@ -15,13 +14,17 @@ class GpusAPIClient(APIClientGroup):
         project_name: str,
         run_spec: RunSpec,
         group_by: Optional[List[str]] = None,
+        full_offers: bool = False,
+        unallocated_resources: bool = False,
     ) -> List[GpuGroup]:
         body = ListGpusRequest(
             run_spec=run_spec,
             group_by=cast(Optional[List[Literal["backend", "region", "count"]]], group_by),
+            full_offers=full_offers,
+            unallocated_resources=unallocated_resources,
         )
         resp = self._request(
             f"/api/project/{project_name}/gpus/list",
-            body=body.json(exclude=get_list_gpus_excludes(body)),
+            body=body.model_dump_json(exclude=get_list_gpus_excludes(body)),
         )
-        return parse_obj_as(ListGpusResponse, resp.json()).gpus
+        return validate_extra_ignore(ListGpusResponse, resp.json()).gpus

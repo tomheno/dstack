@@ -2,7 +2,8 @@ import json
 from pathlib import Path
 from typing import Annotated, Dict, Literal, Optional, Union
 
-from pydantic import Field, root_validator
+from pydantic import Field, field_serializer, model_validator
+from typing_extensions import Self
 
 from dstack._internal.core.backends.base.models import fill_data
 from dstack._internal.core.models.common import CoreModel
@@ -76,9 +77,9 @@ class NebiusServiceAccountFileCreds(CoreModel):
         Optional[str], Field(description="The path to the service account credentials file")
     ] = None
 
-    @root_validator
-    def fill_data(cls, values):
-        if filename := values.get("filename"):
+    @model_validator(mode="after")
+    def fill_data(self) -> Self:
+        if filename := self.filename:
             try:
                 with open(Path(filename).expanduser()) as f:
                     data = json.load(f)
@@ -88,18 +89,16 @@ class NebiusServiceAccountFileCreds(CoreModel):
 
                 credentials = ServiceAccountCredentials.from_json(data)
                 subject = credentials.subject_credentials
-                values["service_account_id"] = subject.sub
-                values["public_key_id"] = subject.kid
-                values["private_key_content"] = subject.private_key
+                self.service_account_id = subject.sub
+                self.public_key_id = subject.kid
+                self.private_key_content = subject.private_key
             except OSError:
                 raise ValueError(f"No such file {filename}")
             except Exception as e:
                 raise ValueError(f"Failed to parse credentials file {filename}: {e}")
-            return values
+            return self
 
-        return fill_data(
-            values, filename_field="private_key_file", data_field="private_key_content"
-        )
+        return fill_data(self, filename_field="private_key_file", data_field="private_key_content")
 
 
 AnyNebiusCreds = NebiusServiceAccountCreds
@@ -183,3 +182,28 @@ class NebiusConfig(NebiusStoredConfig):
 
 class NebiusOfferBackendData(CoreModel):
     fabrics: set[str] = set()
+    is_preemptible_flat_rate: bool = False
+    """
+    True if the price of this spot instance does not change and pricing policies are not supported.
+    """
+    on_demand_price: Optional[float] = None
+    """
+    Fork: the on-demand price of the same instance type in the same region, set on spot
+    offers only. The pricing policy caps the spot price just below it (Nebius accepts a
+    bid up to 0.01 USD per GPU-hour below the on-demand price). `None` when the catalog
+    has no on-demand row for that type and region.
+    """
+    spot_price: Optional[float] = None
+    """
+    Fork: the catalog spot price of a spot offer, kept because the shown offer price
+    becomes the cap. Used for the fallback cap when Nebius refuses the on-demand cap.
+    """
+    run_max_price: Optional[float] = None
+    """
+    Fork: the run's `max_price`, set by an offer modifier on a spot offer that has no
+    on-demand price. The pricing policy then caps the spot price at it.
+    """
+
+    @field_serializer("fabrics")
+    def _serialize_fabrics(self, value: set[str]) -> list[str]:
+        return sorted(value)

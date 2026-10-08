@@ -1,16 +1,16 @@
-from typing import Any, Optional, TypedDict, TypeVar
+from typing import Any, Optional, TypeVar, Union
 
 from pydantic import BaseModel
 
-from dstack._internal.core.models.common import IncludeExcludeType
+from dstack._internal.core.models.common import CoreModel, IncludeExcludeType
 
 
-class ModelFieldDiff(TypedDict):
+class ModelFieldDiff(CoreModel):
     old: Any
     new: Any
 
 
-ModelDiff = dict[str, ModelFieldDiff]
+ModelDiff = dict[str, Union[ModelFieldDiff, "ModelDiff"]]
 
 
 # TODO: calculate nested diffs
@@ -41,11 +41,11 @@ def diff_models(
         new = copy_model(new, reset=reset)
 
     changes: ModelDiff = {}
-    for field in old.__fields__:
+    for field in type(old).model_fields:
         old_value = getattr(old, field)
         new_value = getattr(new, field)
         if old_value != new_value:
-            changes[field] = {"old": old_value, "new": new_value}
+            changes[field] = ModelFieldDiff(old=old_value, new=new_value)
 
     return changes
 
@@ -57,8 +57,8 @@ def copy_model(model: M, reset: Optional[IncludeExcludeType] = None) -> M:
     """
     Returns a deep copy of the model instance.
 
-    Implemented as `BaseModel.parse_obj(BaseModel.dict())`, thus,
-    unlike `BaseModel.copy(deep=True)`, runs all validations.
+    Implemented as `model_validate(model_dump())`, thus,
+    unlike `model_copy(deep=True)`, runs all validations.
 
     The fields specified in the `reset` option are reset to their default values.
 
@@ -68,4 +68,27 @@ def copy_model(model: M, reset: Optional[IncludeExcludeType] = None) -> M:
     Returns:
         A deep copy of the model instance.
     """
-    return type(model).parse_obj(model.dict(exclude=reset))
+    return type(model).model_validate(model.model_dump(exclude=reset))
+
+
+def flatten_diff_fields(diff: ModelDiff, prefix: str = "") -> list[str]:
+    """
+    Recursively collects all field paths from a diff.
+
+    Returns:
+        A list of field paths, each path with dot-separated parts.
+    """
+    fields = []
+    for field_name, field_diff in diff.items():
+        current_path = f"{prefix}.{field_name}" if prefix else field_name
+
+        if isinstance(field_diff, ModelFieldDiff):
+            fields.append(current_path)
+        else:
+            fields.extend(flatten_diff_fields(field_diff, current_path))
+
+    return fields
+
+
+def format_diff_fields_for_event(diff: ModelDiff) -> str:
+    return ", ".join(flatten_diff_fields(diff))

@@ -11,18 +11,25 @@ from dstack._internal.cli.utils.common import (
 )
 from dstack._internal.cli.utils.gateway import get_gateways_table
 from dstack._internal.cli.utils.rich import MultiItemStatus
-from dstack._internal.core.errors import ResourceNotExistsError
+from dstack._internal.core.errors import (
+    ResourceNotExistsError,
+)
+from dstack._internal.core.models.common import ApplyAction
 from dstack._internal.core.models.configurations import ApplyConfigurationType
 from dstack._internal.core.models.gateways import (
+    ApplyGatewayPlanInput,
     Gateway,
     GatewayConfiguration,
     GatewayPlan,
     GatewaySpec,
     GatewayStatus,
 )
-from dstack._internal.core.services.diff import diff_models
+from dstack._internal.core.services.gateways import diff_gateway_configurations
 from dstack._internal.utils.common import local_time
-from dstack.api._public import Client
+from dstack._internal.utils.logging import get_logger
+from dstack._internal.utils.nested_list import NestedList, NestedListItem
+
+logger = get_logger(__name__)
 
 
 class GatewayConfigurator(BaseApplyConfigurator[GatewayConfiguration]):
@@ -41,28 +48,23 @@ class GatewayConfigurator(BaseApplyConfigurator[GatewayConfiguration]):
             configuration_path=configuration_path,
         )
         with console.status("Getting apply plan..."):
-            plan = _get_plan(api=self.api, spec=spec)
+            plan = self.api.client.gateways.get_plan(project_name=self.api.project, spec=spec)
         _print_plan_header(plan)
 
         action_message = ""
         confirm_message = ""
+        delete_gateway_name = None
         if plan.current_resource is None:
-            if plan.spec.configuration.name is not None:
-                action_message += (
-                    f"Gateway [code]{plan.spec.configuration.name}[/] does not exist yet."
-                )
+            if plan.effective_spec.configuration.name is not None:
+                action_message += f"Gateway [code]{plan.effective_spec.configuration.name}[/] does not exist yet."
             confirm_message += "Create the gateway?"
         else:
-            action_message += f"Found gateway [code]{plan.spec.configuration.name}[/]."
-            diff = diff_models(
-                plan.spec.configuration,
+            action_message += f"Found gateway [code]{plan.effective_spec.configuration.name}[/]."
+            diff = diff_gateway_configurations(
                 plan.current_resource.configuration,
+                plan.effective_spec.configuration,
             )
-            changed_fields = list(diff.keys())
-            if (
-                plan.current_resource.configuration == plan.spec.configuration
-                or changed_fields == ["default"]
-            ):
+            if not diff:
                 if command_args.yes and not command_args.force:
                     # --force is required only with --yes,
                     # otherwise we may ask for force apply interactively.
@@ -72,38 +74,55 @@ class GatewayConfigurator(BaseApplyConfigurator[GatewayConfiguration]):
                     return
                 action_message += " No configuration changes detected."
                 confirm_message += "Re-create the gateway?"
+                delete_gateway_name = plan.current_resource.name
             else:
-                action_message += " Configuration changes detected."
-                confirm_message += "Re-create the gateway?"
+                formatted_diff = NestedList(
+                    children=[NestedListItem(field) for field in diff]
+                ).render()
+                if plan.action == ApplyAction.UPDATE:
+                    action_message += f" Detected changes that [code]can[/] be updated in-place:\n{formatted_diff}"
+                    confirm_message += "Update the gateway?"
+                else:
+                    action_message += f" Detected changes that [error]cannot[/] be updated in-place:\n{formatted_diff}"
+                    confirm_message += "Re-create the gateway?"
+                    delete_gateway_name = plan.current_resource.name
 
         console.print(action_message)
         if not command_args.yes and not confirm_ask(confirm_message):
             console.print("\nExiting...")
             return
 
-        if plan.current_resource is not None:
+        if delete_gateway_name is not None:
             with console.status("Deleting existing gateway..."):
                 self.api.client.gateways.delete(
                     project_name=self.api.project,
-                    gateways_names=[plan.current_resource.name],
+                    gateways_names=[delete_gateway_name],
                 )
                 # Gateway deletion is async. Wait for gateway to be deleted.
                 while True:
                     try:
                         self.api.client.gateways.get(
                             project_name=self.api.project,
-                            gateway_name=plan.current_resource.name,
+                            gateway_name=delete_gateway_name,
                         )
                     except ResourceNotExistsError:
                         break
                     else:
                         time.sleep(1)
 
-        with console.status("Creating gateway..."):
-            gateway = self.api.client.gateways.create(
+        with console.status("Applying plan..."):
+            gateway = self.api.client.gateways.apply_plan(
                 project_name=self.api.project,
-                configuration=conf,
+                plan=ApplyGatewayPlanInput(
+                    spec=spec,
+                    current_resource=plan.current_resource,
+                ),
             )
+
+        if plan.action == ApplyAction.UPDATE and delete_gateway_name is None:
+            console.print(get_gateways_table([gateway], current_project=self.api.project))
+            return
+
         if command_args.detach:
             console.print("Gateway configuration submitted. Exiting...")
             return
@@ -112,7 +131,9 @@ class GatewayConfigurator(BaseApplyConfigurator[GatewayConfiguration]):
                 f"Provisioning [code]{gateway.name}[/]...", console=console
             ) as live:
                 while not _finished_provisioning(gateway):
-                    table = get_gateways_table([gateway], include_created=True)
+                    table = get_gateways_table(
+                        [gateway], current_project=self.api.project, include_created=True
+                    )
                     live.update(table)
                     time.sleep(LIVE_TABLE_PROVISION_INTERVAL_SECS)
                     gateway = self.api.client.gateways.get(self.api.project, gateway.name)
@@ -129,6 +150,7 @@ class GatewayConfigurator(BaseApplyConfigurator[GatewayConfiguration]):
         console.print(
             get_gateways_table(
                 [gateway],
+                current_project=self.api.project,
                 verbose=gateway.status == GatewayStatus.FAILED,
                 include_created=True,
                 format_date=local_time,
@@ -182,26 +204,6 @@ class GatewayConfigurator(BaseApplyConfigurator[GatewayConfiguration]):
             conf.name = args.name
 
 
-def _get_plan(api: Client, spec: GatewaySpec) -> GatewayPlan:
-    # TODO: Implement server-side /get_plan with an offer included
-    user = api.client.users.get_my_user()
-    current_resource = None
-    if spec.configuration.name is not None:
-        try:
-            current_resource = api.client.gateways.get(
-                project_name=api.project,
-                gateway_name=spec.configuration.name,
-            )
-        except ResourceNotExistsError:
-            pass
-    return GatewayPlan(
-        project_name=api.project,
-        user=user.username,
-        spec=spec,
-        current_resource=current_resource,
-    )
-
-
 def _print_plan_header(plan: GatewayPlan):
     def th(s: str) -> str:
         return f"[bold]{s}[/bold]"
@@ -212,16 +214,22 @@ def _print_plan_header(plan: GatewayPlan):
 
     configuration_table.add_row(th("Project"), plan.project_name)
     configuration_table.add_row(th("User"), plan.user)
-    configuration_table.add_row(th("Configuration"), plan.spec.configuration_path)
-    configuration_table.add_row(th("Type"), plan.spec.configuration.type)
+    configuration_table.add_row(th("Configuration"), plan.effective_spec.configuration_path)
+    configuration_table.add_row(th("Type"), plan.effective_spec.configuration.type)
 
     domain = "-"
-    if plan.spec.configuration.domain is not None:
-        domain = plan.spec.configuration.domain
+    if plan.effective_spec.configuration.domain is not None:
+        domain = plan.effective_spec.configuration.domain
 
-    configuration_table.add_row(th("Backend"), plan.spec.configuration.backend.value)
-    configuration_table.add_row(th("Region"), plan.spec.configuration.region)
+    configuration_table.add_row(th("Backend"), plan.effective_spec.configuration.backend.value)
+    configuration_table.add_row(th("Region"), plan.effective_spec.configuration.region)
     configuration_table.add_row(th("Domain"), domain)
+
+    if plan.effective_spec.configuration.replicas is not None:
+        assert isinstance(plan.effective_spec.configuration.replicas, int)
+        configuration_table.add_row(
+            th("Replicas"), str(plan.effective_spec.configuration.replicas)
+        )
 
     console.print(configuration_table)
     console.print()

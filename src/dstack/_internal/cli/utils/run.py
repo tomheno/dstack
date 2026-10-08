@@ -1,19 +1,19 @@
 import shutil
-from typing import Any, Dict, List, Optional, Union
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
 from rich.markup import escape
 from rich.table import Table
 
-from dstack._internal.cli.models.offers import OfferCommandOutput, OfferRequirements
 from dstack._internal.cli.models.runs import PsCommandOutput
 from dstack._internal.cli.utils.common import (
     NO_FLEETS_WARNING,
     NO_OFFERS_WARNING,
     add_row_from_dict,
     console,
-    format_instance_availability,
+    format_backend,
 )
-from dstack._internal.core.models.backends.base import BackendType
+from dstack._internal.cli.utils.offers import print_offers_table
 from dstack._internal.core.models.configurations import DevEnvironmentConfiguration
 from dstack._internal.core.models.instances import (
     InstanceOfferWithAvailability,
@@ -21,10 +21,11 @@ from dstack._internal.core.models.instances import (
 )
 from dstack._internal.core.models.profiles import (
     DEFAULT_RUN_TERMINATION_IDLE_TIME,
-    SpotPolicy,
+    CreationPolicy,
     TerminationPolicy,
 )
 from dstack._internal.core.models.runs import (
+    ImagePullProgress,
     Job,
     JobStatus,
     JobSubmission,
@@ -32,7 +33,6 @@ from dstack._internal.core.models.runs import (
     ProbeSpec,
     RunPlan,
     RunStatus,
-    get_policy_map,
 )
 from dstack._internal.core.models.runs import (
     Run as CoreRun,
@@ -48,26 +48,9 @@ from dstack._internal.utils.common import (
 from dstack.api import Run
 
 
-def print_offers_json(run_plan: RunPlan, run_spec):
-    """Print offers information in JSON format."""
-    job_plan = run_plan.job_plans[0]
-
-    requirements = OfferRequirements(
-        resources=job_plan.job_spec.requirements.resources,
-        max_price=job_plan.job_spec.requirements.max_price,
-        spot=get_policy_map(run_spec.configuration.spot_policy, default=SpotPolicy.AUTO),
-        reservation=run_plan.run_spec.configuration.reservation,
-    )
-
-    output = OfferCommandOutput(
-        project=run_plan.project_name,
-        user=run_plan.user,
-        requirements=requirements,
-        offers=job_plan.offers,
-        total_offers=job_plan.total_offers,
-    )
-
-    print(output.json())
+class RunWaitStatus(str, Enum):
+    WAITING_FOR_REQUESTS = "waiting for requests"
+    WAITING_FOR_SCHEDULE = "waiting for schedule"
 
 
 def print_runs_json(project: str, runs: List[Run]) -> None:
@@ -76,14 +59,15 @@ def print_runs_json(project: str, runs: List[Run]) -> None:
         project=project,
         runs=[r._run for r in runs],
     )
-    print(output.json())
+    print(output.model_dump_json())
 
 
 def print_run_plan(
     run_plan: RunPlan,
     max_offers: Optional[int] = None,
-    include_run_properties: bool = True,
     no_fleets: bool = False,
+    verbose: bool = False,
+    extra_properties: Optional[Dict[str, str]] = None,
 ):
     run_spec = run_plan.get_effective_run_spec()
     job_plan = run_plan.job_plans[0]
@@ -94,36 +78,35 @@ def print_run_plan(
 
     req = job_plan.job_spec.requirements
     pretty_req = req.pretty_format(resources_only=True)
-    max_price = f"${req.max_price:3f}".rstrip("0").rstrip(".") if req.max_price else "-"
+    max_price = f"${req.max_price:3f}".rstrip("0").rstrip(".") if req.max_price else "off"
     max_duration = (
         format_pretty_duration(job_plan.job_spec.max_duration)
         if job_plan.job_spec.max_duration
-        else "-"
+        else "off"
     )
-    if include_run_properties:
-        inactivity_duration = None
-        if isinstance(run_spec.configuration, DevEnvironmentConfiguration):
-            inactivity_duration = "-"
-            if isinstance(run_spec.configuration.inactivity_duration, int):
-                inactivity_duration = format_pretty_duration(
-                    run_spec.configuration.inactivity_duration
-                )
-        if job_plan.job_spec.retry is None:
-            retry = "-"
-        else:
-            retry = escape(job_plan.job_spec.retry.pretty_format())
+    inactivity_duration = None
+    if isinstance(run_spec.configuration, DevEnvironmentConfiguration):
+        inactivity_duration = "off"
+        if isinstance(run_spec.configuration.inactivity_duration, int):
+            inactivity_duration = format_pretty_duration(
+                run_spec.configuration.inactivity_duration
+            )
+    if job_plan.job_spec.retry is None:
+        retry = "off"
+    else:
+        retry = escape(job_plan.job_spec.retry.pretty_format())
 
-        profile = run_spec.merged_profile
-        creation_policy = profile.creation_policy
-        # FIXME: This assumes the default idle_duration is the same for client and server.
-        # If the server changes idle_duration, old clients will see incorrect value.
-        termination_policy, termination_idle_time = get_termination(
-            profile, DEFAULT_RUN_TERMINATION_IDLE_TIME
-        )
-        if termination_policy == TerminationPolicy.DONT_DESTROY:
-            idle_duration = "-"
-        else:
-            idle_duration = format_pretty_duration(termination_idle_time)
+    profile = run_spec.merged_profile
+    creation_policy = profile.creation_policy
+    # FIXME: This assumes the default idle_duration is the same for client and server.
+    # If the server changes idle_duration, old clients will see incorrect value.
+    termination_policy, termination_idle_time = get_termination(
+        profile, DEFAULT_RUN_TERMINATION_IDLE_TIME
+    )
+    if termination_policy == TerminationPolicy.DONT_DESTROY:
+        idle_duration = "-"
+    else:
+        idle_duration = format_pretty_duration(termination_idle_time)
 
     if req.spot is None:
         spot_policy = "auto"
@@ -137,65 +120,72 @@ def print_run_plan(
 
     props.add_row(th("Project"), run_plan.project_name)
     props.add_row(th("User"), run_plan.user)
-    if include_run_properties:
-        props.add_row(th("Configuration"), run_spec.configuration_path)
-        configuration_type = run_spec.configuration.type
-        if run_spec.configuration.type == "task":
-            configuration_type += f" (nodes={run_spec.configuration.nodes})"
-        props.add_row(th("Type"), configuration_type)
+    configuration_type = run_spec.configuration.type
+    if run_spec.configuration.type == "task":
+        configuration_type += f" (nodes={run_spec.configuration.nodes_num})"
+    props.add_row(th("Type"), configuration_type)
     props.add_row(th("Resources"), pretty_req)
     props.add_row(th("Spot policy"), spot_policy)
     props.add_row(th("Max price"), max_price)
-    if include_run_properties:
-        props.add_row(th("Retry policy"), retry)
+    props.add_row(th("Retry policy"), retry)
+    if verbose or creation_policy != CreationPolicy.REUSE_OR_CREATE:
         props.add_row(th("Creation policy"), creation_policy)
-        props.add_row(th("Idle duration"), idle_duration)
-        props.add_row(th("Max duration"), max_duration)
-        if inactivity_duration is not None:  # None means n/a
-            props.add_row(th("Inactivity duration"), inactivity_duration)
-    props.add_row(th("Reservation"), run_spec.configuration.reservation or "-")
-
-    offers = Table(box=None, expand=shutil.get_terminal_size(fallback=(120, 40)).columns <= 110)
-    offers.add_column("#")
-    offers.add_column("BACKEND", style="grey58", ratio=2)
-    offers.add_column("RESOURCES", ratio=4)
-    offers.add_column("INSTANCE TYPE", style="grey58", no_wrap=True, ratio=2)
-    offers.add_column("PRICE", style="grey58", ratio=1)
-    offers.add_column()
-
-    job_plan.offers = job_plan.offers[:max_offers] if max_offers else job_plan.offers
-
-    for i, offer in enumerate(job_plan.offers, start=1):
-        r = offer.instance.resources
-
-        instance = offer.instance.name
-        if offer.total_blocks > 1:
-            instance += f" ({offer.blocks}/{offer.total_blocks})"
-        offers.add_row(
-            f"{i}",
-            offer.backend.replace("remote", "ssh") + " (" + offer.region + ")",
-            r.pretty_format(include_spot=True),
-            instance,
-            f"${offer.price:.4f}".rstrip("0").rstrip("."),
-            format_instance_availability(offer.availability),
-            style=None if i == 1 or not include_run_properties else "secondary",
-        )
-    if job_plan.total_offers > len(job_plan.offers):
-        offers.add_row("", "...", style="secondary")
-
+    props.add_row(th("Idle duration"), idle_duration)
+    props.add_row(th("Max duration"), max_duration)
+    if inactivity_duration is not None:  # only set for dev-environment
+        props.add_row(th("Inactivity duration"), inactivity_duration)
+    if verbose or run_spec.configuration.reservation:
+        props.add_row(th("Reservation"), run_spec.configuration.reservation or "no")
+    for key, value in (extra_properties or {}).items():
+        props.add_row(th(key), value)
     console.print(props)
     console.print()
-    if len(job_plan.offers) > 0:
-        console.print(offers)
-        if job_plan.total_offers > len(job_plan.offers):
-            console.print(
-                f"[secondary] Shown {len(job_plan.offers)} of {job_plan.total_offers} offers, "
-                f"${job_plan.max_price:3f}".rstrip("0").rstrip(".")
-                + "max[/]"
-            )
+
+    displayed_offers = job_plan.offers[:max_offers] if max_offers else job_plan.offers
+    if len(displayed_offers) > 0:
+        print_offers_table(
+            offers=displayed_offers,
+            total_offers=job_plan.total_offers,
+            max_price=job_plan.max_price or 0.0,
+            mute_tail_rows=True,
+        )
         console.print()
     else:
         console.print(NO_FLEETS_WARNING if no_fleets else NO_OFFERS_WARNING)
+
+
+def get_run_wait_status(run: CoreRun) -> Optional[RunWaitStatus]:
+    # Only synthesize a CLI-specific waiting state when the server did not provide
+    # a more specific run-level message such as "retrying".
+    if run.status_message not in ("", run.status.value):
+        return None
+
+    if run.status == RunStatus.PENDING and run.next_triggered_at is not None:
+        return RunWaitStatus.WAITING_FOR_SCHEDULE
+
+    if _is_waiting_for_requests(run):
+        return RunWaitStatus.WAITING_FOR_REQUESTS
+
+    return None
+
+
+def _is_waiting_for_requests(run: CoreRun) -> bool:
+    if run.run_spec.configuration.type != "service":
+        return False
+    if run.service is None or run.next_triggered_at is not None:
+        return False
+    if run.status not in (RunStatus.SUBMITTED, RunStatus.PENDING):
+        return False
+    return not any(_is_job_active(job.job_submissions[-1].status) for job in run.jobs)
+
+
+def _is_job_active(status: JobStatus) -> bool:
+    return status in (
+        JobStatus.SUBMITTED,
+        JobStatus.PROVISIONING,
+        JobStatus.PULLING,
+        JobStatus.RUNNING,
+    )
 
 
 def _format_run_status(run) -> str:
@@ -215,7 +205,7 @@ def _format_run_status(run) -> str:
         RunStatus.FAILED: "indian_red1",
         RunStatus.DONE: "grey",
     }
-    if status_text in ("no offers", "interrupted"):
+    if status_text in ("no capacity", "interrupted"):
         color = "gold1"
     elif status_text == "no fleets":
         color = "indian_red1"
@@ -230,7 +220,7 @@ def _format_run_status(run) -> str:
 def _format_job_submission_status(job_submission: JobSubmission, verbose: bool) -> str:
     status_message = job_submission.status_message
     job_status = job_submission.status
-    if status_message in ("no offers", "interrupted"):
+    if status_message in ("no capacity", "interrupted"):
         color = "gold1"
     elif status_message == "no fleets":
         color = "indian_red1"
@@ -251,10 +241,31 @@ def _format_job_submission_status(job_submission: JobSubmission, verbose: bool) 
         color = color_map.get(job_status, "white")
     status_style = f"bold {color}" if not job_status.is_finished() else color
     formatted_status_message = f"[{status_style}]{status_message}[/]"
+    if job_status == JobStatus.PULLING and job_submission.image_pull_progress is not None:
+        formatted_status_message += (
+            f" [secondary]{_format_pull_progress(job_submission.image_pull_progress)}[/]"
+        )
     if verbose and job_submission.inactivity_secs:
         inactive_for = format_duration_multiunit(job_submission.inactivity_secs)
         formatted_status_message += f" (inactive for {inactive_for})"
     return formatted_status_message
+
+
+def _format_pull_progress(progress: ImagePullProgress) -> str:
+    if progress.total_bytes >= 2**30:  # 1GB
+        unit = "GB"
+
+        def f(x: int) -> str:
+            return f"{x / 2**30:.2f}"
+    else:
+        unit = "MB"
+
+        def f(x: int) -> str:
+            return f"{x / 2**20:.0f}"
+
+    # NOTE: The format is documented in protips.md. Keep in sync.
+    total_sign = "≥" if not progress.is_total_bytes_final else ""
+    return f"{f(progress.extracted_bytes)}/{f(progress.downloaded_bytes)}/{total_sign}{f(progress.total_bytes)}{unit}"
 
 
 def _get_show_deployment_replica_job(run: CoreRun, verbose: bool) -> tuple[bool, bool, bool]:
@@ -285,16 +296,38 @@ def _format_job_name(
     show_deployment_num: bool,
     show_replica: bool,
     show_job: bool,
+    group_index: Optional[int] = None,
+    last_shown_group_index: Optional[int] = None,
 ) -> str:
     name_parts = []
+    prefix = ""
     if show_replica:
-        name_parts.append(f"replica={job.job_spec.replica_num}")
+        # Show group information if replica groups are used
+        if group_index is not None:
+            # Show group=X replica=Y when group changes, or just replica=Y when same group
+            if group_index != last_shown_group_index:
+                # First job in group: use 3 spaces indent
+                prefix = "   "
+                name_parts.append(f"group={group_index} replica={job.job_spec.replica_num}")
+            else:
+                # Subsequent job in same group: align "replica=" with first job's "replica="
+                # Calculate padding: width of "   group={last_shown_group_index} "
+                padding_width = 3 + len(f"group={last_shown_group_index}") + 1
+                prefix = " " * padding_width
+                name_parts.append(f"replica={job.job_spec.replica_num}")
+        else:
+            # Legacy behavior: no replica groups
+            prefix = "   "
+            name_parts.append(f"replica={job.job_spec.replica_num}")
+    else:
+        prefix = "   "
+
     if show_job:
         name_parts.append(f"job={job.job_spec.job_num}")
     name_suffix = (
         f" deployment={latest_job_submission.deployment_num}" if show_deployment_num else ""
     )
-    name_value = "  " + (" ".join(name_parts) if name_parts else "")
+    name_value = prefix + (" ".join(name_parts) if name_parts else "")
     name_value += name_suffix
     return name_value
 
@@ -304,13 +337,6 @@ def _format_price(price: float, is_spot: bool) -> str:
     if is_spot:
         price_str += " (spot)"
     return price_str
-
-
-def _format_backend(backend_type: BackendType, region: str) -> str:
-    backend_str = backend_type.value
-    if backend_type == BackendType.REMOTE:
-        backend_str = "ssh"
-    return f"{backend_str} ({region})"
 
 
 def _format_instance_type(
@@ -327,7 +353,7 @@ def _format_instance_type(
 
 
 def _format_run_name(run: CoreRun, show_deployment_num: bool) -> str:
-    parts: List[str] = [run.run_spec.run_name]
+    parts: List[str] = [run.run_spec.run_name or ""]
     if show_deployment_num:
         parts.append(f" [secondary]deployment={run.deployment_num}[/]")
     return "".join(parts)
@@ -345,7 +371,7 @@ def get_runs_table(
     else:
         table.add_column("GPU", ratio=2)
     table.add_column("PRICE", style="grey58", ratio=1)
-    table.add_column("STATUS", no_wrap=True, ratio=1)
+    table.add_column("STATUS", ratio=1)
     if verbose or any(
         run._run.is_deployment_in_progress()
         and any(job.job_submissions[-1].probes for job in run._run.jobs)
@@ -363,7 +389,18 @@ def get_runs_table(
         )
         merge_job_rows = len(run.jobs) == 1 and not show_deployment_num
 
-        run_row: Dict[Union[str, int], Any] = {
+        group_name_to_index: Dict[str, int] = {}
+        if run.run_spec.configuration.type == "service" and hasattr(
+            run.run_spec.configuration, "replica_groups"
+        ):
+            replica_groups = run.run_spec.configuration.replica_groups
+            if replica_groups:
+                for idx, group in enumerate(replica_groups):
+                    assert group.name is not None, "Group name is always set"
+                    group_name = group.name
+                    group_name_to_index[group_name] = idx
+
+        run_row = {
             "NAME": _format_run_name(run, show_deployment_num),
             "SUBMITTED": format_date(run.submitted_at),
             "STATUS": _format_run_status(run),
@@ -376,13 +413,35 @@ def get_runs_table(
         if not merge_job_rows:
             add_row_from_dict(table, run_row)
 
-        for job in run.jobs:
+        # Sort jobs by group index first, then by replica_num within each group
+        def get_job_sort_key(job: Job) -> tuple:
+            group_index = None
+            if group_name_to_index:
+                group_index = group_name_to_index.get(job.job_spec.replica_group)
+            # Use a large number for jobs without groups to put them at the end
+            return (group_index if group_index is not None else 999999, job.job_spec.replica_num)
+
+        sorted_jobs = sorted(run.jobs, key=get_job_sort_key)
+
+        last_shown_group_index: Optional[int] = None
+        for job in sorted_jobs:
             latest_job_submission = job.job_submissions[-1]
             status_formatted = _format_job_submission_status(latest_job_submission, verbose)
 
-            job_row: Dict[Union[str, int], Any] = {
+            # Get group index for this job
+            group_index: Optional[int] = None
+            if group_name_to_index:
+                group_index = group_name_to_index.get(job.job_spec.replica_group)
+
+            job_row = {
                 "NAME": _format_job_name(
-                    job, latest_job_submission, show_deployment_num, show_replica, show_job
+                    job,
+                    latest_job_submission,
+                    show_deployment_num,
+                    show_replica,
+                    show_job,
+                    group_index=group_index,
+                    last_shown_group_index=last_shown_group_index,
                 ),
                 "STATUS": status_formatted,
                 "PROBES": _format_job_probes(
@@ -394,6 +453,9 @@ def get_runs_table(
                 "GPU": "-",
                 "PRICE": "-",
             }
+            # Update last shown group index for next iteration
+            if group_index is not None:
+                last_shown_group_index = group_index
             jpd = latest_job_submission.job_provisioning_data
             if jpd is not None:
                 shared_offer: Optional[InstanceOfferWithAvailability] = None
@@ -416,7 +478,7 @@ def get_runs_table(
                 resources = instance_type.resources
                 job_row.update(
                     {
-                        "BACKEND": _format_backend(jpd.backend, jpd.region),
+                        "BACKEND": format_backend(jpd.backend, jpd.region),
                         "RESOURCES": resources.pretty_format(include_spot=False),
                         "GPU": resources.pretty_format(gpu_only=True, include_spot=False),
                         "INSTANCE TYPE": _format_instance_type(

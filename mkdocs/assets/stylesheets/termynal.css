@@ -1,0 +1,227 @@
+/**
+ * termynal.js
+ *
+ * @author Ines Montani <ines@ines.io>
+ * @version 0.0.1
+ * @license MIT
+ */
+
+:root {
+    --color-bg: rgb(21, 22, 29);
+    --color-text: #eee;
+    --color-text-subtle: #a2a2a2;
+}
+
+[data-termynal] span {
+    white-space: pre;
+}
+
+.small > [data-termynal] {
+    font-size: var(--dstack-code-font-size);
+    line-height: 1.4;
+}
+
+[data-termynal] {
+    margin-block-start: 1em;
+    margin-block-end: 1em;
+    overflow-x: scroll;
+    /*white-space: pre;*/
+    /*width: 750px;*/
+    max-width: 100%;
+    background: var(--color-bg);
+    color: var(--color-text);
+    /* font-size: 18px; */
+    font-size: var(--dstack-code-font-size);   /* 15px, consistent with code/editor blocks */
+    line-height: var(--dstack-code-line-height);
+    /* font-family: 'Fira Mono', Consolas, Menlo, Monaco, 'Courier New', Courier, monospace; */
+    font-family: var(--md-code-font-family) !important;
+    border-radius: 3px;
+    padding: 60px 12px 25px 25px;
+    /*padding: 75px 45px 35px;*/
+    position: relative;
+    -webkit-box-sizing: border-box;
+            box-sizing: border-box;
+}
+
+[data-termynal]:before {
+    content: '';
+    position: absolute;
+    top: 15px;
+    left: 15px;
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    /* A little hack to display the window buttons in one pseudo element. */
+    background: #d9515d;
+    /*-webkit-box-shadow: 25px 0 0 #f4c025, 50px 0 0 #3ec930;*/
+    /*        box-shadow: 25px 0 0 #f4c025, 50px 0 0 #3ec930;*/
+    -webkit-box-shadow: 20px 0 0 #f4c025, 40px 0 0 #3ec930;
+            box-shadow: 20px 0 0 #f4c025, 40px 0 0 #3ec930;
+}
+
+[data-termynal]:after {
+    content: '';
+    position: absolute;
+    color: var(--color-text-subtle);
+    top: 7px;
+    left: 0;
+    width: 100%;
+    text-align: center;
+}
+
+[data-termynal].dstack-termy-scrollable {
+    overflow: visible;
+}
+
+[data-termynal].dstack-termy-scrollable > [data-termynal-body] {
+    max-height: var(--dstack-termy-max-height);
+    overflow: auto;
+    scrollbar-color: #a2a2a2 rgba(255, 255, 255, 0.06);
+    scrollbar-width: thin;
+}
+
+[data-termynal].dstack-termy-scrollable > [data-termynal-body]::-webkit-scrollbar {
+    height: 10px;
+    width: 10px;
+}
+
+[data-termynal].dstack-termy-scrollable > [data-termynal-body]::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.06);
+}
+
+[data-termynal].dstack-termy-scrollable > [data-termynal-body]::-webkit-scrollbar-thumb {
+    background: #a2a2a2;
+    background-clip: content-box;
+    border: 2px solid transparent;
+    border-radius: 8px;
+}
+
+[data-termynal].dstack-termy-scrollable > [data-termynal-body]::-webkit-scrollbar-thumb:hover {
+    background: #e5e5e9;
+    background-clip: content-box;
+}
+
+[data-termynal].dstack-termy-has-copy > a[data-terminal-control] {
+    box-sizing: border-box;
+    padding-right: 32px;
+}
+
+[data-termynal] > .dstack-termy-copy {
+    -webkit-appearance: none;
+            appearance: none;
+    background: transparent;
+    border: 0;
+    color: var(--cs-muted);   /* match the code/editor copy button */
+    cursor: pointer;
+    height: 18px;
+    padding: 0;
+    position: absolute;
+    right: 20px;              /* glyph flush at the content padding (16/20), like the code copy */
+    top: 16px;
+    width: 18px;
+    z-index: 2;
+}
+
+[data-termynal] > .dstack-termy-copy:before {
+    background: rgb(21, 22, 29);
+    border: 1px solid var(--color-text-subtle);
+    color: var(--color-text);
+    content: 'Copied to clipboard';
+    font-family: var(--md-text-font-family);
+    font-size: 11px;
+    line-height: 1;
+    opacity: 0;
+    padding: 5px 7px;
+    pointer-events: none;
+    position: absolute;
+    right: calc(100% + 8px);
+    top: 50%;
+    transform: translateY(-50%);
+    transition: opacity 0.15s ease;
+    white-space: nowrap;
+}
+
+[data-termynal] > .dstack-termy-copy.dstack-termy-copy-copied:before {
+    opacity: 1;
+}
+
+[data-termynal] > .dstack-termy-copy:after {
+    background-color: currentColor;
+    content: '';
+    display: block;
+    height: 18px;
+    margin: 0;
+    mask-image: var(--md-code-copy-icon, var(--md-clipboard-icon));
+    mask-position: center;
+    mask-repeat: no-repeat;
+    mask-size: contain;
+    -webkit-mask-image: var(--md-code-copy-icon, var(--md-clipboard-icon));
+    -webkit-mask-position: center;
+    -webkit-mask-repeat: no-repeat;
+    -webkit-mask-size: contain;
+    width: 18px;
+}
+
+[data-termynal] > .dstack-termy-copy:hover,
+[data-termynal] > .dstack-termy-copy:focus-visible {
+    color: var(--cs-text);   /* match the code/editor copy hover */
+    outline: none;
+}
+
+a[data-terminal-control] {
+    color: #aebbff;
+    display: block;
+    margin-right: 0.5rem;
+    margin-top: 1rem;
+    text-align: right;
+}
+
+[data-ty] {
+    display: block;
+    line-height: inherit;
+}
+
+[data-ty]:before {
+    /* Set up defaults and ensure empty lines are displayed. */
+    content: '';
+    display: inline-block;
+    vertical-align: middle;
+}
+
+[data-ty="input"]:before,
+[data-ty-prompt]:before {
+    margin-right: 0.75em;
+    color: var(--color-text-subtle);
+}
+
+[data-ty="input"]:before {
+    content: '$';
+}
+
+[data-ty][data-ty-prompt]:before {
+    content: attr(data-ty-prompt);
+}
+
+[data-ty-cursor]:after {
+    content: attr(data-ty-cursor);
+    font-family: monospace;
+    margin-left: 0.5em;
+    -webkit-animation: blink 1s infinite;
+            animation: blink 1s infinite;
+}
+
+
+/* Cursor animation */
+
+@-webkit-keyframes blink {
+    50% {
+        opacity: 0;
+    }
+}
+
+@keyframes blink {
+    50% {
+        opacity: 0;
+    }
+}

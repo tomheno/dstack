@@ -1,8 +1,10 @@
 declare type TBackendType =
     | 'aws'
     | 'azure'
+    | 'crusoe'
     | 'cudo'
     | 'datacrunch'
+    | 'daytona'
     | 'dstack'
     | 'gcp'
     | 'kubernetes'
@@ -12,6 +14,7 @@ declare type TBackendType =
     | 'remote'
     | 'oci'
     | 'runpod'
+    | 'seeweb'
     | 'tensordock'
     | 'vastai'
     | 'cloudrift'

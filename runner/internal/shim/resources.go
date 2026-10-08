@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/dstackai/dstack/runner/internal/common"
-	"github.com/dstackai/dstack/runner/internal/log"
+	"github.com/dstackai/dstack/runner/internal/common/gpu"
+	"github.com/dstackai/dstack/runner/internal/common/log"
 	"github.com/dstackai/dstack/runner/internal/shim/host"
 )
 
@@ -33,21 +33,21 @@ func NewGpuLock(gpus []host.GpuInfo) (*GpuLock, error) {
 	lock := make(map[string]bool, len(gpus))
 	if len(gpus) > 0 {
 		vendor := gpus[0].Vendor
-		for _, gpu := range gpus {
-			if gpu.Vendor != vendor {
+		for _, gpu_ := range gpus {
+			if gpu_.Vendor != vendor {
 				return nil, errors.New("multiple GPU vendors detected")
 			}
 			var resourceID string
 			switch vendor {
-			case common.GpuVendorNvidia:
-				resourceID = gpu.ID
-			case common.GpuVendorAmd:
-				resourceID = gpu.RenderNodePath
-			case common.GpuVendorTenstorrent:
-				resourceID = gpu.Index
-			case common.GpuVendorIntel:
-				resourceID = gpu.Index
-			case common.GpuVendorNone:
+			case gpu.GpuVendorNvidia:
+				resourceID = gpu_.ID
+			case gpu.GpuVendorAmd:
+				resourceID = gpu_.RenderNodePath
+			case gpu.GpuVendorTenstorrent:
+				resourceID = gpu_.Index
+			case gpu.GpuVendorIntel:
+				resourceID = gpu_.Index
+			case gpu.GpuVendorNone:
 				return nil, fmt.Errorf("unexpected GPU vendor %s", vendor)
 			default:
 				return nil, fmt.Errorf("unexpected GPU vendor %s", vendor)
@@ -94,7 +94,8 @@ func (gl *GpuLock) Acquire(ctx context.Context, count int) ([]string, error) {
 }
 
 // Lock marks passed Resource IDs as locked (busy)
-// This method never fails, it's safe to lock already locked resource or try to lock unknown resource
+// This method never fails: an already locked or unknown resource is skipped and
+// reported as a warning, as neither is expected during normal operation
 // The returned slice contains only actually locked resource IDs
 func (gl *GpuLock) Lock(ctx context.Context, ids []string) []string {
 	gl.mu.Lock()
@@ -104,7 +105,7 @@ func (gl *GpuLock) Lock(ctx context.Context, ids []string) []string {
 		if locked, ok := gl.lock[id]; !ok {
 			log.Warning(ctx, "skip locking: unknown GPU resource", "id", id)
 		} else if locked {
-			log.Info(ctx, "skip locking: GPU already locked", "id", id)
+			log.Warning(ctx, "skip locking: GPU already locked", "id", id)
 		} else {
 			gl.lock[id] = true
 			lockedIDs = append(lockedIDs, id)
@@ -114,7 +115,8 @@ func (gl *GpuLock) Lock(ctx context.Context, ids []string) []string {
 }
 
 // Release marks passed Resource IDs as idle
-// This method never fails, it's safe to release already idle resource or try to release unknown resource
+// This method never fails: an already idle or unknown resource is skipped and
+// reported as a warning, as neither is expected during normal operation
 // The returned slice contains only actually released resource IDs
 func (gl *GpuLock) Release(ctx context.Context, ids []string) []string {
 	gl.mu.Lock()
@@ -124,7 +126,7 @@ func (gl *GpuLock) Release(ctx context.Context, ids []string) []string {
 		if locked, ok := gl.lock[id]; !ok {
 			log.Warning(ctx, "skip releasing: unknown GPU resource", "id", id)
 		} else if !locked {
-			log.Info(ctx, "skip releasing: GPU not locked", "id", id)
+			log.Warning(ctx, "skip releasing: GPU not locked", "id", id)
 		} else {
 			gl.lock[id] = false
 			releasedIDs = append(releasedIDs, id)

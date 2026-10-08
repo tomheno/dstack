@@ -14,15 +14,13 @@ from fnmatch import fnmatch
 from functools import cache
 
 import mkdocs_gen_files
+
 from mkdocs.structure.files import File
 
 FILE_PATTERN = "docs/reference/cli/dstack/*.md"
 logger = logging.getLogger("mkdocs.plugins.dstack.cli")
 
 DISABLE_ENV = "DSTACK_DOCS_DISABLE_CLI_REFERENCE"
-
-
-logger.info("Generating CLI reference...")
 
 
 @cache  # TODO make caching work
@@ -59,8 +57,10 @@ def process_file(file: File):
 
 def main():
     if os.environ.get(DISABLE_ENV):
-        logger.warning(f"CLI reference generation is disabled: {DISABLE_ENV} is set")
+        logger.warning("CLI reference generation is disabled")
         exit()
+
+    logger.info("Generating CLI reference...")
     # Sequential processing take > 10s
     with concurrent.futures.ThreadPoolExecutor() as pool:
         futures = []

@@ -1,0 +1,2036 @@
+@font-face {
+  font-family: 'Geist';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('./fonts/Geist-Variable.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Geist Pixel Square';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./fonts/GeistPixel-Square.woff2') format('woff2');
+}
+
+:root {
+  color-scheme: light;
+  --cs-text: #16191f;
+  --font-base: Geist, -apple-system, "system-ui", "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
+  --cs-bg: #ffffff;
+  --cs-muted: #5f6b7a;
+  --cs-link: #0972d3;
+  --cs-border: #16191f;
+  --cs-panel: #f4f4f7;
+  --font-small: 15px; /* small body text: action-card descriptions, quotes, FAQ answers */
+  --font-card-heading: 16px; /* card titles: action cards, dstack Sky/Factory, quote names */
+  --cs-hover: rgba(22, 25, 31, 0.03); /* shared faint hover tint: normal buttons, cards, dropdown items (softened from 0.05) */
+  --cs-btn-hover: #272d38; /* filled (primary) button hover fill — shared with the split-button override */
+  --cs-seg-divider: rgba(255, 255, 255, 0.22); /* split-button segment divider (light line on the dark fill) */
+  --cs-dark: #0f141d;
+  --nav-height: 4.875rem;
+  --frame: 80rem;
+  --page-gutter: clamp(1.5rem, 5.5vw, 5rem);
+  --card-gap: 1.25rem;
+  --radius: 0;
+  --doc-article-width: 49.5rem;
+  --doc-rail-width: 17.5rem;
+  --doc-right-gap: 2.5rem;
+  --doc-gap: var(--doc-right-gap);
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --cs-text: #f2f3f3;
+  --cs-bg: #0f141d;
+  --cs-muted: #c6c6cd;
+  --cs-link: #58a6ff;
+  --cs-border: #f2f3f3;
+  --cs-panel: #1b212d;
+  --cs-hover: rgba(242, 243, 243, 0.05); /* softened from 0.085 */
+  --cs-btn-hover: #e2e5e8;
+  --cs-seg-divider: rgba(0, 0, 0, 0.18); /* split-button segment divider (dark line on the light fill) */
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  /* Offset anchor / scrollIntoView landings by the sticky header (banner + nav) so a targeted
+     section isn't hidden behind it — e.g. "Get started" scrolling to #resources. */
+  scroll-padding-top: calc(var(--nav-height) + 3.25rem);
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  color: var(--cs-text);
+  background: var(--cs-bg, #ffffff);
+  font-family: var(--font-base);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Cloudscape's own font family is set via the theming API (see cloudscape-theme.ts);
+   this base rule covers the non-Cloudscape markup. */
+
+img {
+  display: block;
+  max-width: 100%;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+p {
+  line-height: 1.5;
+}
+
+/* Inline highlight for key terms (e.g. "dstack"): a thin rounded outline with minor padding and
+   a transparent fill. Border takes a muted text color so it stays subtle and theme-adaptive. */
+.highlight {
+  padding: 0.06em 0.36em;
+  border: 0.25px solid currentColor;
+  border-radius: 6px;
+  background: transparent;
+  white-space: nowrap;
+}
+
+.site-frame {
+  width: min(var(--frame), calc(100vw - (2 * var(--page-gutter))));
+  margin: 0 auto;
+}
+
+/* Top announcement banner. Filled with the text color and an inverted label — the same
+   treatment as the primary buttons — so it reads as a deliberate strip in either theme. It
+   sticks to the top together with the nav (see .site-header). */
+.site-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 38px;
+  padding: 9px 16px 7.5px;
+  background: var(--cs-text);
+  color: var(--cs-bg);
+  text-align: center;
+}
+
+/* Keep the whole banner (label + arrow) on a single line — never wrap. */
+.site-banner__link {
+  color: var(--cs-bg) !important;
+  font-size: 16.5px;
+  font-weight: 300;
+  text-decoration: none !important;
+  white-space: nowrap;
+}
+
+/* On phones the announcement is wider than the viewport; wrap it (the sticky .site-header is
+   built for the banner's variable height) instead of clipping the text at both edges. */
+@media (max-width: 640px) {
+  .site-banner__link {
+    white-space: normal;
+    text-wrap: balance;
+    font-size: 15px;
+  }
+}
+
+/* Light-on-dark text looks thinner than dark-on-light at the same weight; use a heavier weight in
+   dark mode so the banner reads with the same emphasis as in light. */
+:root[data-theme='dark'] .site-banner__link {
+  font-weight: 500;
+}
+
+/* Icons follow the banner's (inverted) text color in both themes. */
+.site-banner [class*='awsui_icon'] {
+  color: var(--cs-bg) !important;
+}
+
+.site-banner__arrow {
+  display: inline-flex;
+  vertical-align: middle;
+  margin-inline-start: 6px;
+  transition: transform 0.2s ease;
+}
+
+.site-banner__link:hover .site-banner__arrow {
+  transform: translateX(3px);
+}
+
+/* Compact buttons give the arrow a little extra room at the button edge.
+   Hero buttons supply their own symmetric padding around the whole label. */
+.cta-with-arrow {
+  --cta-padding-end: 10px;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+.cta-with-arrow__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  vertical-align: top;
+}
+.cta-with-arrow__icon {
+  display: block;
+  flex: 0 0 12px;
+  width: 12px;
+  height: 12px;
+}
+
+/* Banner + nav stick to the top together. Sticking the wrapper (rather than each child)
+   handles the banner's variable height when its text wraps on narrow screens, and keeps it
+   above the hero gradient (which can extend up into this area). */
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 901;
+}
+
+.site-nav {
+  position: relative;
+  z-index: 900;
+  height: var(--nav-height);
+  border-bottom: 0.5px solid var(--cs-border);
+  background: var(--cs-bg, #ffffff);
+}
+
+.site-nav--home {
+  border-bottom: 0;
+  background: transparent;
+  -webkit-backdrop-filter: blur(5px);
+  backdrop-filter: blur(5px);
+}
+
+.site-nav::after {
+  position: absolute;
+  bottom: -2px;
+  left: 0;
+  right: 0;
+  height: 4px;
+  content: '';
+  background: linear-gradient(90deg, #8f41ff 0 29%, #5668ff 29% 61%, #2d49d8 61% 78%, #102f80 78% 100%);
+}
+
+.site-nav--home::after {
+  display: none;
+}
+
+.site-nav__inner {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  height: 100%;
+  padding: 14px 24px;
+}
+
+.site-logo {
+  border: 0;
+  background: transparent;
+  color: var(--cs-text);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.site-logo {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.site-logo img {
+  width: 28px;
+  height: 28px;
+}
+
+.site-logo span {
+  font-family: 'Geist Pixel Square', var(--font-base);
+  font-weight: 700;
+  font-size: 25px;
+}
+
+.site-menu {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.site-mobile-trigger,
+.site-mobile-spacer {
+  display: none;
+}
+
+.site-menu-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-height: 42px;
+  /* No horizontal padding: borderless text items are spaced purely by the nav's
+     SpaceBetween gap, so the whitespace to a neighboring text item matches the whitespace
+     to a bordered button (whose padding sits inside its border) — giving uniform gaps. */
+  padding: 10px 0;
+  border-radius: 21px;
+  color: var(--cs-text);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.site-menu-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+/* Keyboard focus only on the top-menu links. These are our own elements (not Cloudscape
+   components), so use plain values rather than Cloudscape's internal token variables. */
+.site-menu-link:focus-visible {
+  background: var(--cs-panel);
+  color: var(--cs-text);
+}
+
+/* The Products secondary button anchors the click-to-open popup. */
+.site-products-dropdown {
+  --products-arrow-gap: 10px;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* The text-to-caret gap and trailing button padding use the same value. */
+.site-products-dropdown__label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--products-arrow-gap);
+  vertical-align: top;
+}
+/* Dropdown caret on the Products trigger — rotates 180° while the menu is open. */
+.site-products-dropdown__caret {
+  display: block;
+  width: 12px;
+  height: 12px;
+  opacity: 1; /* full text colour — the caret reads as black like the menu label */
+  transition: transform 0.15s ease;
+}
+.site-products-dropdown[data-open='true'] .site-products-dropdown__caret {
+  transform: rotate(180deg);
+}
+
+/* The Products popup frames the shared grouped rail with one outer border. */
+.site-products-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 1000;
+  width: 360px;
+  /* A floating popup can't show a see-through hole between the groups (arbitrary page content
+     sits behind it) — back the rail with the unselected-row color so the gap reads as ground. */
+  background: var(--cs-panel);
+  border: 1px solid var(--cs-border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.site-products-menu .gs-rail {
+  border-radius: 7px;
+}
+/* And no hole at all in the popup: the groups sit flush, like one continuous menu. */
+.site-products-menu .gs-opt + .gs-rail__group {
+  margin-top: 0;
+}
+
+.home-hero {
+  position: relative;
+  overflow: visible;
+}
+
+.home-hero__content {
+  position: relative;
+  z-index: 1;
+  padding: 96px 0 64px;
+  color: var(--cs-text);
+  /* The content column overlaps the absolutely-positioned art box on the right; let pointer
+     events fall through its empty areas so the live hero scene stays hoverable. The
+     interactive children (text + CTAs) opt back in below. */
+  pointer-events: none;
+}
+
+.home-hero h1,
+.home-hero h2,
+.home-hero p,
+.home-hero__actions {
+  pointer-events: auto;
+}
+
+.home-hero h1,
+.home-hero h2 {
+  margin-top: 0;
+  max-width: 720px;
+  color: var(--cs-text);
+  font-size: 42px;
+  line-height: 1.16;
+  font-weight: 700;
+}
+
+.home-hero p {
+  margin-top: 16px;
+  max-width: 600px;
+  font-size: 17px;
+}
+
+.home-hero .highlight {
+  font-weight: 600;
+}
+
+/* Paired actions share equal columns; single actions keep their natural width. */
+.home-hero__actions {
+  margin-top: 28px;
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cta-pair {
+  display: inline-grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: 8px;
+  max-width: 100%;
+}
+
+.home-hero__art {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  opacity: 1;
+}
+
+:root[data-theme='dark'] .home-hero__art {
+  opacity: 0.92;
+}
+
+/* Centered content frame for the art, so it aligns with the columns of the blocks below. */
+.home-hero__art-frame {
+  position: relative;
+  height: 100%;
+}
+
+/* Live squircle hero scene occupies the second content column: right edge at the frame
+   edge, width of one column, so it lines up with the second column of the blocks below.
+   The SVG inside is width:100%, so it scales to this box. */
+.hero-squircle {
+  position: absolute;
+  top: 40px;
+  right: 0;
+  width: calc((100% - var(--doc-gap)) / 2);
+}
+
+/* Lifted above the footer gradient so the content/cards stay clean while the gradient
+   shows through behind them. */
+.home-main {
+  position: relative;
+  z-index: 1;
+}
+
+.home-main--sky::before {
+  position: absolute;
+  top: calc(-1 * var(--nav-height));
+  left: 0;
+  right: 0;
+  height: 36rem;
+  z-index: -1;
+  content: '';
+  pointer-events: none;
+  background: linear-gradient(
+    180deg,
+    rgba(65, 157, 255, 0.5) 0%,
+    rgba(176, 65, 255, 0.06) 35%,
+    rgba(176, 65, 255, 0) 100%
+  );
+}
+
+.home-stack {
+  padding: 0 0 96px;
+}
+
+.home-with-rail .docs-body {
+  grid-template-columns:
+    minmax(0, calc(100% - var(--doc-right-gap) - var(--doc-rail-width)))
+    var(--doc-right-gap)
+    var(--doc-rail-width);
+}
+
+.media-card h3,
+.doc-media-card h3 {
+  margin-bottom: 8px;
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.docs-section > h2 {
+  margin-bottom: 12px;
+  font-size: 28px;
+  line-height: 1.25;
+}
+
+/* "Get started" and "Trusted by" section headings: larger than the in-flow block
+   titles, closer to the hero size. */
+#resources > h2,
+#trusted-by > h2 {
+  margin-bottom: 32px;
+  font-size: 36px;
+}
+
+/* Keep the lower sections flowing as one continuous sequence (no dividers between them). */
+#faq,
+#trusted-by {
+  border-bottom: 0;
+}
+
+/* One outer frame for the FAQ; individual questions only draw internal dividers
+   (see cloudscape-overrides). Clip their backgrounds to the shared rounded corners. */
+.faq-list {
+  border: 1px solid var(--cs-border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+/* FAQ question headers. */
+.faq-list [class*="awsui_header-text"] {
+  font-size: 16px;
+}
+
+.media-card {
+  border: 1px solid var(--cs-border); /* 1px / 12px */
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--cs-bg, #ffffff);
+}
+
+.media-card img {
+  width: 100%;
+  height: 120px;
+  object-fit: cover;
+  background: #f3f5f9;
+}
+
+.media-card h3,
+.media-card p {
+  padding-inline: 20px;
+}
+
+.media-card h3 {
+  padding-top: 16px;
+}
+
+.media-card p {
+  padding-bottom: 22px;
+  font-size: var(--font-small);
+}
+
+.docs-body {
+  display: grid;
+  grid-template-columns: minmax(0, var(--doc-article-width)) var(--doc-right-gap) var(--doc-rail-width);
+  align-items: start;
+}
+
+.docs-body--no-rail {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.docs-article {
+  grid-column: 1;
+}
+
+.docs-section {
+  padding: 1.5rem 0 3rem;
+  border-bottom: 0.5px solid var(--cs-border);
+}
+
+.docs-section:last-child {
+  border-bottom: 0;
+}
+
+/* No divider between the explore section and Access GPU marketplace below it. */
+.docs-section.explore-section {
+  border-bottom: 0;
+}
+
+.doc-alternating {
+  display: grid;
+  grid-template-columns: minmax(16rem, 1fr) minmax(0, 1fr);
+  gap: var(--doc-gap);
+  align-items: center;
+  margin-top: 18px;
+}
+
+.doc-alternating + .doc-alternating {
+  margin-top: 48px;
+}
+
+.doc-alternating:not(.image-first) {
+  grid-template-columns: minmax(0, 1fr) minmax(16rem, 1fr);
+}
+
+.doc-alternating:not(.image-first) .doc-visual {
+  order: 2;
+}
+
+.doc-visual {
+  min-width: 0;
+}
+
+/* CodeView has no prop to disable its built-in fill; let the Container surface show through. */
+.code-snippet > div {
+  background-color: transparent !important;
+}
+
+/* Cloudscape buttons render as <a> when given href; exclude them from the docs underline rule.
+   Higher specificity than `.docs-article a` so the reset wins regardless of source order. */
+.docs-article .doc-action a,
+.docs-article .figma-card a,
+.docs-article .gs-boxfoot a,
+.docs-article .gs-deploy a {
+  text-decoration: none !important;
+}
+
+.doc-action {
+  margin-top: 20px;
+}
+
+.doc-alternating h2 {
+  margin-bottom: 12px;
+  font-size: 28px;
+}
+
+/* Body copy in the alternating marketing blocks (normal page text). */
+.doc-alternating p {
+  font-size: 17px;
+}
+
+/* "Vendor-agnostic, open-source" architecture diagram (components/ArchitectureDiagram.tsx),
+   rebuilt from a static SVG into HTML/CSS and sized 1:1 with it. Every dimension is in cqw
+   (% of the diagram's own width, resolved against the .arch-diagram-wrap container) so the
+   whole thing scales proportionally like the original SVG. Source design width is 901.8
+   units, so 1 unit ≈ 0.111cqw. Logos are monochrome + theme-adaptive (see .arch-logo). */
+.arch-diagram-wrap {
+  container-type: inline-size;
+  width: 100%;
+}
+
+.arch-diagram {
+  display: flex;
+  flex-direction: column;
+  gap: 2.66cqw; /* 24u between the diagram blocks */
+  width: 100%;
+  color: var(--cs-text);
+  --arch-border-width: max(1px, 0.22cqw); /* placeholder badge stroke */
+  --arch-gradient: var(--cs-text);
+  --arch-label-padding: 2cqw;
+}
+
+.arch-stack {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 0.5px dotted currentColor;
+  border-radius: 12px;
+  background: var(--cs-panel);
+}
+
+.arch-row {
+  display: grid;
+  gap: 1.72cqw; /* 15.5u */
+}
+
+/* Framework/model inputs use equal-width blocks. */
+.arch-row--inputs {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+/* Give cloud examples the remaining space after the compact compute labels. */
+.arch-row--compute {
+  grid-template-columns: minmax(0, 1fr) repeat(4, max-content);
+  gap: 1.26cqw;
+  padding: 3.2cqw var(--arch-label-padding) 3.48cqw;
+}
+
+.arch-row--compute .arch-cell {
+  justify-content: center;
+  gap: 0.55cqw;
+  min-height: calc(8cqw - 6px);
+  padding-inline: 1.5cqw;
+  border: 1px solid currentColor;
+  border-radius: 9px;
+  background: var(--cs-bg);
+}
+
+.arch-row--compute .arch-cell--cloud {
+  justify-content: space-between;
+  gap: 1.55cqw;
+}
+
+.arch-cell--cloud .arch-logos {
+  flex-shrink: 0;
+}
+
+/* Pin both input labels left and their logo groups right. */
+.arch-row--inputs .arch-cell {
+  justify-content: space-between;
+}
+
+.arch-cell {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 1.55cqw;
+  min-height: 9.83cqw; /* 88.7u */
+  padding: 0 var(--arch-label-padding);
+  border: 1px solid currentColor;
+  border-radius: 12px;
+}
+
+.arch-cell--center {
+  justify-content: center;
+}
+
+/* Centered labels (e.g. "On-prem clusters") may wrap rather than overflow the narrow column. */
+.arch-cell--center .arch-cell__label {
+  white-space: normal;
+  text-align: center;
+}
+
+.arch-cell--full {
+  min-height: 9.83cqw;
+}
+
+.arch-cell--platform {
+  justify-content: center;
+  gap: 0.55cqw;
+  padding-inline: 2.1cqw;
+}
+
+.arch-cell--platform .arch-cell__label {
+  font-size: 2.55cqw;
+  text-align: center;
+  white-space: normal;
+}
+
+/* "Any accelerator": label pinned left, logos centered across the full row. */
+.arch-cell--hw {
+  justify-content: center;
+}
+.arch-cell--hw > .arch-cell__label {
+  position: absolute;
+  left: var(--arch-label-padding);
+}
+
+.arch-cell__label {
+  font-size: 2.55cqw;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+/* Orchestration and infrastructure share an outer border and aligned label padding. */
+.arch-orchestration {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3cqw;
+  padding: 3.2cqw var(--arch-label-padding) 3.48cqw;
+  border-radius: 0 0 12px 12px;
+  background: var(--arch-gradient);
+  color: var(--cs-bg);
+}
+
+/* Same size/weight as the cell labels (e.g. "Any framework"). */
+.arch-orchestration__title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2cqw;
+  width: 100%; /* stretch full width so the title pins left and the Docker marker pins right */
+  font-size: 2.55cqw;
+  font-weight: 500;
+}
+
+/* Five top-level orchestration primitives. */
+.arch-orchestration__cells {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 1.26cqw; /* 11.4u */
+  width: 100%;
+}
+
+.arch-subcell {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 6cqw;
+  padding: 0 0.8cqw;
+  border-radius: 12px;
+  text-align: center;
+  font-size: 2.25cqw;
+  font-weight: 500;
+  line-height: 1.2;
+  border: 1px dotted currentColor;
+}
+
+.arch-diagram .arch-link {
+  color: inherit;
+  text-decoration: none !important;
+}
+
+.arch-diagram .arch-link:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+.arch-logos {
+  display: inline-flex;
+  align-items: center;
+  gap: 1.15cqw; /* ~10u between logos in the SVG */
+  flex-wrap: nowrap; /* keep each cell's logos on one line (mobile reflow re-enables wrap) */
+}
+
+/* Real logo: source SVG (or webp) used as a mask filled with the current text color, so it reads
+   monochrome and flips with the theme. The mask image URL is the only inline bit (it needs the
+   runtime base path); size + aspect live in the per-logo classes below. */
+.arch-logo {
+  display: inline-block;
+  background-color: currentColor;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+}
+
+/* Per-logo height (cqw, so it scales) + aspect from each source's viewBox. Wide marks (NVIDIA)
+   are set shorter so they don't dominate; tall ones (PyTorch) a touch taller. */
+.arch-logo--nebius { height: 4.6cqw; aspect-ratio: 1; }
+.arch-logo--crusoe { height: 4.8cqw; aspect-ratio: 1; }
+.arch-logo--runpod { height: calc(5.04cqw - 1.5px); aspect-ratio: 120 / 130; }
+.arch-logo--aws { height: calc(4.05cqw - 1.5px); aspect-ratio: 304 / 182; }
+.arch-logo--pytorch { height: 4.9cqw; aspect-ratio: 90.3 / 109.1; }
+.arch-logo--vllm { height: 4.8cqw; aspect-ratio: 1; }
+.arch-logo--sglang { height: 4.8cqw; aspect-ratio: 596 / 683; }
+.arch-logo--smg { height: 3.75cqw; aspect-ratio: 28 / 29; }
+.arch-logo--nvidia { height: 4cqw; aspect-ratio: 271.7 / 179.7; }
+.arch-logo--amd { height: 4.8cqw; margin-left: 2px; aspect-ratio: 1600 / 1408; }
+.arch-logo--tenstorrent { height: 4.8cqw; aspect-ratio: 170 / 169; }
+.arch-logo--tpu { height: calc(4.2cqw - 1px); aspect-ratio: 256 / 206; } /* shares the GCP mark, sized down a touch */
+/* "Any model" marks (top row) — square icons; plus the Docker marker on the orchestration band. */
+/* Heights tuned per-logo for similar optical weight, compensating for differing padding and
+   visual density inside each source viewBox. */
+.arch-logo--glm { height: 3.8cqw; aspect-ratio: 19 / 16; }
+.arch-logo--deepseek { height: 5.75cqw; aspect-ratio: 1; transform: translateY(-1px); }
+.arch-logo--qwen {
+  width: 5.4cqw;
+  height: 6.3cqw;
+  aspect-ratio: 1;
+  -webkit-mask-size: auto 100%;
+  mask-size: auto 100%;
+  transform: translateY(1px);
+}
+.arch-logo--kimi { height: 5.2cqw; aspect-ratio: 1; transform: translateY(-1px); }
+.arch-logo--docker { height: 2.8cqw; aspect-ratio: 122.88 / 88.17; }
+
+/* Placeholder badge (fallback if a logo ever lacks a source). Overrides the mask fill. */
+.arch-logo--placeholder {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: auto;
+  /* height + min-width set inline per logo */
+  padding: 0 0.6cqw;
+  border: var(--arch-border-width) dashed color-mix(in srgb, var(--cs-text) 42%, transparent);
+  border-radius: 0.7cqw;
+  background: none;
+  font-size: 1.5cqw;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--cs-muted);
+}
+
+/* Safety net for narrow containers (phones): stop shrinking, stack the rows, drop the
+   primitives to two columns, and switch to fixed legible type. */
+@container (max-width: 480px) {
+  .arch-diagram { gap: 12px; --arch-label-padding: 14px; }
+  .arch-stack { border-radius: 8px; }
+  /* Stack the inputs and cloud examples, then pair the other compute sources. */
+  .arch-row { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .arch-row > :first-child { grid-column: 1 / -1; }
+  .arch-row--inputs > .arch-cell { grid-column: 1 / -1; }
+  .arch-row--compute { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 16px var(--arch-label-padding); }
+  .arch-row--compute > :first-child { grid-column: 1 / -1; }
+  .arch-row--compute .arch-cell { min-height: 54px; padding: 11px 8px; }
+  .arch-cell { min-height: 52px; padding: 10px var(--arch-label-padding); gap: 12px; border-width: 1px; border-radius: 8px; }
+  .arch-cell__label { font-size: 16px; white-space: normal; }
+  .arch-cell--platform { min-height: 52px; gap: 6px; padding: 8px 4px; }
+  .arch-cell--platform .arch-cell__label { font-size: 16px; }
+  /* "Any accelerator": label left, logos pushed to the right (the desktop layout centers them). */
+  .arch-cell--hw { justify-content: space-between; }
+  .arch-cell--hw > .arch-cell__label { position: static; }
+  .arch-orchestration { gap: 12px; padding: 16px var(--arch-label-padding); border-radius: 0 0 8px 8px; }
+  .arch-orchestration__title { font-size: 15px; }
+  .arch-orchestration__cells { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .arch-orchestration__cells > :last-child { grid-column: 1 / -1; }
+  .arch-subcell { min-height: 44px; font-size: 13px; border-width: 1px; border-radius: 7px; }
+  .arch-logos { gap: 12px; }
+  /* !important to beat the per-logo cqw heights. */
+  .arch-logo { height: 22px !important; }
+  .arch-logo--runpod,
+  .arch-logo--aws { height: 20.5px !important; }
+  .arch-logo--tpu { height: 21px !important; }
+  .arch-logo--placeholder { height: 22px !important; min-width: 22px !important; font-size: 12px; border-width: 1px; border-radius: 5px; }
+}
+
+.doc-card-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--card-gap);
+  margin-top: 24px;
+}
+
+.doc-media-card img {
+  height: 98px;
+}
+
+.doc-media-card h3 {
+  padding-top: 24px;
+}
+
+.doc-media-card {
+  min-height: 272px;
+}
+
+.alert-block {
+  margin-top: 1.5rem;
+}
+
+.figma-card {
+  width: min(24rem, 100%);
+  margin-top: 1.5rem;
+  border: 1px solid var(--cs-border); /* 1px / 12px */
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--cs-bg, #ffffff);
+}
+
+.figma-card img {
+  width: 100%;
+  aspect-ratio: 980 / 560;
+  height: auto;
+  object-fit: cover;
+}
+
+.figma-card div {
+  padding: 24px;
+}
+
+.figma-card h3 {
+  margin-bottom: 12px;
+  font-size: var(--font-card-heading);
+}
+
+.figma-card p {
+  margin-bottom: 20px;
+  font-size: var(--font-small);
+}
+
+/* Quote author name reuses the card-heading size. */
+.testimonial-name {
+  font-size: var(--font-card-heading) !important;
+}
+
+/* Product cards reusing the figma-card style. Used inside an AlternatingDocBlock
+   visual slot, so it stays vertically centered (no top margin). */
+.product-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--card-gap);
+}
+
+/* Two-up variant: dstack Sky and Factory side by side. */
+.product-grid--pair {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+/* Testimonial cards in the "Trusted by" section. */
+.testimonial-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--card-gap);
+  margin-top: 24px;
+}
+
+/* Small body text — quotes and FAQ answers — reuse the action-card description's size, line
+   height, and color so they read identically. !important to beat Cloudscape's boosted classes. */
+.testimonial-grid p,
+.faq-list [class*='awsui_content'] {
+  font-size: var(--font-small) !important;
+  line-height: 1.5 !important;
+  color: var(--cs-text) !important;
+}
+
+.faq-list p {
+  font-size: inherit;
+}
+
+.faq-list p + p {
+  margin-top: 1em;
+}
+
+
+.testimonial-person {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.testimonial-photo {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex: 0 0 auto;
+}
+
+.product-grid .figma-card {
+  width: auto;
+  margin-top: 0;
+}
+
+/* Product selector and its matching preview. */
+.gs-deploy {
+  display: grid;
+  grid-template-columns: 1fr 2fr; /* selector 1/3, detail 2/3 */
+  align-items: start; /* the box sets its own (taller) height; the rail sits at the top, not stretched */
+  gap: 36px;
+  margin-top: 8px;
+}
+
+/* Left: the selector — a bare column of individually-bordered option cards (no panel chrome). */
+.gs-rail {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  border-radius: 8px;
+  overflow: hidden; /* clip the full-width group bars to the rounded corners */
+  background: transparent; /* the rows carry the panel ground, so the gap between groups is a true hole */
+}
+/* Product links share the same styling in the section and popup. */
+.gs-rail a.gs-opt {
+  color: var(--cs-text);
+  text-decoration: none;
+  cursor: pointer;
+}
+.gs-rail__group {
+  position: relative;
+  z-index: 4;
+}
+.gs-opt {
+  position: relative;
+  display: block;
+  width: 100%;
+  border: 0;
+  border-radius: 8px; /* same radius as the tab chips */
+  background: var(--cs-panel); /* each row paints its own ground (the rail is transparent) */
+  color: var(--cs-text);
+  font: inherit;
+  line-height: 1.15; /* pinned (not inherited) so the rail renders identically on the docs site */
+  text-align: left;
+  cursor: pointer;
+}
+
+/* Adjacent rows inside a group square off their shared edge, so the group's ground reads as one
+   block (rounded corners there would open see-through notches between the rows). */
+.gs-opt + .gs-opt {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+.gs-opt:has(+ .gs-opt) {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.gs-rail:not(:has(a.gs-opt:hover, a.gs-opt:focus-visible)) .gs-opt.gs-opt--on,
+.gs-rail a.gs-opt:hover,
+.gs-rail a.gs-opt:focus-visible {
+  border-radius: 8px;
+  background: var(--cs-bg);
+  box-shadow: inset 0 0 0 1px var(--cs-text);
+}
+.site-products-menu .gs-rail:not(:has(a.gs-opt:hover, a.gs-opt:focus-visible)) .gs-opt.gs-opt--on,
+.site-products-menu .gs-rail a.gs-opt:hover,
+.site-products-menu .gs-rail a.gs-opt:focus-visible {
+  box-shadow: none;
+}
+.gs-rail button.gs-opt:focus-visible {
+  outline: 2px solid var(--cs-text);
+  outline-offset: -3px;
+}
+
+/* Row names mirror the tab typography: 16px / 700. */
+.gs-opt__name {
+  display: block;
+  font-size: 16px;
+  font-weight: 700;
+}
+/* Rail group segments ("self-hosted" over dstack + Factory, "hosted by us" over Sky): thin
+   full-width solid bars; the rows beneath carry a thick left spine showing what each group
+   includes. */
+.gs-rail__group {
+  background: var(--cs-text);
+  color: var(--cs-bg);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1;
+  padding: 5px 16px 5px 60.5px; /* left-aligns the label with the row titles */
+  border-radius: 8px 8px 0 0; /* same radius as the rows */
+  white-space: nowrap;
+}
+/* The first bar sits inside the rail's border corner: a 12px outer radius with a 1px border has
+   an 11px inner curve, so the bar needs the nested radius to fill it without a sliver. */
+/* A group bar that follows a row stands off from it, so the groups read as separate blocks. */
+.gs-opt + .gs-rail__group {
+  margin-top: 10px;
+}
+.gs-rail__group:first-child {
+  border-radius: 8px 8px 0 0; /* flush with the borderless rail's 8px clip */
+}
+/* Rows keep their full rounding. The bar hugs the first row's top corners with two
+   inverted-radius notch shapes painted over the corners (nothing black sits behind the row's
+   antialiased edge, so no hairline outline), and tucks 1px under the row to kill the seam. */
+.gs-rail__group {
+  margin-bottom: -2px; /* tuck under the next row past any fractional-pixel rounding */
+}
+/* A black top border bridges the bar/row boundary in the middle span, so pixel-snapping can
+   never open a white seam there (the bar's -1px margin tucks it under this border). */
+.gs-rail__group + .gs-opt {
+  border-top: 1px solid var(--cs-text);
+}
+.gs-rail__group + .gs-opt::before,
+.gs-rail__group + .gs-opt::after {
+  content: '';
+  position: absolute;
+  top: -1.5px; /* half-pixel deeper into the bar so fractional rounding can't expose a sliver */
+  width: 9px; /* 1px overlap + the 8px corner radius */
+  height: 9.5px; /* 1.5px overlap + the 8px corner radius */
+  pointer-events: none;
+}
+.gs-rail__group + .gs-opt::before {
+  left: -1px;
+  background: radial-gradient(circle at 100% 100%, transparent 8px, var(--cs-text) 8.7px);
+}
+.gs-rail__group + .gs-opt::after {
+  right: -1px;
+  background: radial-gradient(circle at 0 100%, transparent 8px, var(--cs-text) 8.7px);
+}
+.gs-opt__desc {
+  display: block;
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: color-mix(in srgb, var(--cs-text) 68%, var(--cs-muted));
+}
+
+/* Open-source product row. */
+.gs-opt--feat {
+  padding: 13px 14px;
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+/* dstack Sky / Factory: compact rows with an icon. */
+.gs-opt--row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 13px 14px;
+}
+.gs-opt__ic {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  border: 1px solid var(--cs-border);
+  color: inherit;
+}
+.gs-opt__ic svg {
+  width: 20px;
+  height: 20px;
+}
+
+.gs-opt__body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Right: the selection's detail. */
+.gs-detail {
+  min-width: 0;
+}
+.gs-detail .gs-tabs {
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+.gs-detail .gs-tab {
+  white-space: nowrap;
+}
+/* The detail box — shared shell for all three tabs: a bordered container with a fixed height, holding a tab strip, content, and a footer CTA bar. The
+   height is tuned a touch taller than the rail, giving the content room to breathe and matching the
+   tabbed code cards higher up the page; all three tabs reuse this shell, so they stay equal height. */
+.gs-box {
+  height: 360px; /* a touch taller than the rail (~332px); fits the 5-item Governance grid with slack */
+  display: flex;
+  flex-direction: column;
+  background: var(--cs-bg);
+  border: 1px solid var(--cs-border); /* matches the landing's cards (.media-card / .figma-card) */
+  border-radius: 12px;
+  overflow: hidden;
+}
+.gs-box.gs-box--compute,
+.gs-box.gs-box--compute-sources {
+  height: 360px;
+}
+.gs-box--compute .gs-skybody,
+.gs-box--compute-sources .gs-skybody {
+  overflow-y: auto;
+}
+.gs-box--offers .gs-skybody {
+  padding-top: 0;
+}
+.sky-gpu-prices {
+  flex: 0 0 auto;
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 13px;
+}
+.sky-gpu-prices th,
+.sky-gpu-prices td {
+  padding: 6px 0 6px 14px;
+  text-align: right;
+  vertical-align: top;
+}
+.sky-gpu-prices tr > :first-child {
+  padding-left: 0;
+  text-align: left;
+}
+.sky-gpu-prices thead th {
+  padding-block: 14px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--cs-bg);
+  color: var(--cs-muted);
+  font-weight: 600;
+}
+.sky-gpu-prices td {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: nowrap;
+}
+.sky-gpu-prices tbody th,
+.sky-gpu-prices tbody td {
+  transition: background-color 0.15s ease;
+}
+.sky-gpu-prices tbody tr:hover > * {
+  background: var(--cs-panel);
+}
+.sky-gpu-prices tbody tr > :first-child {
+  border-radius: 8px 0 0 8px;
+}
+.sky-gpu-prices tbody tr > :last-child {
+  border-radius: 0 8px 8px 0;
+}
+@media (max-width: 480px) {
+  .gs-box--offers .gs-skybody {
+    padding-inline: 16px;
+  }
+  .sky-gpu-prices,
+  .sky-gpu-prices .gs-mkt__g {
+    font-size: 12px;
+  }
+  .sky-gpu-prices th,
+  .sky-gpu-prices td {
+    padding-left: 8px;
+  }
+}
+.gs-boxfoot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  padding: 13px 16px 13px 20px;
+  border-top: 1px solid color-mix(in srgb, var(--cs-border) 14%, transparent);
+}
+.gs-foot__note {
+  font-size: 13px;
+  color: var(--cs-muted);
+  min-width: 0; /* allow the note to shrink/wrap so it shares the row with the CTA on narrow screens */
+  margin-inline-end: auto; /* note left, button(s) right — the footer itself is flex-end */
+}
+.gs-foot__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 14px;
+}
+
+@media (max-width: 640px) {
+  .gs-detail .gs-boxfoot {
+    flex-wrap: wrap;
+  }
+  .gs-detail .gs-foot__note {
+    flex-basis: 100%;
+  }
+  .gs-foot__actions {
+    flex-wrap: wrap;
+    gap: 10px;
+    max-width: 100%;
+  }
+}
+
+/* The footer CTA(s) keep their width (never shrink/wrap mid-word); the note takes the rest. */
+.gs-boxfoot > [class*='awsui_button'] {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 480px) {
+  .gs-box--compute .gs-boxfoot,
+  .gs-box--compute-sources .gs-boxfoot {
+    flex-wrap: wrap;
+  }
+  .gs-box--compute .gs-foot__note,
+  .gs-box--compute-sources .gs-foot__note {
+    flex-basis: 100%;
+  }
+}
+
+/* Shared tabs for installation methods and Sky compute options. */
+.gs-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 6px 8px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--cs-border) 14%, transparent);
+}
+.gs-tab {
+  padding: 15px 14px;
+  border: 0;
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+  color: var(--cs-muted);
+  font-family: inherit;
+  font-size: 16px; /* match the page's other (Cloudscape) tab groups: 16px / 700 */
+  font-weight: 700;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.gs-tab:not(.gs-tab--on):hover {
+  color: var(--cs-text);
+  background: var(--cs-hover); /* match the Cloudscape tabs' hover tint */
+}
+.gs-tab--on {
+  color: var(--cs-text);
+  background: var(--cs-panel);
+}
+
+/* Open-source: read-only code fills the body. */
+.gs-box--install .gs-skybody {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 10px 12px;
+  overflow: auto;
+}
+
+/* dstack Sky: two panes (GPU marketplace | bring your own clouds). Source order is header→list,
+   header→list. Desktop: a 2-row grid with column auto-flow, so the two headers land in row 1 (the
+   tab strip) and the two lists in row 2 (the content). Mobile (media query): a single column, so
+   each header sits directly above its own list. The chips reuse the open-source tab look. */
+.gs-sky {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.gs-skyhalf {
+  min-width: 0;
+  padding: 6px 0 0 8px; /* chip text (chip pad 14) lands at 22px, matching the column content below */
+  border-bottom: 1px solid color-mix(in srgb, var(--cs-border) 14%, transparent); /* under-tab divider */
+}
+.gs-skytab {
+  display: inline-block;
+  padding: 15px 14px;
+  border-radius: 8px 8px 0 0;
+  background: var(--cs-panel);
+  color: var(--cs-text);
+  font-size: 16px; /* match the page's other tab groups: 16px / 700 */
+  font-weight: 700;
+}
+.gs-col {
+  min-width: 0;
+  min-height: 0; /* grid item: allow the 1fr row to cap it so the list scrolls instead of overflowing */
+  display: flex;
+  flex-direction: column;
+  padding: 14px 22px 0;
+}
+/* Vertical divider between the two lists only (the 2nd list pane), not under the headers. */
+.gs-sky .gs-col ~ .gs-col {
+  border-left: 1px solid color-mix(in srgb, var(--cs-border) 14%, transparent);
+}
+
+/* The explore block's categorized clouds grid: one column per group (hyperscalers, top GPU
+   neoclouds, smaller GPU clouds), each column an ordered list. Rows match .gs-cloud styling. */
+.gs-cloudcols {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  column-gap: 28px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.gs-cloudcols ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  align-content: start;
+}
+@media (max-width: 640px) {
+  /* Too narrow for three columns; the group lists stack as blocks instead. */
+  .gs-cloudcols {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    row-gap: 9px;
+  }
+}
+
+/* Sky compute tab content. */
+.gs-skybody {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 36px 28px 18px;
+}
+.gs-skybody .gs-caps {
+  flex: 1 1 auto;
+  align-content: start;
+}
+
+.gs-mkt__g {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  font-weight: 400; /* only the GPU name is emphasized (below); VRAM stays regular */
+}
+.gs-mkt__name {
+  font-weight: 600; /* emphasize the GPU name by weight, not size */
+}
+
+.gs-cloud {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: var(--font-small);
+  font-weight: 600; /* match the emphasized GPU names in the marketplace tab */
+  line-height: 1.3;
+}
+
+/* Factory: the "Extra" capabilities — a 2×2 grid of capability rows (icon + title + one-line
+   detail), centered in the body. No card borders. */
+.gs-entbody {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 20px 24px;
+}
+.gs-caps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px 26px;
+}
+
+.gs-cap {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+}
+.gs-cap,
+.gs-cloud {
+  position: relative;
+  isolation: isolate;
+  border-radius: 8px;
+}
+.docs-article a.gs-cap,
+.docs-article a.gs-cloud {
+  color: var(--cs-text);
+  text-decoration: none !important;
+}
+/* Extend the hover fill without changing list spacing or text alignment. */
+.gs-cap::before,
+.gs-cloud::before {
+  content: '';
+  position: absolute;
+  inset: -8px -12px;
+  z-index: -1;
+  border-radius: inherit;
+  background: var(--cs-panel);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+.gs-cap:hover::before,
+.gs-cloud:hover::before,
+.gs-cap:focus-visible::before,
+.gs-cloud:focus-visible::before {
+  opacity: 1;
+}
+.docs-article a.gs-cap:focus-visible,
+.docs-article a.gs-cloud:focus-visible {
+  outline: 2px solid var(--cs-text);
+  outline-offset: 4px;
+}
+.gs-cap__ic {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  color: #8b2fd0;
+}
+:root[data-theme='dark'] .gs-cap__ic {
+  color: #c08bff;
+}
+.gs-cap__ic svg {
+  width: 20px;
+  height: 20px;
+}
+.gs-cap__b {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.gs-cap__t {
+  font-size: var(--font-small); /* same size as the Sky cloud rows */
+  font-weight: 600;
+  line-height: 1.3;
+}
+.gs-cap__s {
+  font-size: 12.5px;
+  color: var(--cs-muted);
+  margin-top: 2px;
+  line-height: 1.4;
+}
+
+/* Brand-purple list glyphs (Sky clouds + marketplace GPU chips), matching the capability icons. */
+.gs-li__ic {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: #8b2fd0;
+}
+:root[data-theme='dark'] .gs-li__ic {
+  color: #c08bff;
+}
+.gs-li__ic svg {
+  width: 15px;
+  height: 15px;
+}
+/* Marketplace row: chip + name group on the left, price on the right. */
+.gs-mkt__left {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+
+@media (max-width: 860px) {
+  .gs-deploy { grid-template-columns: 1fr; gap: 24px; }
+  /* Stacked: the box flows naturally to fit its content (no fixed-height scroll). */
+  .gs-box { height: auto; }
+  /* Sky: single column so each header sits directly above its own list (header→list→header→list). */
+  .gs-sky { display: flex; flex-direction: column; }
+  .gs-sky .gs-col ~ .gs-col { border-left: 0; }
+  /* Separate the second pane (its header follows the first list). */
+  .gs-sky .gs-col + .gs-skyhalf { margin-top: 12px; }
+  .gs-caps { grid-template-columns: 1fr; }
+  /* Keep footer notes and buttons on one row. */
+  .gs-boxfoot { align-items: center; gap: 10px; }
+  .gs-boxfoot [class*='awsui_button'] { padding-inline: 14px var(--cta-padding-end, 14px) !important; }
+}
+
+.site-footer {
+  position: relative;
+  border-top: 0.5px solid var(--cs-border);
+  background: var(--cs-bg, #ffffff);
+}
+
+/* On home, drop the divider line and white block so the footer blends into the
+   colored band above (mirrors the transparent, borderless home header). */
+.site-footer--home {
+  border-top: 0;
+  background: transparent;
+}
+
+/* Single colored band: rises from the bottom of the page up toward the divider (which
+   crops it visually), deepening in color toward the footer. Painted behind .home-main so
+   the content and cards stay clean on top. */
+.site-footer--home::before {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -28rem;
+  bottom: 0;
+  z-index: 0;
+  content: '';
+  pointer-events: none;
+  background: linear-gradient(
+    180deg,
+    rgba(176, 65, 255, 0) 0%,
+    rgba(176, 65, 255, 0.1) 55%,
+    rgba(96, 106, 255, 0.22) 100%
+  );
+}
+
+.footer-content {
+  position: relative;
+  z-index: 1;
+  padding-top: 48px;
+  font-size: 13px;
+}
+
+/* Top row: brand block (logo + social) on the left, the link group flush to the
+   right edge (justify-content on this outer row), so the columns themselves keep a
+   tight content width + fixed gap rather than being stretched apart. */
+.footer-top {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 48px;
+  padding-bottom: 32px;
+}
+
+.footer-brand {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+
+/* Link columns: each sized to its content, separated by a fixed gap. */
+.footer-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 32px 72px;
+}
+
+.footer-brand__logo {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  color: var(--cs-text);
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1;
+  text-decoration: none !important;
+}
+
+.footer-brand__logo img {
+  width: 28px;
+  height: 28px;
+}
+
+.footer-brand__logo span {
+  font-family: 'Geist Pixel Square', var(--font-base);
+  font-weight: 700;
+  font-size: 25px;
+}
+
+.footer-channels {
+  display: flex;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.footer-channel-link {
+  display: inline-flex;
+  color: var(--cs-text) !important;
+  text-decoration: none !important;
+}
+
+.footer-channel-link svg {
+  display: block;
+}
+
+/* Column captions: match the top-menu link size (16px); links sit a step below. */
+.footer-col__heading {
+  margin: 0 0 14px;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--cs-text);
+}
+
+/* Bottom bar: theme toggle + copyright, separated from the columns by a divider. */
+.footer-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  min-height: 64px;
+}
+
+/* Theme toggle: a pill switch + crescent moon, matching the dstack control-plane app's toggle
+   (frontend AppLayout). Light = switch OFF (grey track, white thumb left); [data-theme="dark"]
+   = switch ON (the app's dark-mode "checked" blue track, dark thumb slid right). Colors are the
+   Cloudscape control tokens: track #424650, checked #42b4ff, thumb #fff (light) / #0f141a (dark).
+   The same component renders in the header (large screens) and footer (tablet/mobile); the
+   --header / --footer variants below toggle which one is visible at the 1024px breakpoint. */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;           /* the moon inherits the surrounding text color */
+  cursor: pointer;
+}
+.theme-toggle__track {
+  position: relative;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 16px;
+  border-radius: 8px;
+  background: #424650;
+  transition: background-color 0.2s ease;
+}
+.theme-toggle__thumb {
+  position: absolute;
+  top: 2px;
+  left: 0;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  transform: translateX(2px);
+  transition: transform 0.2s ease, background-color 0.2s ease;
+}
+.theme-toggle__moon {
+  flex: 0 0 auto;
+  display: block;
+}
+[data-theme='dark'] .theme-toggle__track {
+  background: #42b4ff;
+}
+[data-theme='dark'] .theme-toggle__thumb {
+  background: #0f141a;
+  transform: translateX(10px);
+}
+
+/* The header toggle shows only on large screens; the footer one takes over at ≤1024px (tablet +
+   mobile), where the header nav collapses into the burger menu. */
+.theme-toggle--footer {
+  display: none;
+}
+.theme-toggle--header {
+  transform: translateY(3px); /* the nav row centers it a hair high; nudge it down to match */
+  margin-right: -5px;           /* trim the SpaceBetween gap to GitHub by 5px */
+}
+@media (max-width: 1024px) {
+  .theme-toggle--header {
+    display: none;
+  }
+  .theme-toggle--footer {
+    display: inline-flex;
+  }
+}
+
+.footer-copyright {
+  text-align: left;
+}
+
+.home-stack a,
+.docs-article a,
+.site-footer a {
+  text-decoration-line: underline !important;
+  text-decoration-color: currentColor !important;
+  text-underline-offset: 0.08em;
+}
+
+.home-stack a:hover,
+.docs-article a:hover,
+.site-footer a:hover {
+  text-decoration-thickness: 2px !important;
+}
+
+/* Footer column links: full-strength text, same 16px as the column headings, no underline
+   until hover. */
+.footer-links a {
+  color: var(--cs-text) !important;
+  /* Cloudscape <Link> sets 14px via its boosted awsui_font-size-body-m class, so override
+     with !important to match the 16px column headings. */
+  font-size: 16px !important;
+  text-decoration-line: none !important;
+}
+
+.footer-links a:hover {
+  text-decoration-line: underline !important;
+}
+
+/* The brand logo and social icons are <a>s inside .site-footer, so the global
+   footer-link underline rule applies to them — override it (higher specificity). */
+.site-footer .footer-brand__logo,
+.site-footer .footer-channel-link {
+  text-decoration: none !important;
+}
+
+/* On home the divider would sit on the gradient band; soften it so the footer
+   keeps blending into the colored band above. */
+.site-footer--home .footer-bar {
+  border-top-color: transparent;
+}
+
+.home-stack p a,
+.docs-article p a {
+  font-size: inherit !important;
+  line-height: inherit !important;
+}
+
+/* Footer responsive: below the desktop width the columns stack on top, with the brand
+   (logo + social) below them — the links are the primary footer nav, so they lead. */
+@media (max-width: 1100px) {
+  .footer-top {
+    flex-direction: column;
+    gap: 32px;
+  }
+
+  /* Links first, brand (logo + social icons) second. */
+  .footer-brand {
+    order: 2;
+  }
+
+  .footer-links {
+    width: 100%;
+    gap: 28px 56px;
+  }
+}
+
+/* Phones: four columns no longer fit in one row, and three would orphan the fourth,
+   so drop to a clean two-up grid. */
+@media (max-width: 720px) {
+  .footer-links {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 28px 32px;
+  }
+}
+
+@media (max-width: 1100px) {
+  .site-frame {
+    width: calc(100vw - 48px);
+  }
+
+  .home-hero__content {
+    padding: 64px 0;
+  }
+
+  .home-hero__art {
+    opacity: 0.85;
+  }
+
+  .hero-squircle {
+    top: 12px;
+  }
+
+  .doc-card-grid,
+  .product-grid,
+  .testimonial-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .doc-alternating,
+  .doc-alternating:not(.image-first) {
+    grid-template-columns: 1fr;
+  }
+
+  /* Stacked on mobile, always lead with the text block; the visual follows below
+     (regardless of the desktop image-first / image-last alternation). */
+  .doc-alternating .doc-visual {
+    order: 2;
+  }
+
+  /* Tighter gap between blocks once they stack into a single column. */
+  .doc-alternating + .doc-alternating {
+    margin-top: 32px;
+  }
+
+  .docs-body {
+    display: flex;
+    flex-direction: column;
+  }
+}
+
+/* Switch to the burger nav at ≤1024px: the full menu (Documentation + the three blog links +
+   theme toggle + GitHub + Get started) is too wide for tablet widths. This matches the theme
+   toggle's 1024px boundary (header → footer above), so the footer toggle takes over exactly when
+   the burger appears — no width band is left without a toggle. The hero/content phone layout
+   stays at ≤640px (below). */
+@media (max-width: 1024px) {
+  .site-nav {
+    height: 54px;
+  }
+
+  .site-nav__inner {
+    position: relative;
+    justify-content: space-between;
+    gap: 0;
+    width: 100%;
+    padding: 0 13px;
+  }
+
+  .site-menu {
+    display: none;
+  }
+
+  .site-mobile-trigger,
+  .site-mobile-spacer {
+    display: block;
+    flex: 0 0 28px;
+  }
+
+  .site-logo {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+
+  .site-mobile-navigation {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    z-index: -1;
+    max-height: calc(100vh - 58px);
+    overflow: auto;
+    padding: 20px;
+    border-bottom: 0.5px solid var(--cs-border);
+    background: var(--cs-bg, #ffffff);
+  }
+
+  /* Below 1024 (where the nav also collapses to a hamburger) the side-by-side hero would
+     overlap the headline, so stack it: headline + CTAs first, then the squircle below them
+     in normal flow, centered — on tablet and phone alike. */
+  .home-hero {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .home-hero__content {
+    order: 1;
+    padding-bottom: 8px;
+  }
+
+  .home-hero__art {
+    order: 2;
+    position: static;
+    height: auto;
+    opacity: 1;
+    padding-bottom: 8px;
+  }
+
+  .home-hero__art-frame {
+    height: auto;
+  }
+
+  .hero-squircle {
+    position: static;
+    width: min(100%, 460px);
+    margin: 8px auto 0;
+  }
+}
+
+@media (max-width: 640px) {
+  .home-hero {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .home-hero__content {
+    order: 1;
+    /* Tighter than tablet's 64px — the sticky banner + nav already eat a phone's first screen. */
+    padding: 40px 0 24px;
+  }
+
+  /* Hero CTAs share one full-width row on phones — two equal columns spanning the width. */
+  .home-hero__actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+  }
+
+  .home-hero__actions--single {
+    grid-template-columns: max-content;
+  }
+  /* Each button fills its half-column; center the label and trim the desktop side
+     padding so both fit. !important: Cloudscape sets text-align:start via a boosted rule. */
+  .cta-pair > a {
+    padding-inline: 16px !important;
+  }
+  .home-hero__actions [class*='awsui_button'] {
+    width: 100%;
+    padding-inline: 16px !important;
+    text-align: center !important;
+  }
+
+  .home-hero h1,
+  .home-hero h2 {
+    font-size: 32px;
+  }
+
+  .home-stack {
+    padding-top: 0;
+  }
+
+  .figma-card,
+  .figma-card img {
+    width: 100%;
+  }
+
+  .footer-content {
+    padding-top: 32px;
+  }
+
+  .footer-top {
+    padding-bottom: 24px;
+  }
+
+  .footer-bar {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+}

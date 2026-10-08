@@ -7,11 +7,7 @@ from sqlalchemy import Connection, MetaData, text
 
 from dstack._internal.server.db import get_db
 from dstack._internal.server.models import BaseModel, EnumAsString
-
-config = context.config
-
-if config.config_file_name is not None and config.attributes.get("configure_logging", True):
-    fileConfig(config.config_file_name)
+from dstack._internal.server.settings import init_server_data_dir
 
 target_metadata = BaseModel.metadata
 
@@ -56,7 +52,7 @@ def run_migrations_online():
     In this scenario we need to create an Engine
     and associate a connection with the context.
     """
-    connection = config.attributes.get("connection", None)
+    connection = context.config.attributes.get("connection", None)
     if connection is None:
         asyncio.run(run_async_migrations())
     else:
@@ -73,7 +69,7 @@ def run_migrations(connection: Connection):
         # lock_timeout is needed so that migrations that acquire locks
         # do not wait for locks forever, blocking live queries.
         # Better to fail and retry a deployment.
-        connection.execute(text("SET lock_timeout='10s';"))
+        connection.execute(text("SET lock_timeout='15s';"))
     connection.commit()
     context.configure(
         connection=connection,
@@ -94,6 +90,7 @@ def run_migrations(connection: Connection):
 
 
 async def run_async_migrations():
+    init_server_data_dir()
     engine = get_db().engine
     async with engine.connect() as connection:
         await connection.run_sync(run_migrations)
@@ -101,6 +98,11 @@ async def run_async_migrations():
 
 
 def main():
+    # Extending servers import this module once and reuse it across Alembic commands.
+    # Read the active configuration on each invocation rather than caching it at import.
+    config = context.config
+    if config.config_file_name is not None and config.attributes.get("configure_logging", True):
+        fileConfig(config.config_file_name)
     if context.is_offline_mode():
         run_migrations_offline()
     else:

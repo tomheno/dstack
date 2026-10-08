@@ -3,6 +3,10 @@ from typing import Optional
 import gpuhunt
 import pytest
 
+from dstack._internal.core.backends.vastai.profile_options import (
+    VastAIOfferOrder,
+    VastAIProfileOptions,
+)
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.profiles import SpotPolicy
 from dstack._internal.core.models.resources import (
@@ -18,11 +22,13 @@ from dstack._internal.core.models.runs import Requirements
 from dstack._internal.server.services.requirements.combine import (
     CombineError,
     Profile,
+    _combine_backend_options_optional,
     _combine_cpu,
     _combine_gpu_optional,
     _combine_idle_duration_optional,
     _combine_resources,
     _combine_spot_policy_optional,
+    _intersect_lists_case_insensitive_optional,
     _intersect_lists_optional,
     combine_fleet_and_run_profiles,
     combine_fleet_and_run_requirements,
@@ -42,6 +48,15 @@ class TestCombineFleetAndRunProfiles:
             tags={"tag": "value"},
         )
         assert combine_fleet_and_run_profiles(profile, profile) == profile
+
+    def test_prefers_finite_idle_duration_over_off(self):
+        combined_profile = combine_fleet_and_run_profiles(
+            Profile(idle_duration=300),
+            Profile(idle_duration=-1),
+        )
+
+        assert combined_profile is not None
+        assert combined_profile.idle_duration == 300
 
     @pytest.mark.parametrize(
         argnames=["fleet_profile", "run_profile", "expected_profile"],
@@ -84,6 +99,24 @@ class TestCombineFleetAndRunProfiles:
             ),
             pytest.param(
                 Profile(
+                    regions=["US-East-1"],
+                    availability_zones=["US-East-1a"],
+                    instance_types=["P4d.24xlarge"],
+                ),
+                Profile(
+                    regions=["us-east-1"],
+                    availability_zones=["us-east-1a"],
+                    instance_types=["p4d.24xlarge"],
+                ),
+                Profile(
+                    regions=["US-East-1"],
+                    availability_zones=["US-East-1a"],
+                    instance_types=["P4d.24xlarge"],
+                ),
+                id="locations_differing_in_case",
+            ),
+            pytest.param(
+                Profile(
                     spot_policy=SpotPolicy.SPOT,
                 ),
                 Profile(
@@ -91,6 +124,22 @@ class TestCombineFleetAndRunProfiles:
                 ),
                 None,
                 id="incompatible_profiles",
+            ),
+            pytest.param(
+                Profile(backend_options=[VastAIProfileOptions(min_score=100)]),
+                Profile(backend_options=[VastAIProfileOptions(min_score=400)]),
+                Profile(backend_options=[VastAIProfileOptions(min_score=400)]),
+                id="backend_options_compatible",
+            ),
+            pytest.param(
+                Profile(
+                    backend_options=[VastAIProfileOptions(offer_order=VastAIOfferOrder.PRICE)]
+                ),
+                Profile(
+                    backend_options=[VastAIProfileOptions(offer_order=VastAIOfferOrder.SCORE)]
+                ),
+                None,
+                id="backend_options_incompatible",
             ),
         ],
     )
@@ -142,6 +191,33 @@ class TestCombineFleetAndRunRequirements:
                 None,
                 id="incompatible_requirements",
             ),
+            pytest.param(
+                Requirements(
+                    resources=ResourcesSpec(),
+                    backend_options=[VastAIProfileOptions(min_score=100)],
+                ),
+                Requirements(
+                    resources=ResourcesSpec(),
+                    backend_options=[VastAIProfileOptions(min_score=400)],
+                ),
+                Requirements(
+                    resources=ResourcesSpec(),
+                    backend_options=[VastAIProfileOptions(min_score=400)],
+                ),
+                id="backend_options_compatible",
+            ),
+            pytest.param(
+                Requirements(
+                    resources=ResourcesSpec(),
+                    backend_options=[VastAIProfileOptions(offer_order=VastAIOfferOrder.PRICE)],
+                ),
+                Requirements(
+                    resources=ResourcesSpec(),
+                    backend_options=[VastAIProfileOptions(offer_order=VastAIOfferOrder.SCORE)],
+                ),
+                None,
+                id="backend_options_incompatible",
+            ),
         ],
     )
     def test_combines_requirements(
@@ -154,6 +230,29 @@ class TestCombineFleetAndRunRequirements:
             combine_fleet_and_run_requirements(fleet_requirements, run_requirements)
             == expected_requirements
         )
+
+    def test_unconstrained_fleet_resources_pass_through_run_requirements(self):
+        unconstrained_fleet = Requirements(
+            resources=ResourcesSpec.unconstrained(),
+        )
+        run = Requirements(
+            resources=ResourcesSpec(
+                cpu=CPUSpec(count=Range(min=2, max=None)),
+                memory=Range(min=Memory.parse("2GB"), max=None),
+                gpu=GPUSpec(count=Range(min=1, max=None)),
+                disk=DiskSpec(size=Range(min=Memory.parse("50GB"), max=None)),
+            ),
+        )
+        result = combine_fleet_and_run_requirements(unconstrained_fleet, run)
+        assert result is not None
+        combined_cpu = result.resources.cpu
+        assert isinstance(combined_cpu, CPUSpec)
+        assert combined_cpu.count.min == 2
+        assert result.resources.memory.min == Memory.parse("2GB")
+        assert result.resources.gpu is not None
+        assert result.resources.gpu.count.min == 1
+        assert result.resources.disk is not None
+        assert result.resources.disk.size.min == Memory.parse("50GB")
 
 
 class TestIntersectLists:
@@ -196,8 +295,46 @@ class TestIntersectLists:
         result = _intersect_lists_optional(list1, list2)
         assert result == ["a", "a", "c"]
 
+    def test_intersection_is_case_sensitive(self):
+        assert _intersect_lists_optional(["A"], ["a"]) == []
 
-class TestCombineIdleDuration:
+
+class TestIntersectListsCaseInsensitive:
+    def test_both_none_returns_none(self):
+        assert _intersect_lists_case_insensitive_optional(None, None) is None
+
+    def test_first_none_returns_copy_of_second(self):
+        list2 = ["a", "b", "c"]
+        result = _intersect_lists_case_insensitive_optional(None, list2)
+        assert result == list2
+        assert result is not list2  # Should be a copy
+
+    def test_second_none_returns_copy_of_first(self):
+        list1 = ["x", "y", "z"]
+        result = _intersect_lists_case_insensitive_optional(list1, None)
+        assert result == list1
+        assert result is not list1  # Should be a copy
+
+    def test_intersection_ignores_case(self):
+        list1 = ["us-east-1", "EU-WEST-1", "ap-south-1"]
+        list2 = ["US-EAST-1", "eu-west-1"]
+        result = _intersect_lists_case_insensitive_optional(list1, list2)
+        assert result == ["us-east-1", "EU-WEST-1"]
+
+    def test_intersection_of_non_overlapping_lists(self):
+        result = _intersect_lists_case_insensitive_optional(["a", "b"], ["c", "d"])
+        assert result == []
+
+    def test_intersection_preserves_order_from_first_list(self):
+        result = _intersect_lists_case_insensitive_optional(["C", "A", "B"], ["a", "b", "c"])
+        assert result == ["C", "A", "B"]
+
+    def test_intersection_with_duplicates(self):
+        result = _intersect_lists_case_insensitive_optional(["a", "b", "A", "c"], ["A", "c", "d"])
+        assert result == ["a", "A", "c"]
+
+
+class TestCombineOptionalIdleDuration:
     def test_both_none_returns_none(self):
         assert _combine_idle_duration_optional(None, None) is None
 
@@ -218,27 +355,19 @@ class TestCombineIdleDuration:
     def test_both_zero_returns_zero(self):
         assert _combine_idle_duration_optional(0, 0) == 0
 
-    def test_positive_and_negative_raises_error(self):
-        with pytest.raises(
-            CombineError, match="idle_duration values 3600 and -1 cannot be combined"
-        ):
-            _combine_idle_duration_optional(3600, -1)
+    def test_positive_and_negative_returns_positive(self):
+        assert _combine_idle_duration_optional(3600, -1) == 3600
 
-    def test_negative_and_positive_raises_error(self):
-        with pytest.raises(
-            CombineError, match="idle_duration values -1 and 3600 cannot be combined"
-        ):
-            _combine_idle_duration_optional(-1, 3600)
+    def test_negative_and_positive_returns_positive(self):
+        assert _combine_idle_duration_optional(-1, 3600) == 3600
 
     def test_zero_and_positive_returns_zero(self):
         assert _combine_idle_duration_optional(0, 3600) == 0
         assert _combine_idle_duration_optional(3600, 0) == 0
 
-    def test_zero_and_negative_raises_error(self):
-        with pytest.raises(CombineError, match="idle_duration values 0 and -1 cannot be combined"):
-            _combine_idle_duration_optional(0, -1)
-        with pytest.raises(CombineError, match="idle_duration values -1 and 0 cannot be combined"):
-            _combine_idle_duration_optional(-1, 0)
+    def test_zero_and_negative_returns_zero(self):
+        assert _combine_idle_duration_optional(0, -1) == 0
+        assert _combine_idle_duration_optional(-1, 0) == 0
 
 
 class TestCombineSpotPolicy:
@@ -382,8 +511,24 @@ class TestCombineGpu:
             name=["V100"],
             count=Range(min=2, max=3),
             memory=Range(min=Memory(16), max=Memory(24)),
-            compute_capability=ComputeCapability((7, 0)),
+            compute_capability=ComputeCapability((7, 8)),
         )
+
+    def test_intersects_names_case_insensitively(self):
+        gpu1 = GPUSpec(name=["MI300X", "H100"], count=Range(min=1, max=1))
+        gpu2 = GPUSpec(name=["mi300x"], count=Range(min=1, max=1))
+        result = _combine_gpu_optional(gpu1, gpu2)
+        assert result is not None
+        assert result.name == ["MI300X"]
+
+    def test_takes_the_highest_compute_capability(self):
+        # compute_capability is a lower bound, so the stricter of the two must win.
+        higher = GPUSpec(count=Range(min=1, max=1), compute_capability=ComputeCapability((8, 0)))
+        lower = GPUSpec(count=Range(min=1, max=1), compute_capability=ComputeCapability((7, 0)))
+        for gpu1, gpu2 in [(higher, lower), (lower, higher)]:
+            result = _combine_gpu_optional(gpu1, gpu2)
+            assert result is not None
+            assert result.compute_capability == ComputeCapability((8, 0))
 
     def test_incompatible_vendors_raises_error(self):
         gpu1 = GPUSpec(vendor=gpuhunt.AcceleratorVendor.NVIDIA, count=Range(min=1, max=2))
@@ -402,3 +547,26 @@ class TestCombineGpu:
         gpu2 = GPUSpec(count=Range(min=1, max=2), memory=Range(min=Memory(32), max=Memory(64)))
         with pytest.raises(CombineError):
             _combine_gpu_optional(gpu1, gpu2)
+
+
+class TestCombineBackendOptionsOptional:
+    def test_both_none_returns_none(self):
+        assert _combine_backend_options_optional(None, None) is None
+
+    def test_one_none_returns_copy_of_other(self):
+        opts = [VastAIProfileOptions(min_score=100)]
+        combine_none_opts = _combine_backend_options_optional(None, opts)
+        assert combine_none_opts == opts
+        assert combine_none_opts is not opts
+        combine_opts_none = _combine_backend_options_optional(opts, None)
+        assert combine_opts_none == opts
+        assert combine_opts_none is not opts
+
+    def test_combines_same_backend_type(self):
+        opts1 = [VastAIProfileOptions(min_score=100, min_reliability=0.7)]
+        opts2 = [VastAIProfileOptions(min_score=300, min_reliability=0.95)]
+        result = _combine_backend_options_optional(opts1, opts2)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].min_score == 300
+        assert result[0].min_reliability == 0.95

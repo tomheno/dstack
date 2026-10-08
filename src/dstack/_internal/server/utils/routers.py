@@ -1,35 +1,69 @@
 from typing import Any, Dict, List, Optional
 
-import orjson
 import packaging.version
 from fastapi import HTTPException, Request, Response, status
+from fastapi.staticfiles import StaticFiles
+from pydantic_core import to_json
 
 from dstack._internal.core.errors import ServerClientError, ServerClientErrorCode
 from dstack._internal.core.models.common import CoreModel
-from dstack._internal.utils.json_utils import get_orjson_default_options, orjson_default
+from dstack._internal.utils.logging import get_logger
 from dstack._internal.utils.version import parse_version
 
+logger = get_logger(__name__)
 
-class CustomORJSONResponse(Response):
+
+class CustomStaticFiles(StaticFiles):
     """
-    Custom JSONResponse that uses orjson for serialization.
+    StaticFiles raises AssertionError on "websocket" scope type,
+    but starlette's Mount() matches both "http" and "websocket".
+    So a custom ASGI app is needed to reject WebSocket requests gracefully.
+
+    See: https://github.com/dstackai/dstack/issues/4061
+    """
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close"})  # Reject the handshake
+            return
+        await super().__call__(scope, receive, send)
+
+
+class CustomJSONResponse(Response):
+    """
+    JSONResponse backed by pydantic's own Rust serializer.
 
     It's recommended to return this class from routers directly instead of
     returning pydantic models to avoid the FastAPI's jsonable_encoder overhead.
     See https://fastapi.tiangolo.com/advanced/custom-response/#use-orjsonresponse.
 
     Beware that FastAPI skips model validation when responses are returned directly.
-    If serialization needs to be modified, override `dict()` instead of adding validators.
+    If serialization needs to be modified, add a `@field_serializer`/`@model_serializer`
+    instead of adding validators.
     """
 
     media_type = "application/json"
 
     def render(self, content: Any) -> bytes:
-        return orjson.dumps(
-            content,
-            option=get_orjson_default_options(),
-            default=orjson_default,
-        )
+        # `content` is a model, a list of models, or a plain dict (the `server/compatibility/`
+        # patches mutate models in place, but some routers do assemble dicts), so it has to be
+        # serialized generically rather than through one model's `model_dump_json`.
+        return to_json(content, fallback=_fallback)
+
+
+def _fallback(obj: Any) -> str:
+    """
+    Last resort for a type `to_json` cannot serialize.
+
+    Returning a string keeps one unexpected value from turning the whole response into a 500, but
+    it also puts a `repr` on the wire where the client expects real data, so it must not pass
+    silently: the fix is a `@field_serializer` on the field that produced it.
+    """
+    logger.error(
+        "Response contains a value of non-serializable type %s. Add a serializer for it.",
+        type(obj).__name__,
+    )
+    return str(obj)
 
 
 class BadRequestDetailsModel(CoreModel):

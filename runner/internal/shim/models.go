@@ -5,11 +5,13 @@ import (
 )
 
 type DockerParameters interface {
+	DockerPassEnv() []string
 	DockerPrivileged() bool
-	DockerShellCommands([]string) []string
-	DockerMounts(string) ([]mount.Mount, error)
+	DockerShellCommands(authorizedKeys []string, runnerHttpAddress string) []string
+	DockerMounts(taskDir string) ([]mount.Mount, error)
 	DockerPorts() []int
-	MakeRunnerDir(name string) (string, error)
+	TasksDir() string
+	MakeTaskDir(name string) (string, error)
 	DockerPJRTDevice() string
 }
 
@@ -18,15 +20,16 @@ type CLIArgs struct {
 		HTTPPort   int
 		HomeDir    string
 		BinaryPath string
-		LogLevel   int
+		LogLevel   string
 	}
 
 	Runner struct {
 		HTTPPort    int
 		SSHPort     int
+		SSHLogLevel string
 		DownloadURL string
 		BinaryPath  string
-		LogLevel    int
+		LogLevel    string
 	}
 
 	DCGMExporter struct {
@@ -39,6 +42,7 @@ type CLIArgs struct {
 	}
 
 	Docker struct {
+		PassEnv    string
 		Privileged bool
 		PJRTDevice string
 	}
@@ -68,8 +72,8 @@ type VolumeInfo struct {
 	InitFs     bool   `json:"init_fs"`
 	DeviceName string `json:"device_name"`
 	// NFS mount details for SFS/network volumes
-	NfsHost    string `json:"nfs_host,omitempty"`    // e.g., "nfs.fin-03.datacrunch.io"
-	NfsPseudo  string `json:"nfs_pseudo,omitempty"`  // e.g., "/path/to/share"
+	NfsHost   string `json:"nfs_host,omitempty"`   // e.g., "nfs.fin-03.datacrunch.io"
+	NfsPseudo string `json:"nfs_pseudo,omitempty"` // e.g., "/path/to/share"
 }
 
 type PortMapping struct {
@@ -111,12 +115,20 @@ type TaskListItem struct {
 	Status TaskStatus `json:"status"`
 }
 
+type ImagePullProgress struct {
+	DownloadedBytes   uint64 `json:"downloaded_bytes"`
+	ExtractedBytes    uint64 `json:"extracted_bytes"`
+	TotalBytes        uint64 `json:"total_bytes"`
+	IsTotalBytesFinal bool   `json:"is_total_bytes_final"`
+}
+
 type TaskInfo struct {
 	ID                 string
 	Status             TaskStatus
 	TerminationReason  string
 	TerminationMessage string
 	Ports              []PortMapping
+	ImagePullProgress  *ImagePullProgress
 	ContainerName      string
 	ContainerID        string
 	GpuIDs             []string

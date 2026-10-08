@@ -3,48 +3,40 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Any, BinaryIO, Callable, Dict, Optional
+from typing import Annotated, BinaryIO, Callable, Dict, Optional, Union, cast
 
 import git
 import pydantic
-from pydantic import Field
+from pydantic import Field, TypeAdapter
 from typing_extensions import Literal
 
-from dstack._internal.core.errors import DstackError
-from dstack._internal.core.models.common import CoreConfig, generate_dual_core_model
+from dstack._internal.core.deprecated import Deprecated
+from dstack._internal.core.errors import (
+    RepoDetachedHeadError,
+    RepoError,
+    RepoGitError,
+    RepoInvalidGitRepositoryError,
+)
+from dstack._internal.core.models.common import CoreModel
 from dstack._internal.core.models.repos.base import BaseRepoInfo, Repo
 from dstack._internal.utils.hash import get_sha256, slugify
+from dstack._internal.utils.logging import get_logger
 from dstack._internal.utils.path import PathLike
 from dstack._internal.utils.ssh import get_host_config
+
+logger = get_logger(__name__)
 
 SCP_LOCATION_REGEX = re.compile(r"(?P<user>[^/]+)@(?P<host>[^/]+?):(?P<path>.+)", re.IGNORECASE)
 
 
-class RepoError(DstackError):
-    pass
-
-
-class RemoteRepoCredsConfig(CoreConfig):
-    @staticmethod
-    def schema_extra(schema: Dict[str, Any]):
-        pass
-
-
-class RemoteRepoCreds(generate_dual_core_model(RemoteRepoCredsConfig)):
+class RemoteRepoCreds(CoreModel):
     clone_url: str
     private_key: Optional[str] = None
     oauth_token: Optional[str] = None
 
 
-class RemoteRepoInfoConfig(CoreConfig):
-    @staticmethod
-    def schema_extra(schema: Dict[str, Any]):
-        pass
-
-
 class RemoteRepoInfo(
     BaseRepoInfo,
-    generate_dual_core_model(RemoteRepoInfoConfig),
 ):
     repo_type: Literal["remote"] = "remote"
     repo_name: str
@@ -53,7 +45,7 @@ class RemoteRepoInfo(
 class RemoteRunRepoData(RemoteRepoInfo):
     repo_branch: Optional[str] = None
     repo_hash: Optional[str] = None
-    repo_diff: Optional[str] = Field(None, exclude=True)
+    repo_diff: Annotated[Optional[bytes], Field(exclude=True)] = None
     repo_config_name: Optional[str] = None
     repo_config_email: Optional[str] = None
 
@@ -102,6 +94,7 @@ class RemoteRepo(Repo):
     """
 
     run_repo_data: RemoteRunRepoData
+    repo_url: str
 
     @staticmethod
     def from_dir(repo_dir: PathLike) -> "RemoteRepo":
@@ -143,53 +136,89 @@ class RemoteRepo(Repo):
         repo_id: Optional[str] = None,
         local_repo_dir: Optional[PathLike] = None,
         repo_url: Optional[str] = None,
-        repo_data: Optional[RemoteRunRepoData] = None,
         repo_branch: Optional[str] = None,
         repo_hash: Optional[str] = None,
+        repo_data: Union[Deprecated, RemoteRunRepoData, None] = Deprecated.PLACEHOLDER,
     ):
-        self.repo_dir = local_repo_dir
-        self.repo_url = repo_url
-
-        if self.repo_dir is not None:
-            repo = git.Repo(self.repo_dir)
-            tracking_branch = repo.active_branch.tracking_branch()
-            if tracking_branch is None:
-                raise RepoError("No remote branch is configured")
-            self.repo_url = repo.remote(tracking_branch.remote_name).url
-            repo_data = RemoteRunRepoData.from_url(self.repo_url)
-            repo_data.repo_branch = tracking_branch.remote_head
-            repo_data.repo_hash = tracking_branch.commit.hexsha
-            repo_data.repo_config_name = repo.config_reader().get_value("user", "name", "") or None
-            repo_data.repo_config_email = (
-                repo.config_reader().get_value("user", "email", "") or None
+        if repo_data is not Deprecated.PLACEHOLDER:
+            logger.warning(
+                "The repo_data argument is deprecated, ignored, and will be removed soon."
+                " As it was always ignored, it's safe to remove it."
             )
-            repo_data.repo_diff = _repo_diff_verbose(repo, repo_data.repo_hash)
-        elif self.repo_url is not None:
-            repo_data = RemoteRunRepoData.from_url(self.repo_url)
-            if repo_branch is not None:
-                repo_data.repo_branch = repo_branch
-            if repo_hash is not None:
-                repo_data.repo_hash = repo_hash
-        elif repo_data is None:
-            raise RepoError("No remote repo data provided")
+        # _init_from_* methods must set repo_dir, repo_url, and run_repo_data
+        if local_repo_dir is not None:
+            try:
+                self._init_from_repo_dir(local_repo_dir)
+            except git.InvalidGitRepositoryError as e:
+                raise RepoInvalidGitRepositoryError() from e
+            except git.GitError as e:
+                raise RepoGitError() from e
+        elif repo_url is not None:
+            self._init_from_repo_url(repo_url, repo_branch, repo_hash)
+        else:
+            raise RepoError("Neither local repo dir nor repo URL provided")
 
         if repo_id is None:
             repo_id = slugify(
-                repo_data.repo_name,
+                self.run_repo_data.repo_name,
                 GitRepoURL.parse(
                     self.repo_url, get_ssh_config=get_host_config
                 ).get_unique_location(),
             )
         self.repo_id = repo_id
-        self.run_repo_data = repo_data
+
+    def has_code_to_write(self) -> bool:
+        # repo_diff is:
+        # * None for RemoteRepo.from_url()
+        # * empty bytes for RemoteRepo.from_dir() if there are no changes ("clean" state)
+        #   and untracked files
+        # * non-empty bytes for RemoteRepo.from_dir() if there are changes ("dirty" state)
+        #   and/or untracked files
+        return bool(self.run_repo_data.repo_diff)
 
     def write_code_file(self, fp: BinaryIO) -> str:
         if self.run_repo_data.repo_diff is not None:
-            fp.write(self.run_repo_data.repo_diff.encode())
+            fp.write(self.run_repo_data.repo_diff)
         return get_sha256(fp)
 
     def get_repo_info(self) -> RemoteRepoInfo:
         return RemoteRepoInfo(repo_name=self.run_repo_data.repo_name)
+
+    def _init_from_repo_dir(self, repo_dir: PathLike):
+        git_repo = git.Repo(repo_dir)
+        if git_repo.head.is_detached:
+            raise RepoDetachedHeadError()
+        tracking_branch = git_repo.active_branch.tracking_branch()
+        if tracking_branch is None:
+            raise RepoError("No remote branch is configured")
+
+        repo_url = git_repo.remote(tracking_branch.remote_name).url
+        repo_data = RemoteRunRepoData.from_url(repo_url)
+        repo_data.repo_branch = tracking_branch.remote_head
+        repo_data.repo_hash = tracking_branch.commit.hexsha
+        git_config = git_repo.config_reader()
+        if user_name := cast(str, git_config.get_value("user", "name", "")):
+            repo_data.repo_config_name = user_name
+        if user_email := cast(str, git_config.get_value("user", "email", "")):
+            repo_data.repo_config_email = user_email
+        repo_data.repo_diff = _repo_diff_verbose(git_repo, repo_data.repo_hash)
+
+        self.repo_dir = str(repo_dir)
+        self.repo_url = repo_url
+        self.run_repo_data = repo_data
+
+    def _init_from_repo_url(
+        self, repo_url: str, repo_branch: Optional[str], repo_hash: Optional[str]
+    ):
+        repo_data = RemoteRunRepoData.from_url(repo_url)
+        if repo_branch is not None:
+            repo_data.repo_branch = repo_branch
+        if repo_hash is not None:
+            repo_data.repo_hash = repo_hash
+
+        self.repo_dir = None
+        self.repo_url = repo_url
+        self.run_repo_data = repo_data
 
 
 class _DiffCollector:
@@ -198,7 +227,7 @@ class _DiffCollector:
         self.delay = delay
         self.warned = False
         self.start_time = time.monotonic()
-        self.buffer = io.StringIO()
+        self.buffer = io.BytesIO()
 
     def timeout(self):
         now = time.monotonic()
@@ -216,12 +245,28 @@ class _DiffCollector:
         )
 
     def write(self, v: bytes):
-        self.buffer.write(v.decode())
+        self.buffer.write(v)
 
-    def get(self) -> str:
+    def get(self) -> bytes:
         if self.warned:
             print()
         return self.buffer.getvalue()
+
+
+HTTPS_DEFAULT_PORT = 443
+
+
+def _explicit_port(port: Optional[int], default: int) -> Optional[int]:
+    """
+    The port only if it was written explicitly.
+
+    pydantic v2's URL types fill in the scheme's default port, where v1 left `port` as `None`
+    unless the URL spelled it out. Without this, every https repo URL would be rebuilt as
+    `https://github.com:443/...`.
+    """
+    if port is None or port == default:
+        return None
+    return port
 
 
 @dataclass
@@ -236,7 +281,8 @@ class GitRepoURL:
     ssh_port: Optional[str]
     path: str
 
-    original_host: str  # before SSH config lookup
+    original_host: str
+    """`original_host` stores the host value before SSH config lookup."""
 
     @staticmethod
     def parse(
@@ -244,7 +290,7 @@ class GitRepoURL:
         get_ssh_config: Callable[[str], Dict[str, str]] = lambda host: {},
     ) -> "GitRepoURL":
         try:
-            url = pydantic.parse_obj_as(pydantic.AnyUrl, value)
+            url = TypeAdapter(pydantic.AnyUrl).validate_python(value)
         except pydantic.ValidationError:
             url = scp_location_to_ssh_url(value)
 
@@ -257,7 +303,7 @@ class GitRepoURL:
             return GitRepoURL(
                 ssh_user=ssh_config.get("user"),
                 host=url.host.lower(),
-                https_port=url.port,
+                https_port=_explicit_port(url.port, default=HTTPS_DEFAULT_PORT),
                 ssh_port=ssh_config.get("port"),
                 path=url.path or "/",
                 original_host=url.host.lower(),
@@ -265,7 +311,7 @@ class GitRepoURL:
 
         if url.scheme.lower() == "ssh":
             return GitRepoURL(
-                ssh_user=url.user or ssh_config.get("user"),
+                ssh_user=url.username or ssh_config.get("user"),
                 host=ssh_config.get("hostname", "").lower() or url.host.lower(),
                 https_port=None,
                 ssh_port=url.port or ssh_config.get("port"),
@@ -306,7 +352,7 @@ def scp_location_to_ssh_url(scp_location: str) -> Optional[pydantic.AnyHttpUrl]:
         return None
     user, host, path = match.group("user"), match.group("host"), match.group("path")
     try:
-        return pydantic.parse_obj_as(pydantic.AnyUrl, f"ssh://{user}@{host}/{path}")
+        return TypeAdapter(pydantic.AnyUrl).validate_python(f"ssh://{user}@{host}/{path}")
     except pydantic.ValidationError:
         return None
 
@@ -325,10 +371,10 @@ def _interactive_git_proc(
             continue
 
 
-def _repo_diff_verbose(repo: git.Repo, repo_hash: str, warning_time: float = 5) -> str:
+def _repo_diff_verbose(repo: git.Repo, repo_hash: str, warning_time: float = 5) -> bytes:
     collector = _DiffCollector(warning_time)
     try:
-        _interactive_git_proc(repo.git.diff(repo_hash, as_process=True), collector)
+        _interactive_git_proc(repo.git.diff(repo_hash, binary=True, as_process=True), collector)
         for filename in repo.untracked_files:
             _interactive_git_proc(
                 repo.git.diff("/dev/null", filename, no_index=True, binary=True, as_process=True),

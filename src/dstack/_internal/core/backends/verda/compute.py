@@ -1,4 +1,5 @@
 import json
+import os
 from collections.abc import Iterable
 from typing import Dict, List, Optional
 
@@ -10,6 +11,7 @@ from dstack._internal.core.backends.base.backend import Compute
 from dstack._internal.core.backends.base.compute import (
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithPrivilegedSupport,
     ComputeWithVolumeSupport,
     generate_unique_instance_name,
@@ -22,8 +24,15 @@ from dstack._internal.core.backends.base.offers import (
     get_offers_disk_modifier,
 )
 from dstack._internal.core.backends.verda.models import VerdaConfig
-from dstack._internal.core.errors import ComputeError, NoCapacityError
+from dstack._internal.core.errors import (
+    BackendError,
+    ComputeError,
+    NoCapacityError,
+    NotYetTerminated,
+    ProvisioningError,
+)
 from dstack._internal.core.models.backends.base import BackendType
+from dstack._internal.core.models.common import CoreModel, validate_json_extra_ignore
 from dstack._internal.core.models.instances import (
     InstanceAvailability,
     InstanceConfiguration,
@@ -35,6 +44,7 @@ from dstack._internal.core.models.placement import PlacementGroup
 from dstack._internal.core.models.resources import Memory, Range
 from dstack._internal.core.models.runs import Job, JobProvisioningData, Requirements, Run
 from dstack._internal.core.models.volumes import (
+    VerdaVolumeConfiguration,
     Volume,
     VolumeAttachmentData,
     VolumeMountPoint,
@@ -42,7 +52,6 @@ from dstack._internal.core.models.volumes import (
 )
 from dstack._internal.utils.common import get_or_error
 from dstack._internal.utils.logging import get_logger
-from dstack._internal.utils.ssh import get_public_key_fingerprint
 
 logger = get_logger(__name__)
 
@@ -57,6 +66,7 @@ class VerdaCompute(
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
     ComputeWithPrivilegedSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithVolumeSupport,
     Compute,
 ):
@@ -69,7 +79,9 @@ class VerdaCompute(
         )
         self.backend_type = backend_type
 
-    def get_all_offers_with_availability(self) -> List[InstanceOfferWithAvailability]:
+    def get_all_offers_with_availability(
+        self, unallocated_resources: bool
+    ) -> List[InstanceOfferWithAvailability]:
         offers = get_catalog_offers(
             backend=self.backend_type,
             locations=self.config.regions,
@@ -77,29 +89,31 @@ class VerdaCompute(
         offers_with_availability = self._get_offers_with_availability(offers)
         return offers_with_availability
 
-    def get_offers_modifiers(self, requirements: Requirements) -> Iterable[OfferModifier]:
+    def get_offers_modifiers(
+        self, requirements: Requirements, full_offers: bool
+    ) -> Iterable[OfferModifier]:
         return [get_offers_disk_modifier(CONFIGURABLE_DISK_SIZE, requirements)]
 
     def _get_offers_with_availability(
         self, offers: List[InstanceOffer]
     ) -> List[InstanceOfferWithAvailability]:
-        raw_availabilities: List[Dict] = self.client.instances.get_availabilities()
-
         region_availabilities = {}
-        for location in raw_availabilities:
-            location_code = location["location_code"]
-            availabilities = location["availabilities"]
-            for name in availabilities:
-                key = (name, location_code)
-                region_availabilities[key] = InstanceAvailability.AVAILABLE
+        for is_spot in (False, True):
+            raw_availabilities: List[Dict] = self.client.instances.get_availabilities(
+                is_spot=is_spot
+            )
+            for location in raw_availabilities:
+                location_code = location["location_code"]
+                availabilities = location["availabilities"]
+                for name in availabilities:
+                    key = (name, location_code, is_spot)
+                    region_availabilities[key] = InstanceAvailability.AVAILABLE
 
         availability_offers = []
         for offer in offers:
-            key = (offer.instance.name, offer.region)
+            key = (offer.instance.name, offer.region, offer.instance.resources.spot)
             availability = region_availabilities.get(key, InstanceAvailability.NOT_AVAILABLE)
-            availability_offers.append(
-                InstanceOfferWithAvailability(**offer.dict(), availability=availability)
-            )
+            availability_offers.append(offer.with_availability(availability=availability))
 
         return availability_offers
 
@@ -112,16 +126,20 @@ class VerdaCompute(
         project_ssh_private_key: str,
         volumes: List[Volume],
         placement_group: Optional[PlacementGroup],
+        requirements: Requirements,
+        extra_authorized_keys: list[str],
     ) -> JobProvisioningData:
         """
         Override run_job to handle SFS volume mounting.
         SFS volumes are mounted via NFS in the startup script.
         """
-        # Include both user SSH key (if provided) and project SSH key
-        ssh_keys = []
-        if run.run_spec.ssh_key_pub:
-            ssh_keys.append(SSHKey(public=run.run_spec.ssh_key_pub.strip()))
-        ssh_keys.append(SSHKey(public=project_ssh_public_key.strip()))
+        # Fork: authorize the caller's keys (typically the user key) on the Verda host too,
+        # next to the project key, for host-level debug access. Upstream passes them as
+        # `extra_authorized_keys` (VM backends otherwise send them to the shim only).
+        ssh_keys = [SSHKey(public=project_ssh_public_key.strip())]
+        for key in extra_authorized_keys:
+            if key and key.strip():
+                ssh_keys.append(SSHKey(public=key.strip()))
 
         instance_config = InstanceConfiguration(
             project_name=run.project_name,
@@ -129,7 +147,7 @@ class VerdaCompute(
             user=run.user,
             ssh_keys=ssh_keys,
             volumes=volumes,
-            reservation=run.run_spec.configuration.reservation,
+            reservation=requirements.reservation,
             tags=run.run_spec.merged_profile.tags,
         )
 
@@ -137,7 +155,14 @@ class VerdaCompute(
         logger.info(
             "run_job called with %d volumes: %s",
             len(volumes),
-            [(v.name, v.volume_id, v.provisioning_data.backend_data if v.provisioning_data else None) for v in volumes]
+            [
+                (
+                    v.name,
+                    v.volume_id,
+                    v.provisioning_data.backend_data if v.provisioning_data else None,
+                )
+                for v in volumes
+            ],
         )
 
         volume_mounts: Dict[str, str] = {}
@@ -155,13 +180,15 @@ class VerdaCompute(
                             volume_mounts[vol.volume_id] = mount_point.path
                             logger.info(
                                 "Mapped volume %s (id=%s) to mount path %s",
-                                vol.name, vol.volume_id, mount_point.path
+                                vol.name,
+                                vol.volume_id,
+                                mount_point.path,
                             )
                             break
 
         logger.info("Final volume_mounts: %s", volume_mounts)
 
-        instance_offer = instance_offer.copy()
+        instance_offer = instance_offer.model_copy()
         self._restrict_instance_offer_az_to_volumes_az(instance_offer, volumes)
 
         return self.create_instance(
@@ -182,87 +209,100 @@ class VerdaCompute(
             instance_config, max_length=MAX_INSTANCE_NAME_LEN
         )
         public_keys = instance_config.get_public_keys()
-        ssh_ids = []
-        for ssh_public_key in public_keys:
-            ssh_ids.append(
-                # verda allows you to use the same name
-                _get_or_create_ssh_key(
-                    client=self.client,
-                    name=f"dstack-{instance_config.instance_name}.key",
-                    public_key=ssh_public_key,
+        ssh_ids: List[str] = []
+        startup_script_id: Optional[str] = None
+        try:
+            for idx, ssh_public_key in enumerate(public_keys):
+                ssh_ids.append(
+                    _create_ssh_key(
+                        client=self.client,
+                        name=f"{instance_name}-{idx}.key",
+                        public_key=ssh_public_key,
+                    )
                 )
+
+            # Fork: an optional debug SSH key from the server env (DSTACK_DEBUG_SSH_PUBLIC_KEY).
+            # Created per instance like the other keys, so the upstream cleanup removes it.
+            debug_ssh_key = os.environ.get("DSTACK_DEBUG_SSH_PUBLIC_KEY")
+            if debug_ssh_key:
+                logger.info("Adding debug SSH key from DSTACK_DEBUG_SSH_PUBLIC_KEY")
+                ssh_ids.append(
+                    _create_ssh_key(
+                        client=self.client,
+                        name=f"{instance_name}-debug.key",
+                        public_key=debug_ssh_key.strip(),
+                    )
+                )
+
+            # Fork: mount Verda SFS volumes over NFS before the shim starts.
+            sfs_mount_commands = _get_sfs_mount_commands(
+                # getattr: some callers (and upstream tests) pass a config without volumes.
+                volumes=getattr(instance_config, "volumes", None) or [],
+                volume_mounts=volume_mounts or {},
+                instance_region=instance_offer.region,
+            )
+            logger.info(
+                "SFS mount commands for instance %s: %s", instance_name, sfs_mount_commands
+            )
+            commands = sfs_mount_commands + get_shim_commands()
+            startup_script = " ".join([" && ".join(commands)])
+            logger.info(
+                "Full startup script for instance %s: %s",
+                instance_name,
+                startup_script[:500] + "..." if len(startup_script) > 500 else startup_script,
+            )
+            script_name = f"{instance_name}.sh"
+            startup_script_id = _create_startup_script(
+                client=self.client,
+                name=script_name,
+                script=startup_script,
             )
 
-        # Add additional SSH key from environment for debugging (optional)
-        import os
-        debug_ssh_key = os.environ.get("DSTACK_DEBUG_SSH_PUBLIC_KEY")
-        if debug_ssh_key:
-            logger.info("Adding debug SSH key from DSTACK_DEBUG_SSH_PUBLIC_KEY")
-            ssh_ids.append(
-                _get_or_create_ssh_key(
-                    client=self.client,
-                    name="dstack-debug.key",
-                    public_key=debug_ssh_key,
-                )
+            disk_size = round(instance_offer.instance.resources.disk.size_mib / 1024)
+            image_id = _get_vm_image_id(instance_offer)
+
+            logger.debug(
+                "Deploying Verda instance",
+                {
+                    "instance_type": instance_offer.instance.name,
+                    "ssh_key_ids": ssh_ids,
+                    "startup_script_id": startup_script_id,
+                    "hostname": instance_name,
+                    "description": instance_name,
+                    "image": image_id,
+                    "disk_size": disk_size,
+                    "location": instance_offer.region,
+                },
             )
-
-        # Generate SFS mount commands for volumes
-        sfs_mount_commands = _get_sfs_mount_commands(
-            volumes=instance_config.volumes or [],
-            volume_mounts=volume_mounts or {},
-            instance_region=instance_offer.region,
-        )
-
-        logger.info(
-            "SFS mount commands for instance %s: %s",
-            instance_name, sfs_mount_commands
-        )
-
-        # Build startup script with SFS mounts first, then shim commands
-        shim_commands = get_shim_commands()
-        all_commands = sfs_mount_commands + shim_commands
-        startup_script = " ".join([" && ".join(all_commands)])
-
-        logger.info(
-            "Full startup script for instance %s: %s",
-            instance_name, startup_script[:500] + "..." if len(startup_script) > 500 else startup_script
-        )
-
-        script_name = f"dstack-{instance_config.instance_name}.sh"
-        startup_script_ids = _get_or_create_startup_scrpit(
-            client=self.client,
-            name=script_name,
-            script=startup_script,
-        )
-
-        disk_size = round(instance_offer.instance.resources.disk.size_mib / 1024)
-        image_id = _get_vm_image_id(instance_offer)
-
-        logger.debug(
-            "Deploying Verda instance",
-            {
-                "instance_type": instance_offer.instance.name,
-                "ssh_key_ids": ssh_ids,
-                "startup_script_id": startup_script_ids,
-                "hostname": instance_name,
-                "description": instance_name,
-                "image": image_id,
-                "disk_size": disk_size,
-                "location": instance_offer.region,
-            },
-        )
-        instance = _deploy_instance(
-            client=self.client,
-            instance_type=instance_offer.instance.name,
-            ssh_key_ids=ssh_ids,
-            startup_script_id=startup_script_ids,
-            hostname=instance_name,
-            description=instance_name,
-            image=image_id,
-            disk_size=disk_size,
-            is_spot=instance_offer.instance.resources.spot,
-            location=instance_offer.region,
-        )
+            instance = _deploy_instance(
+                client=self.client,
+                instance_type=instance_offer.instance.name,
+                ssh_key_ids=ssh_ids,
+                startup_script_id=startup_script_id,
+                hostname=instance_name,
+                description=instance_name,
+                image=image_id,
+                disk_size=disk_size,
+                is_spot=instance_offer.instance.resources.spot,
+                location=instance_offer.region,
+            )
+        except Exception:
+            # startup_script_id and ssh_key_ids are per-instance. Ensure no leaks on failures.
+            try:
+                _delete_startup_script(self.client, startup_script_id)
+            except Exception:
+                logger.exception(
+                    "Failed to cleanup startup script %s after provisioning failure.",
+                    startup_script_id,
+                )
+            try:
+                _delete_ssh_keys(self.client, ssh_ids)
+            except Exception:
+                logger.exception(
+                    "Failed to cleanup ssh keys %s after provisioning failure.",
+                    ssh_ids,
+                )
+            raise
         return JobProvisioningData(
             backend=instance_offer.backend,
             instance_type=instance_offer.instance,
@@ -275,22 +315,37 @@ class VerdaCompute(
             ssh_port=22,
             dockerized=True,
             ssh_proxy=None,
-            backend_data=None,
+            backend_data=VerdaInstanceBackendData(
+                startup_script_id=startup_script_id,
+                ssh_key_ids=ssh_ids,
+            ).model_dump_json(),
         )
 
     def terminate_instance(
         self, instance_id: str, region: str, backend_data: Optional[str] = None
     ):
+        backend_data_parsed = VerdaInstanceBackendData.load(backend_data)
         try:
-            self.client.instances.action(id_list=[instance_id], action="delete")
+            self.client.instances.action(
+                id_list=[instance_id],
+                action="delete",
+                delete_permanently=True,
+            )
         except APIException as e:
             if e.message in [
                 "Invalid instance id",
                 "Can't discontinue a discontinued instance",
             ]:
                 logger.debug("Skipping instance %s termination. Instance not found.", instance_id)
-                return
-            raise
+            elif e.message == "Can't discontinue a provisioning instance":
+                raise NotYetTerminated(
+                    "Waiting for Verda instance to leave provisioning state."
+                    " Verda forbids terminating provisioning instances"
+                ) from e
+            else:
+                raise
+        _delete_startup_script(self.client, backend_data_parsed.startup_script_id)
+        _delete_ssh_keys(self.client, backend_data_parsed.ssh_key_ids)
 
     def update_provisioning_data(
         self,
@@ -299,7 +354,11 @@ class VerdaCompute(
         project_ssh_private_key: str,
     ):
         instance = _get_instance_by_id(self.client, provisioning_data.instance_id)
-        if instance is not None and instance.status == "running":
+        if instance is None:
+            raise ProvisioningError("Verda instance not found")
+        if instance.status not in ("ordered", "provisioning", "running"):
+            raise ProvisioningError(f"Unexpected Verda instance status: {instance.status!r}")
+        if instance.status == "running":
             provisioning_data.hostname = instance.ip
 
     def register_volume(self, volume: Volume) -> VolumeProvisioningData:
@@ -309,6 +368,7 @@ class VerdaCompute(
         SFS volumes are NFS-based shared filesystems that can be mounted to instances.
         The volume must already exist in Verda and be of type *_Shared (e.g. NVMe_Shared).
         """
+        assert isinstance(volume.configuration, VerdaVolumeConfiguration)
         volume_id = get_or_error(volume.configuration.volume_id)
         volume_data = _get_volume_by_id(self.config, volume_id)
 
@@ -336,11 +396,13 @@ class VerdaCompute(
         size_gb = volume_data.get("size", 0)
 
         # Store SFS-specific data for NFS mounting
-        backend_data = json.dumps({
-            "pseudo_path": pseudo_path,
-            "location_code": location,
-            "volume_type": volume_type,
-        })
+        backend_data = json.dumps(
+            {
+                "pseudo_path": pseudo_path,
+                "location_code": location,
+                "volume_type": volume_type,
+            }
+        )
 
         return VolumeProvisioningData(
             backend=self.backend_type,
@@ -391,10 +453,7 @@ class VerdaCompute(
         volume_id = volume.volume_id
         instance_id = provisioning_data.instance_id
 
-        logger.info(
-            "Attaching SFS volume %s to instance %s",
-            volume_id, instance_id
-        )
+        logger.info("Attaching SFS volume %s to instance %s", volume_id, instance_id)
 
         try:
             token = _get_verda_access_token(
@@ -412,10 +471,7 @@ class VerdaCompute(
                 "instance_ids": [instance_id],
             }
 
-            logger.info(
-                "Calling Verda volume API: PUT /v1/volumes with payload=%s",
-                payload
-            )
+            logger.info("Calling Verda volume API: PUT /v1/volumes with payload=%s", payload)
 
             response = requests.put(
                 "https://api.datacrunch.io/v1/volumes",
@@ -426,7 +482,8 @@ class VerdaCompute(
 
             logger.info(
                 "Verda volume API response: status=%d body=%s",
-                response.status_code, response.text[:500] if response.text else "(empty)"
+                response.status_code,
+                response.text[:500] if response.text else "(empty)",
             )
 
             # 202 Accepted is a valid response - means the request was accepted for async processing
@@ -443,8 +500,7 @@ class VerdaCompute(
                 )
 
             logger.info(
-                "Successfully attached SFS volume %s to instance %s",
-                volume_id, instance_id
+                "Successfully attached SFS volume %s to instance %s", volume_id, instance_id
             )
 
             # SFS volumes don't have a device_name - they're mounted via NFS
@@ -469,8 +525,7 @@ class VerdaCompute(
         instance_id = provisioning_data.instance_id
 
         logger.info(
-            "Detaching SFS volume %s from instance %s (force=%s)",
-            volume_id, instance_id, force
+            "Detaching SFS volume %s from instance %s (force=%s)", volume_id, instance_id, force
         )
 
         try:
@@ -513,13 +568,14 @@ class VerdaCompute(
                 else:
                     logger.warning(
                         "Failed to detach volume %s from instance %s (force=True, ignoring): %s",
-                        volume_id, instance_id, error_msg
+                        volume_id,
+                        instance_id,
+                        error_msg,
                     )
                     return
 
             logger.info(
-                "Successfully detached SFS volume %s from instance %s",
-                volume_id, instance_id
+                "Successfully detached SFS volume %s from instance %s", volume_id, instance_id
             )
 
         except requests.exceptions.RequestException as e:
@@ -527,8 +583,7 @@ class VerdaCompute(
                 raise ComputeError(f"Failed to detach volume {volume_id}: {e}")
             else:
                 logger.warning(
-                    "Failed to detach volume %s (force=True, ignoring): %s",
-                    volume_id, e
+                    "Failed to detach volume %s (force=True, ignoring): %s", volume_id, e
                 )
 
 
@@ -615,13 +670,16 @@ def _get_sfs_mount_commands(
 
     logger.info(
         "_get_sfs_mount_commands: processing %d volumes, volume_mounts=%s",
-        len(volumes), volume_mounts
+        len(volumes),
+        volume_mounts,
     )
 
     # Check if we have any volumes to mount - if so, ensure nfs-common is installed
     has_volumes_to_mount = any(
-        volume.provisioning_data and volume.provisioning_data.backend_data
-        and volume.volume_id and volume.volume_id in volume_mounts
+        volume.provisioning_data
+        and volume.provisioning_data.backend_data
+        and volume.volume_id
+        and volume.volume_id in volume_mounts
         for volume in volumes
     )
     if has_volumes_to_mount:
@@ -636,18 +694,12 @@ def _get_sfs_mount_commands(
 
     for volume in volumes:
         if not volume.provisioning_data or not volume.provisioning_data.backend_data:
-            logger.info(
-                "Skipping volume %s: no provisioning_data or backend_data",
-                volume.name
-            )
+            logger.info("Skipping volume %s: no provisioning_data or backend_data", volume.name)
             continue
 
         volume_id = volume.volume_id
         if not volume_id or volume_id not in volume_mounts:
-            logger.info(
-                "Skipping volume %s (id=%s): not in volume_mounts",
-                volume.name, volume_id
-            )
+            logger.info("Skipping volume %s (id=%s): not in volume_mounts", volume.name, volume_id)
             continue
 
         try:
@@ -682,7 +734,10 @@ def _get_sfs_mount_commands(
 
         logger.info(
             "SFS mount for volume %s: nfs.%s.datacrunch.io:%s -> %s",
-            volume.name, dc, pseudo_path, host_mount_path
+            volume.name,
+            dc,
+            pseudo_path,
+            host_mount_path,
         )
 
     logger.info("_get_sfs_mount_commands: returning %d commands: %s", len(commands), commands)
@@ -690,36 +745,43 @@ def _get_sfs_mount_commands(
 
 
 def _get_vm_image_id(instance_offer: InstanceOfferWithAvailability) -> str:
-    # https://api.verda.com/v1/images
+    # https://api.datacrunch.io/v1/docs#tag/images/GET/v1/images
     if len(instance_offer.instance.resources.gpus) > 0 and instance_offer.instance.resources.gpus[
         0
     ].name in ["V100", "A6000"]:
+        # * A6000: Verda returns "Operating system is not valid for this instance type" for newer images
         # Ubuntu 22.04 + CUDA 12.0 + Docker
         return "2088da25-bb0d-41cc-a191-dccae45d96fd"
-    # Ubuntu 24.04 + CUDA 12.8 Open + Docker
-    return "77777777-4f48-4249-82b3-f199fb9b701b"
+    # Ubuntu 24.04 + CUDA 13.0 Open + Docker
+    return "2404f580-1300-1111-82b3-f199fb9b701b"
 
 
-def _get_or_create_ssh_key(client: VerdaClient, name: str, public_key: str) -> str:
-    fingerprint = get_public_key_fingerprint(public_key)
-    keys = client.ssh_keys.get()
-    found_keys = [key for key in keys if fingerprint == get_public_key_fingerprint(key.public_key)]
-    if found_keys:
-        key = found_keys[0]
+def _create_ssh_key(client: VerdaClient, name: str, public_key: str) -> str:
+    try:
+        key = client.ssh_keys.create(name, public_key)
         return key.id
-    key = client.ssh_keys.create(name, public_key)
-    return key.id
+    except APIException as e:
+        raise BackendError(f"Verda API error while creating SSH key: {e.message}")
 
 
-def _get_or_create_startup_scrpit(client: VerdaClient, name: str, script: str) -> str:
-    scripts = client.startup_scripts.get()
-    found_scripts = [startup_script for startup_script in scripts if script == startup_script]
-    if found_scripts:
-        startup_script = found_scripts[0]
+def _create_startup_script(client: VerdaClient, name: str, script: str) -> str:
+    try:
+        startup_script = client.startup_scripts.create(name, script)
         return startup_script.id
+    except APIException as e:
+        raise BackendError(f"Verda API error while creating startup script: {e.message}")
 
-    startup_script = client.startup_scripts.create(name, script)
-    return startup_script.id
+
+def _delete_startup_script(client: VerdaClient, startup_script_id: Optional[str]) -> None:
+    if startup_script_id is None:
+        return
+    client.startup_scripts.delete_by_id(startup_script_id)
+
+
+def _delete_ssh_keys(client: VerdaClient, ssh_key_ids: Optional[List[str]]) -> None:
+    if not ssh_key_ids:
+        return
+    client.ssh_keys.delete(ssh_key_ids)
 
 
 def _get_instance_by_id(
@@ -758,9 +820,21 @@ def _deploy_instance(
             is_spot=is_spot,
             location=location,
             os_volume={"name": "OS volume", "size": disk_size},
+            wait_for_status=None,  # return asap
         )
     except APIException as e:
         # FIXME: Catch only no capacity errors
         raise NoCapacityError(f"Verda API error: {e.message}")
 
     return instance
+
+
+class VerdaInstanceBackendData(CoreModel):
+    startup_script_id: Optional[str] = None
+    ssh_key_ids: Optional[List[str]] = None
+
+    @classmethod
+    def load(cls, raw: Optional[str]) -> "VerdaInstanceBackendData":
+        if raw is None:
+            return cls()
+        return validate_json_extra_ignore(cls, raw)

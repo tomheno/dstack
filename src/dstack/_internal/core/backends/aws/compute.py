@@ -1,6 +1,8 @@
 import threading
-from collections.abc import Iterable
+from collections.abc import Container, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import boto3
@@ -19,9 +21,13 @@ from dstack._internal.core.backends.aws.models import (
 )
 from dstack._internal.core.backends.base.compute import (
     Compute,
+    ComputeCache,
+    ComputeTTLCache,
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
+    ComputeWithGatewayLoadBalancerSupport,
     ComputeWithGatewaySupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     ComputeWithPlacementGroupSupport,
     ComputeWithPrivateGatewaySupport,
@@ -30,6 +36,7 @@ from dstack._internal.core.backends.base.compute import (
     ComputeWithVolumeSupport,
     generate_unique_gateway_instance_name,
     generate_unique_instance_name,
+    generate_unique_short_backend_name,
     generate_unique_volume_name,
     get_gateway_user_data,
     get_user_data,
@@ -45,12 +52,15 @@ from dstack._internal.core.errors import (
     NoCapacityError,
     PlacementGroupInUseError,
     PlacementGroupNotSupportedError,
+    ProvisioningError,
 )
 from dstack._internal.core.models.backends.base import BackendType
-from dstack._internal.core.models.common import CoreModel
+from dstack._internal.core.models.common import CoreModel, validate_json_extra_ignore
 from dstack._internal.core.models.gateways import (
-    GatewayComputeConfiguration,
-    GatewayProvisioningData,
+    GatewayLoadBalancerConfiguration,
+    GatewayLoadBalancerData,
+    GatewayReplicaConfiguration,
+    GatewayReplicaProvisioningData,
 )
 from dstack._internal.core.models.instances import (
     InstanceAvailability,
@@ -66,6 +76,7 @@ from dstack._internal.core.models.placement import (
 from dstack._internal.core.models.resources import Memory, Range
 from dstack._internal.core.models.runs import JobProvisioningData, Requirements
 from dstack._internal.core.models.volumes import (
+    AWSVolumeConfiguration,
     Volume,
     VolumeAttachmentData,
     VolumeProvisioningData,
@@ -83,6 +94,11 @@ class AWSGatewayBackendData(CoreModel):
     lb_arn: str
     tg_arn: str
     listener_arn: str
+    """Primary listener"""
+    http_listener_arn: Optional[str] = None
+    """Listener for the HTTP->HTTPS redirection.
+    `None` for `certificate: null` gateways and for pre-0.20.17 gateways that have no redirection
+    """
 
 
 class AWSVolumeBackendData(CoreModel):
@@ -90,23 +106,41 @@ class AWSVolumeBackendData(CoreModel):
     iops: int
 
 
+class AWSInstanceBackendData(CoreModel):
+    eip_allocation_id: Optional[str] = None
+    """Elastic IP allocated for multi-ENI instances launched with `public_ips: true`.
+    """
+
+
 def _ec2client_cache_methodkey(self, ec2_client, *args, **kwargs):
     return hashkey(*args, **kwargs)
+
+
+@dataclass
+class AWSQuotasCache(ComputeTTLCache):
+    execution_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class AWSCompute(
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
     ComputeWithPrivilegedSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     ComputeWithReservationSupport,
     ComputeWithPlacementGroupSupport,
     ComputeWithGatewaySupport,
+    ComputeWithGatewayLoadBalancerSupport,
     ComputeWithPrivateGatewaySupport,
     ComputeWithVolumeSupport,
     Compute,
 ):
-    def __init__(self, config: AWSConfig):
+    def __init__(
+        self,
+        config: AWSConfig,
+        quotas_cache: Optional[ComputeTTLCache] = None,
+        zones_cache: Optional[ComputeCache] = None,
+    ):
         super().__init__()
         self.config = config
         if isinstance(config.creds, AWSAccessKeyCreds):
@@ -116,38 +150,36 @@ class AWSCompute(
             )
         else:  # default creds
             self.session = boto3.Session()
+        self._supported_instances = partial(
+            _supported_instances,
+            experimental_instance_types=set(self.config.experimental_instance_types or []),
+        )
         # Caches to avoid redundant API calls when provisioning many instances
         # get_offers is already cached but we still cache its sub-functions
         # with more aggressive/longer caches.
-        self._offers_post_filter_cache_lock = threading.Lock()
-        self._offers_post_filter_cache = TTLCache(maxsize=10, ttl=180)
-        self._get_regions_to_quotas_cache_lock = threading.Lock()
-        self._get_regions_to_quotas_execution_lock = threading.Lock()
-        self._get_regions_to_quotas_cache = TTLCache(maxsize=10, ttl=300)
-        self._get_regions_to_zones_cache_lock = threading.Lock()
-        self._get_regions_to_zones_cache = Cache(maxsize=10)
-        self._get_vpc_id_subnet_id_or_error_cache_lock = threading.Lock()
-        self._get_vpc_id_subnet_id_or_error_cache = TTLCache(maxsize=100, ttl=600)
-        self._get_maximum_efa_interfaces_cache_lock = threading.Lock()
-        self._get_maximum_efa_interfaces_cache = Cache(maxsize=100)
-        self._get_subnets_availability_zones_cache_lock = threading.Lock()
-        self._get_subnets_availability_zones_cache = Cache(maxsize=100)
-        self._create_security_group_cache_lock = threading.Lock()
-        self._create_security_group_cache = TTLCache(maxsize=100, ttl=600)
-        self._get_image_id_and_username_cache_lock = threading.Lock()
-        self._get_image_id_and_username_cache = TTLCache(maxsize=100, ttl=600)
+        self._offers_post_filter_cache = ComputeTTLCache(cache=TTLCache(maxsize=10, ttl=180))
+        if quotas_cache is None:
+            quotas_cache = ComputeTTLCache(cache=TTLCache(maxsize=10, ttl=600))
+        self._regions_to_quotas_cache = quotas_cache
+        if zones_cache is None:
+            zones_cache = ComputeCache(cache=Cache(maxsize=10))
+        self._regions_to_zones_cache = zones_cache
+        self._vpc_id_subnets_ids_cache = ComputeTTLCache(cache=TTLCache(maxsize=100, ttl=600))
+        self._maximum_efa_interfaces_cache = ComputeCache(cache=Cache(maxsize=100))
+        self._subnets_availability_zones_cache = ComputeCache(cache=Cache(maxsize=100))
+        self._security_group_cache = ComputeTTLCache(cache=TTLCache(maxsize=100, ttl=600))
+        self._image_id_and_username_cache = ComputeTTLCache(cache=TTLCache(maxsize=100, ttl=600))
 
-    def get_all_offers_with_availability(self) -> List[InstanceOfferWithAvailability]:
+    def get_all_offers_with_availability(
+        self, unallocated_resources: bool
+    ) -> List[InstanceOfferWithAvailability]:
         offers = get_catalog_offers(
             backend=BackendType.AWS,
             locations=self.config.regions,
-            extra_filter=_supported_instances,
+            extra_filter=self._supported_instances,
         )
         regions = list(set(i.region for i in offers))
-        with self._get_regions_to_quotas_execution_lock:
-            # Cache lock does not prevent concurrent execution.
-            # We use a separate lock to avoid requesting quotas in parallel and hitting rate limits.
-            regions_to_quotas = self._get_regions_to_quotas(self.session, regions)
+        regions_to_quotas = self._get_regions_to_quotas(self.session, regions)
         regions_to_zones = self._get_regions_to_zones(self.session, regions)
 
         availability_offers = []
@@ -157,27 +189,33 @@ class AWSCompute(
             if quota is not None and not quota:
                 availability = InstanceAvailability.NO_QUOTA
             availability_offers.append(
-                InstanceOfferWithAvailability(
-                    **offer.dict(),
+                offer.with_availability(
                     availability=availability,
                     availability_zones=regions_to_zones[offer.region],
                 )
             )
         return availability_offers
 
-    def get_offers_modifiers(self, requirements: Requirements) -> Iterable[OfferModifier]:
+    def get_offers_modifiers(
+        self, requirements: Requirements, full_offers: bool
+    ) -> Iterable[OfferModifier]:
         return [get_offers_disk_modifier(CONFIGURABLE_DISK_SIZE, requirements)]
 
-    def _get_offers_cached_key(self, requirements: Requirements) -> int:
+    def get_offers_post_filter(
+        self, requirements: Requirements
+    ) -> Optional[Callable[[InstanceOfferWithAvailability], bool]]:
+        return self._get_offers_post_filter_cached(requirements)
+
+    def _get_offers_post_filter_cached_key(self, requirements: Requirements) -> int:
         # Requirements is not hashable, so we use a hack to get arguments hash
-        return hash(requirements.json())
+        return hash(requirements.model_dump_json())
 
     @cachedmethod(
-        cache=lambda self: self._offers_post_filter_cache,
-        key=_get_offers_cached_key,
-        lock=lambda self: self._offers_post_filter_cache_lock,
+        cache=lambda self: self._offers_post_filter_cache.cache,
+        key=_get_offers_post_filter_cached_key,
+        lock=lambda self: self._offers_post_filter_cache.lock,
     )
-    def get_offers_post_filter(
+    def _get_offers_post_filter_cached(
         self, requirements: Requirements
     ) -> Optional[Callable[[InstanceOfferWithAvailability], bool]]:
         if requirements.reservation:
@@ -217,6 +255,12 @@ class AWSCompute(
                 logger.debug("Skipping instance %s termination. Instance not found.", instance_id)
             else:
                 raise e
+        instance_backend_data = _parse_instance_backend_data(backend_data)
+        if instance_backend_data.eip_allocation_id is not None:
+            _release_eip(
+                ec2_client=ec2_client,
+                allocation_id=instance_backend_data.eip_allocation_id,
+            )
 
     def create_instance(
         self,
@@ -255,8 +299,9 @@ class AWSCompute(
         )
         enable_efa = max_efa_interfaces > 0
         is_capacity_block = False
+        reservation_tenancy = None
         try:
-            vpc_id, subnet_ids = self._get_vpc_id_subnet_id_or_error(
+            vpc_id, subnets_ids = self._get_vpc_id_subnets_ids_or_error(
                 ec2_client=ec2_client,
                 config=self.config,
                 region=instance_offer.region,
@@ -266,7 +311,7 @@ class AWSCompute(
             subnet_id_to_az_map = self._get_subnets_availability_zones(
                 ec2_client=ec2_client,
                 region=instance_offer.region,
-                subnet_ids=subnet_ids,
+                subnets_ids=subnets_ids,
             )
             if instance_config.reservation:
                 reservation = aws_resources.get_reservation(
@@ -275,6 +320,7 @@ class AWSCompute(
                     instance_count=1,
                 )
                 if reservation is not None:
+                    reservation_tenancy = reservation.get("Tenancy")
                     # Filter out az different from capacity reservation
                     subnet_id_to_az_map = {
                         k: v
@@ -283,35 +329,35 @@ class AWSCompute(
                     }
                     if reservation.get("ReservationType") == "capacity-block":
                         is_capacity_block = True
-
         except botocore.exceptions.ClientError as e:
             logger.warning("Got botocore.exceptions.ClientError: %s", e)
             raise NoCapacityError()
+
         tried_zones = set()
         for subnet_id, az in subnet_id_to_az_map.items():
             if az in tried_zones:
                 continue
             tried_zones.add(az)
+            logger.debug("Trying provisioning %s in %s", instance_offer.instance.name, az)
+            image_id, username = self._get_image_id_and_username(
+                ec2_client=ec2_client,
+                region=instance_offer.region,
+                gpu_name=(
+                    instance_offer.instance.resources.gpus[0].name
+                    if len(instance_offer.instance.resources.gpus) > 0
+                    else None
+                ),
+                instance_type=instance_offer.instance.name,
+                image_config=self.config.os_images,
+            )
+            security_group_id = self._create_security_group(
+                ec2_client=ec2_client,
+                region=instance_offer.region,
+                project_id=project_name,
+                vpc_id=vpc_id,
+            )
             try:
-                logger.debug("Trying provisioning %s in %s", instance_offer.instance.name, az)
-                image_id, username = self._get_image_id_and_username(
-                    ec2_client=ec2_client,
-                    region=instance_offer.region,
-                    gpu_name=(
-                        instance_offer.instance.resources.gpus[0].name
-                        if len(instance_offer.instance.resources.gpus) > 0
-                        else None
-                    ),
-                    instance_type=instance_offer.instance.name,
-                    image_config=self.config.os_images,
-                )
-                security_group_id = self._create_security_group(
-                    ec2_client=ec2_client,
-                    region=instance_offer.region,
-                    project_id=project_name,
-                    vpc_id=vpc_id,
-                )
-                response = ec2_resource.create_instances(
+                response = ec2_resource.create_instances(  # pyright: ignore[reportAttributeAccessIssue]
                     **aws_resources.create_instances_struct(
                         disk_size=disk_size,
                         image_id=image_id,
@@ -333,32 +379,8 @@ class AWSCompute(
                         max_efa_interfaces=max_efa_interfaces,
                         reservation_id=instance_config.reservation,
                         is_capacity_block=is_capacity_block,
+                        tenancy=reservation_tenancy,
                     )
-                )
-                instance = response[0]
-                instance.wait_until_running()
-                instance.reload()  # populate instance.public_ip_address
-                if instance_offer.instance.resources.spot:  # it will not terminate the instance
-                    ec2_client.cancel_spot_instance_requests(
-                        SpotInstanceRequestIds=[instance.spot_instance_request_id]
-                    )
-                hostname = _get_instance_ip(instance, allocate_public_ip)
-                return JobProvisioningData(
-                    backend=instance_offer.backend,
-                    instance_type=instance_offer.instance,
-                    instance_id=instance.instance_id,
-                    public_ip_enabled=allocate_public_ip,
-                    hostname=hostname,
-                    internal_ip=instance.private_ip_address,
-                    region=instance_offer.region,
-                    availability_zone=az,
-                    reservation=instance.capacity_reservation_id,
-                    price=instance_offer.price,
-                    username=username,
-                    ssh_port=22,
-                    dockerized=True,  # because `dstack-shim` is used
-                    ssh_proxy=None,
-                    backend_data=None,
                 )
             except botocore.exceptions.ClientError as e:
                 logger.warning("Got botocore.exceptions.ClientError: %s", e)
@@ -366,7 +388,98 @@ class AWSCompute(
                     msg = e.response["Error"].get("Message", "")
                     raise ComputeError(f"Invalid AWS request: {msg}")
                 continue
+            instance = response[0]
+            # wait_until_running() is only needed so that instance is immediately ready for volume attach.
+            # TODO: Drop wait_until_running() once attach readiness is checked outside.
+            instance.wait_until_running()
+            if instance_offer.instance.resources.spot:
+                # it will not terminate the instance
+                try:
+                    ec2_client.cancel_spot_instance_requests(
+                        SpotInstanceRequestIds=[instance.spot_instance_request_id]
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to cancel spot instance request. The instance will be terminated."
+                    )
+                    self.terminate_instance(
+                        instance_id=instance.instance_id, region=instance_offer.region
+                    )
+                    raise NoCapacityError()
+            return JobProvisioningData(
+                backend=instance_offer.backend,
+                instance_type=instance_offer.instance,
+                instance_id=instance.instance_id,
+                public_ip_enabled=allocate_public_ip,
+                hostname=None,
+                internal_ip=None,
+                region=instance_offer.region,
+                availability_zone=az,
+                reservation=instance.capacity_reservation_id,
+                price=instance_offer.price,
+                username=username,
+                ssh_port=None,
+                dockerized=True,  # because `dstack-shim` is used
+                ssh_proxy=None,
+                backend_data=None,
+            )
         raise NoCapacityError()
+
+    def update_provisioning_data(
+        self,
+        provisioning_data: JobProvisioningData,
+        project_ssh_public_key: str,
+        project_ssh_private_key: str,
+    ):
+        ec2_resource = self.session.resource("ec2", region_name=provisioning_data.region)
+        ec2_client = self.session.client("ec2", region_name=provisioning_data.region)
+        instance = ec2_resource.Instance(provisioning_data.instance_id)  # pyright: ignore[reportAttributeAccessIssue]
+        try:
+            instance.load()
+        except botocore.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] == "InvalidInstanceID.NotFound":
+                logger.debug(
+                    "Instance %s not found. Waiting for the instance to appear"
+                    " or to timeout if the instance is manually deleted.",
+                    provisioning_data.instance_id,
+                )
+                # Instance may be created but not yet visible to due AWS eventual consistency,
+                # so we wait instead of failing immediately.
+                return
+            raise e
+
+        state = instance.state.get("Name")
+        if state == "pending":
+            return
+        if state in [None, "shutting-down", "terminated", "stopping", "stopped"]:
+            raise ProvisioningError(
+                f"Failed to get instance IP address. Instance state is {state}."
+            )
+        if state != "running":
+            raise ProvisioningError(
+                f"Failed to get instance IP address. Unknown instance state {state}."
+            )
+
+        if self.config.allocate_public_ips and instance.public_ip_address is None:
+            # AWS can't auto-assign a public IPv4 to multi-ENI instances (multi-EFA instances).
+            # When `public_ips: true` and no public IP is present after launch, attach an Elastic IP to the primary ENI.
+            # The check relies on running instances always having IP assigned if ever.
+            public_ip, allocation_id = _allocate_and_associate_eip(
+                ec2_client=ec2_client,
+                instance=instance,
+                project_name=_get_project_name_from_instance_tags(instance),
+                backend_tags=self.config.tags,
+            )
+            provisioning_data.backend_data = AWSInstanceBackendData(
+                eip_allocation_id=allocation_id
+            ).model_dump_json()
+            provisioning_data.hostname = public_ip
+        else:
+            provisioning_data.hostname = _get_instance_ip(
+                instance, self.config.allocate_public_ips
+            )
+        provisioning_data.internal_ip = instance.private_ip_address
+        provisioning_data.ssh_port = 22
 
     def create_placement_group(
         self,
@@ -415,10 +528,30 @@ class AWSCompute(
             return False
         return placement_group.configuration.region == instance_offer.region
 
-    def create_gateway(
+    def are_placement_groups_compatible_with_reservation(
         self,
-        configuration: GatewayComputeConfiguration,
-    ) -> GatewayProvisioningData:
+        instance_offer: InstanceOffer,
+        reservation: str,
+    ) -> bool:
+        # AWS rejects launches into Capacity Blocks that specify a placement group.
+        # Capacity Block instances are already placed close together in EC2 UltraClusters.
+        try:
+            capacity_block = aws_resources.get_reservation(
+                ec2_client=self.session.client("ec2", region_name=instance_offer.region),
+                reservation_id=reservation,
+                is_capacity_block=True,
+                active_only=False,
+            )
+        except botocore.exceptions.ClientError as e:
+            logger.warning("Failed to get reservation %s: %s", reservation, e)
+            return True
+        return capacity_block is None
+
+    def create_gateway_replica(
+        self,
+        configuration: GatewayReplicaConfiguration,
+        gateway_backend_data: Optional[str] = None,
+    ) -> GatewayReplicaProvisioningData:
         ec2_resource = self.session.resource("ec2", region_name=configuration.region)
         ec2_client = self.session.client("ec2", region_name=configuration.region)
 
@@ -439,7 +572,7 @@ class AWSCompute(
         tags = aws_resources.filter_invalid_tags(tags)
         tags = aws_resources.make_tags(tags)
 
-        vpc_id, subnets_ids = self._get_vpc_id_subnet_id_or_error(
+        vpc_id, subnets_ids = self._get_vpc_id_subnets_ids_or_error(
             ec2_client=ec2_client,
             config=self.config,
             region=configuration.region,
@@ -460,9 +593,7 @@ class AWSCompute(
             image_id=aws_resources.get_gateway_image_id(ec2_client),
             instance_type=configuration.instance_type or DEFAULT_GATEWAY_INSTANCE_TYPE,
             iam_instance_profile=None,
-            user_data=get_gateway_user_data(
-                configuration.ssh_key_pub, router=configuration.router
-            ),
+            user_data=get_gateway_user_data(configuration.ssh_key_pub),
             tags=tags,
             security_group_id=security_group_id,
             spot=False,
@@ -470,7 +601,7 @@ class AWSCompute(
             allocate_public_ip=configuration.public_ip,
         )
         try:
-            response = ec2_resource.create_instances(**instance_struct)
+            response = ec2_resource.create_instances(**instance_struct)  # pyright: ignore[reportAttributeAccessIssue]
         except botocore.exceptions.ClientError as e:
             msg = f"AWS Error: {e.response['Error']['Code']}"
             if e.response["Error"].get("Message"):
@@ -479,26 +610,66 @@ class AWSCompute(
         instance = response[0]
         instance.wait_until_running()
         instance.reload()  # populate instance.public_ip_address
-        if configuration.certificate is None or configuration.certificate.type != "acm":
-            ip_address = _get_instance_ip(instance, configuration.public_ip)
-            return GatewayProvisioningData(
-                instance_id=instance.instance_id,
-                region=configuration.region,
-                availability_zone=availability_zone,
-                ip_address=ip_address,
-            )
+        ip_address = _get_instance_ip(instance, configuration.public_ip)
+        return GatewayReplicaProvisioningData(
+            instance_id=instance.instance_id,
+            region=configuration.region,
+            availability_zone=availability_zone,
+            ip_address=ip_address,
+        )
 
+    def create_gateway_load_balancer(
+        self,
+        configuration: GatewayLoadBalancerConfiguration,
+    ) -> GatewayLoadBalancerData:
+        """Creates an ALB, target group, and listeners for a gateway."""
+        assert configuration.certificate is None or configuration.certificate.type == "acm"
+
+        ec2_client = self.session.client("ec2", region_name=configuration.region)
         elb_client = self.session.client("elbv2", region_name=configuration.region)
 
-        if len(subnets_ids) < 2:
+        base_tags = {
+            "owner": "dstack",
+            "dstack_project": configuration.project_name,
+            "dstack_name": configuration.gateway_name,
+        }
+        if settings.DSTACK_VERSION is not None:
+            base_tags["dstack_version"] = settings.DSTACK_VERSION
+        tags = merge_tags(
+            base_tags=base_tags,
+            backend_tags=self.config.tags,
+            resource_tags=configuration.tags,
+        )
+        tags = aws_resources.filter_invalid_tags(tags)
+        tags = aws_resources.make_tags(tags)
+
+        vpc_id, subnets_ids = self._get_vpc_id_subnets_ids_or_error(
+            ec2_client=ec2_client,
+            config=self.config,
+            region=configuration.region,
+            allocate_public_ip=configuration.public_ip,
+        )
+        security_group_id = aws_resources.create_gateway_security_group(
+            ec2_client=ec2_client,
+            project_id=configuration.project_name,
+            vpc_id=vpc_id,
+        )
+        lb_subnets_ids = self._get_gateway_lb_subnets_ids(
+            ec2_client=ec2_client, region=configuration.region, subnets_ids=subnets_ids
+        )
+        if len(lb_subnets_ids) < 2:
             raise ComputeError(
-                "Deploying gateway with ACM certificate requires at least two subnets in different AZs"
+                "Deploying a gateway with a load balancer requires at least two subnets"
+                " in different AZs"
             )
 
-        logger.debug("Creating ALB for gateway %s...", configuration.instance_name)
+        # Using short names as LB and target groups have length limit of 32.
+        resources_name_prefix = generate_unique_short_backend_name()
+
+        logger.debug("Creating ALB for gateway %s...", configuration.gateway_name)
         response = elb_client.create_load_balancer(
-            Name=f"{instance_name}-lb",
-            Subnets=subnets_ids,
+            Name=f"{resources_name_prefix}-lb",
+            Subnets=lb_subnets_ids,
             SecurityGroups=[security_group_id],
             Scheme="internet-facing" if configuration.public_ip else "internal",
             Tags=tags,
@@ -508,64 +679,94 @@ class AWSCompute(
         lb = response["LoadBalancers"][0]
         lb_arn = lb["LoadBalancerArn"]
         lb_dns_name = lb["DNSName"]
-        logger.debug("Created ALB for gateway %s.", configuration.instance_name)
+        logger.debug("Created ALB for gateway %s.", configuration.gateway_name)
 
-        logger.debug("Creating Target Group for gateway %s...", configuration.instance_name)
+        logger.debug("Creating Target Group for gateway %s...", configuration.gateway_name)
         response = elb_client.create_target_group(
-            Name=f"{instance_name}-tg",
+            Name=f"{resources_name_prefix}-tg",
             Protocol="HTTP",
             Port=80,
             VpcId=vpc_id,
             TargetType="instance",
         )
         tg_arn = response["TargetGroups"][0]["TargetGroupArn"]
-        logger.debug("Created Target Group for gateway %s", configuration.instance_name)
+        logger.debug("Created Target Group for gateway %s", configuration.gateway_name)
 
-        logger.debug("Registering ALB target for gateway %s...", configuration.instance_name)
-        elb_client.register_targets(
-            TargetGroupArn=tg_arn,
-            Targets=[
-                {"Id": instance.instance_id, "Port": 80},
-            ],
-        )
-        logger.debug("Registered ALB target for gateway %s", configuration.instance_name)
+        if configuration.certificate is not None:
+            logger.debug(
+                "Creating HTTPS ALB listener for gateway %s...", configuration.gateway_name
+            )
+            response = elb_client.create_listener(
+                LoadBalancerArn=lb_arn,
+                Protocol="HTTPS",
+                Port=443,
+                SslPolicy="ELBSecurityPolicy-2016-08",
+                Certificates=[
+                    {"CertificateArn": configuration.certificate.arn},
+                ],
+                DefaultActions=[
+                    {
+                        "Type": "forward",
+                        "TargetGroupArn": tg_arn,
+                    }
+                ],
+            )
+            listener_arn = response["Listeners"][0]["ListenerArn"]
+            logger.debug("Created HTTPS ALB listener for gateway %s", configuration.gateway_name)
 
-        logger.debug("Creating ALB Listener for gateway %s...", configuration.instance_name)
-        response = elb_client.create_listener(
-            LoadBalancerArn=lb_arn,
-            Protocol="HTTPS",
-            Port=443,
-            SslPolicy="ELBSecurityPolicy-2016-08",
-            Certificates=[
-                {"CertificateArn": configuration.certificate.arn},
-            ],
-            DefaultActions=[
-                {
-                    "Type": "forward",
-                    "TargetGroupArn": tg_arn,
-                }
-            ],
-        )
-        listener_arn = response["Listeners"][0]["ListenerArn"]
-        logger.debug("Created ALB Listener for gateway %s", configuration.instance_name)
+            logger.debug(
+                "Creating HTTP ALB listener for gateway %s...", configuration.gateway_name
+            )
+            response = elb_client.create_listener(
+                LoadBalancerArn=lb_arn,
+                Protocol="HTTP",
+                Port=80,
+                DefaultActions=[
+                    {
+                        "Type": "redirect",
+                        "RedirectConfig": {
+                            "Protocol": "HTTPS",
+                            "Port": "443",
+                            "StatusCode": "HTTP_301",
+                        },
+                    }
+                ],
+            )
+            http_listener_arn = response["Listeners"][0]["ListenerArn"]
+            logger.debug("Created HTTP ALB listener for gateway %s", configuration.gateway_name)
+        else:
+            logger.debug(
+                "Creating HTTP ALB listener for gateway %s...", configuration.gateway_name
+            )
+            response = elb_client.create_listener(
+                LoadBalancerArn=lb_arn,
+                Protocol="HTTP",
+                Port=80,
+                DefaultActions=[
+                    {
+                        "Type": "forward",
+                        "TargetGroupArn": tg_arn,
+                    }
+                ],
+            )
+            listener_arn = response["Listeners"][0]["ListenerArn"]
+            http_listener_arn = None
+            logger.debug("Created HTTP ALB listener for gateway %s", configuration.gateway_name)
 
-        ip_address = _get_instance_ip(instance, configuration.public_ip)
-        return GatewayProvisioningData(
-            instance_id=instance.instance_id,
-            region=configuration.region,
-            ip_address=ip_address,
+        return GatewayLoadBalancerData(
             hostname=lb_dns_name,
             backend_data=AWSGatewayBackendData(
                 lb_arn=lb_arn,
                 tg_arn=tg_arn,
                 listener_arn=listener_arn,
-            ).json(),
+                http_listener_arn=http_listener_arn,
+            ).model_dump_json(),
         )
 
-    def terminate_gateway(
+    def terminate_gateway_replica(
         self,
         instance_id: str,
-        configuration: GatewayComputeConfiguration,
+        configuration: GatewayReplicaConfiguration,
         backend_data: Optional[str] = None,
     ):
         self.terminate_instance(
@@ -573,34 +774,115 @@ class AWSCompute(
             region=configuration.region,
             backend_data=None,
         )
-        if configuration.certificate is None or configuration.certificate.type != "acm":
-            return
 
+    def terminate_gateway_load_balancer(
+        self,
+        configuration: GatewayLoadBalancerConfiguration,
+        backend_data: Optional[str],
+    ) -> None:
         if backend_data is None:
             logger.error(
-                "Failed to terminate all gateway %s resources. backend_data is None.",
-                configuration.instance_name,
+                "Failed to terminate load balancer for gateway %s: backend_data is None.",
+                configuration.gateway_name,
             )
             return
-
         try:
-            backend_data_parsed = AWSGatewayBackendData.parse_raw(backend_data)
+            backend_data_parsed = validate_json_extra_ignore(AWSGatewayBackendData, backend_data)
         except ValidationError:
             logger.exception(
-                "Failed to terminate all gateway %s resources. backend_data parsing error.",
-                configuration.instance_name,
+                "Failed to terminate load balancer for gateway %s: backend_data parsing error.",
+                configuration.gateway_name,
             )
             return
 
         elb_client = self.session.client("elbv2", region_name=configuration.region)
 
-        logger.debug("Deleting ALB resources for gateway %s...", configuration.instance_name)
+        logger.debug("Deleting ALB resources for gateway %s...", configuration.gateway_name)
+        if backend_data_parsed.http_listener_arn is not None:
+            elb_client.delete_listener(ListenerArn=backend_data_parsed.http_listener_arn)
         elb_client.delete_listener(ListenerArn=backend_data_parsed.listener_arn)
         elb_client.delete_target_group(TargetGroupArn=backend_data_parsed.tg_arn)
         elb_client.delete_load_balancer(LoadBalancerArn=backend_data_parsed.lb_arn)
-        logger.debug("Deleted ALB resources for gateway %s", configuration.instance_name)
+        logger.debug("Deleted ALB resources for gateway %s.", configuration.gateway_name)
+
+    def register_gateway_replica_with_load_balancer(
+        self,
+        instance_id: str,
+        configuration: GatewayLoadBalancerConfiguration,
+        gateway_backend_data: Optional[str],
+    ) -> None:
+        if gateway_backend_data is None:
+            raise ComputeError(
+                f"Cannot register gateway {configuration.gateway_name} replica with load balancer:"
+                " gateway_backend_data is None"
+            )
+        try:
+            gateway_backend_data_parsed = validate_json_extra_ignore(
+                AWSGatewayBackendData, gateway_backend_data
+            )
+        except ValidationError as e:
+            raise ComputeError(
+                f"Cannot register gateway {configuration.gateway_name} replica with load balancer:"
+                " gateway_backend_data parsing error"
+            ) from e
+
+        elb_client = self.session.client("elbv2", region_name=configuration.region)
+        logger.debug(
+            "Registering gateway %s replica %s with ALB target group %s...",
+            configuration.gateway_name,
+            instance_id,
+            gateway_backend_data_parsed.tg_arn,
+        )
+        elb_client.register_targets(
+            TargetGroupArn=gateway_backend_data_parsed.tg_arn,
+            Targets=[{"Id": instance_id, "Port": 80}],
+        )
+        logger.debug(
+            "Registered gateway %s replica %s with ALB target group.",
+            configuration.gateway_name,
+            instance_id,
+        )
+
+    def deregister_gateway_replica_from_load_balancer(
+        self,
+        instance_id: str,
+        configuration: GatewayLoadBalancerConfiguration,
+        gateway_backend_data: Optional[str],
+    ) -> None:
+        if gateway_backend_data is None:
+            raise ComputeError(
+                f"Cannot deregister gateway {configuration.gateway_name} replica from load balancer:"
+                " gateway_backend_data is None"
+            )
+        try:
+            gateway_backend_data_parsed = validate_json_extra_ignore(
+                AWSGatewayBackendData, gateway_backend_data
+            )
+        except ValidationError as e:
+            raise ComputeError(
+                f"Cannot deregister gateway {configuration.gateway_name} replica from load balancer:"
+                " gateway_backend_data parsing error",
+            ) from e
+
+        elb_client = self.session.client("elbv2", region_name=configuration.region)
+        logger.debug(
+            "Deregistering gateway %s replica %s from ALB target group %s...",
+            configuration.gateway_name,
+            instance_id,
+            gateway_backend_data_parsed.tg_arn,
+        )
+        elb_client.deregister_targets(
+            TargetGroupArn=gateway_backend_data_parsed.tg_arn,
+            Targets=[{"Id": instance_id, "Port": 80}],
+        )
+        logger.debug(
+            "Deregistered gateway %s replica %s from ALB target group.",
+            configuration.gateway_name,
+            instance_id,
+        )
 
     def register_volume(self, volume: Volume) -> VolumeProvisioningData:
+        assert isinstance(volume.configuration, AWSVolumeConfiguration)
         ec2_client = self.session.client("ec2", region_name=volume.configuration.region)
 
         logger.debug("Requesting EBS volume %s", volume.configuration.volume_id)
@@ -624,10 +906,11 @@ class AWSCompute(
             backend_data=AWSVolumeBackendData(
                 volume_type=response_volume["VolumeType"],
                 iops=response_volume["Iops"],
-            ).json(),
+            ).model_dump_json(),
         )
 
     def create_volume(self, volume: Volume) -> VolumeProvisioningData:
+        assert isinstance(volume.configuration, AWSVolumeConfiguration)
         ec2_client = self.session.client("ec2", region_name=volume.configuration.region)
 
         volume_name = generate_unique_volume_name(volume)
@@ -682,10 +965,11 @@ class AWSCompute(
             backend_data=AWSVolumeBackendData(
                 volume_type=response["VolumeType"],
                 iops=iops,
-            ).json(),
+            ).model_dump_json(),
         )
 
     def delete_volume(self, volume: Volume):
+        assert isinstance(volume.configuration, AWSVolumeConfiguration)
         ec2_client = self.session.client("ec2", region_name=volume.configuration.region)
 
         logger.debug("Deleting EBS volume %s", volume.configuration.name)
@@ -701,6 +985,7 @@ class AWSCompute(
     def attach_volume(
         self, volume: Volume, provisioning_data: JobProvisioningData
     ) -> VolumeAttachmentData:
+        assert isinstance(volume.configuration, AWSVolumeConfiguration)
         ec2_client = self.session.client("ec2", region_name=volume.configuration.region)
 
         instance_id = provisioning_data.instance_id
@@ -739,6 +1024,7 @@ class AWSCompute(
     def detach_volume(
         self, volume: Volume, provisioning_data: JobProvisioningData, force: bool = False
     ):
+        assert isinstance(volume.configuration, AWSVolumeConfiguration)
         ec2_client = self.session.client("ec2", region_name=volume.configuration.region)
 
         instance_id = provisioning_data.instance_id
@@ -761,6 +1047,7 @@ class AWSCompute(
         logger.debug("Detached EBS volume %s from instance %s", volume.volume_id, instance_id)
 
     def is_volume_detached(self, volume: Volume, provisioning_data: JobProvisioningData) -> bool:
+        assert isinstance(volume.configuration, AWSVolumeConfiguration)
         ec2_client = self.session.client("ec2", region_name=volume.configuration.region)
 
         instance_id = provisioning_data.instance_id
@@ -789,9 +1076,9 @@ class AWSCompute(
         return hashkey(tuple(regions))
 
     @cachedmethod(
-        cache=lambda self: self._get_regions_to_quotas_cache,
+        cache=lambda self: self._regions_to_quotas_cache.cache,
         key=_get_regions_to_quotas_key,
-        lock=lambda self: self._get_regions_to_quotas_cache_lock,
+        lock=lambda self: self._regions_to_quotas_cache.lock,
     )
     def _get_regions_to_quotas(
         self,
@@ -808,9 +1095,9 @@ class AWSCompute(
         return hashkey(tuple(regions))
 
     @cachedmethod(
-        cache=lambda self: self._get_regions_to_zones_cache,
+        cache=lambda self: self._regions_to_zones_cache.cache,
         key=_get_regions_to_zones_key,
-        lock=lambda self: self._get_regions_to_zones_cache_lock,
+        lock=lambda self: self._regions_to_zones_cache.lock,
     )
     def _get_regions_to_zones(
         self,
@@ -819,7 +1106,7 @@ class AWSCompute(
     ) -> Dict[str, List[str]]:
         return _get_regions_to_zones(session=session, regions=regions)
 
-    def _get_vpc_id_subnet_id_or_error_cache_key(
+    def _get_vpc_id_subnets_ids_or_error_cache_key(
         self,
         ec2_client: botocore.client.BaseClient,
         config: AWSConfig,
@@ -832,11 +1119,11 @@ class AWSCompute(
         )
 
     @cachedmethod(
-        cache=lambda self: self._get_vpc_id_subnet_id_or_error_cache,
-        key=_get_vpc_id_subnet_id_or_error_cache_key,
-        lock=lambda self: self._get_vpc_id_subnet_id_or_error_cache_lock,
+        cache=lambda self: self._vpc_id_subnets_ids_cache.cache,
+        key=_get_vpc_id_subnets_ids_or_error_cache_key,
+        lock=lambda self: self._vpc_id_subnets_ids_cache.lock,
     )
-    def _get_vpc_id_subnet_id_or_error(
+    def _get_vpc_id_subnets_ids_or_error(
         self,
         ec2_client: botocore.client.BaseClient,
         config: AWSConfig,
@@ -844,7 +1131,7 @@ class AWSCompute(
         allocate_public_ip: bool,
         availability_zones: Optional[List[str]] = None,
     ) -> Tuple[str, List[str]]:
-        return get_vpc_id_subnet_id_or_error(
+        return get_vpc_id_subnets_ids_or_error(
             ec2_client=ec2_client,
             config=config,
             region=region,
@@ -853,9 +1140,9 @@ class AWSCompute(
         )
 
     @cachedmethod(
-        cache=lambda self: self._get_maximum_efa_interfaces_cache,
+        cache=lambda self: self._maximum_efa_interfaces_cache.cache,
         key=_ec2client_cache_methodkey,
-        lock=lambda self: self._get_maximum_efa_interfaces_cache_lock,
+        lock=lambda self: self._maximum_efa_interfaces_cache.lock,
     )
     def _get_maximum_efa_interfaces(
         self,
@@ -872,30 +1159,30 @@ class AWSCompute(
         self,
         ec2_client: botocore.client.BaseClient,
         region: str,
-        subnet_ids: List[str],
+        subnets_ids: List[str],
     ) -> tuple:
-        return hashkey(region, tuple(subnet_ids))
+        return hashkey(region, tuple(subnets_ids))
 
     @cachedmethod(
-        cache=lambda self: self._get_subnets_availability_zones_cache,
+        cache=lambda self: self._subnets_availability_zones_cache.cache,
         key=_get_subnets_availability_zones_key,
-        lock=lambda self: self._get_subnets_availability_zones_cache_lock,
+        lock=lambda self: self._subnets_availability_zones_cache.lock,
     )
     def _get_subnets_availability_zones(
         self,
         ec2_client: botocore.client.BaseClient,
         region: str,
-        subnet_ids: List[str],
+        subnets_ids: List[str],
     ) -> Dict[str, str]:
         return aws_resources.get_subnets_availability_zones(
             ec2_client=ec2_client,
-            subnet_ids=subnet_ids,
+            subnets_ids=subnets_ids,
         )
 
     @cachedmethod(
-        cache=lambda self: self._create_security_group_cache,
+        cache=lambda self: self._security_group_cache.cache,
         key=_ec2client_cache_methodkey,
-        lock=lambda self: self._create_security_group_cache_lock,
+        lock=lambda self: self._security_group_cache.lock,
     )
     def _create_security_group(
         self,
@@ -919,13 +1206,16 @@ class AWSCompute(
         image_config: Optional[AWSOSImageConfig] = None,
     ) -> tuple:
         return hashkey(
-            region, gpu_name, instance_type, image_config.json() if image_config else None
+            region,
+            gpu_name,
+            instance_type,
+            image_config.model_dump_json() if image_config else None,
         )
 
     @cachedmethod(
-        cache=lambda self: self._get_image_id_and_username_cache,
+        cache=lambda self: self._image_id_and_username_cache.cache,
         key=_get_image_id_and_username_cache_key,
-        lock=lambda self: self._get_image_id_and_username_cache_lock,
+        lock=lambda self: self._image_id_and_username_cache.lock,
     )
     def _get_image_id_and_username(
         self,
@@ -942,8 +1232,26 @@ class AWSCompute(
             image_config=image_config,
         )
 
+    def _get_gateway_lb_subnets_ids(
+        self,
+        ec2_client: botocore.client.BaseClient,
+        region: str,
+        subnets_ids: List[str],
+    ) -> List[str]:
+        """
+        Returns subnet IDs to be used for gateway Load Balancer among `subnets_ids`.
+        Filters out subnets from the same AZ since Load Balancer requires all subnets to be in different AZ.
+        """
+        subnet_id_to_az_map = self._get_subnets_availability_zones(
+            ec2_client=ec2_client,
+            region=region,
+            subnets_ids=subnets_ids,
+        )
+        az_to_subnet_id_map = {az: subnet_id for subnet_id, az in subnet_id_to_az_map.items()}
+        return list(az_to_subnet_id_map.values())
 
-def get_vpc_id_subnet_id_or_error(
+
+def get_vpc_id_subnets_ids_or_error(
     ec2_client: botocore.client.BaseClient,
     config: AWSConfig,
     region: str,
@@ -974,7 +1282,7 @@ def get_vpc_id_subnet_id_or_error(
         if not config.use_default_vpcs:
             raise ComputeError(f"No VPC ID configured for region {region}")
 
-    return _get_vpc_id_subnet_id_by_vpc_name_or_error(
+    return _get_vpc_id_subnets_ids_by_vpc_name_or_error(
         ec2_client=ec2_client,
         vpc_name=config.vpc_name,
         region=region,
@@ -983,7 +1291,7 @@ def get_vpc_id_subnet_id_or_error(
     )
 
 
-def _get_vpc_id_subnet_id_by_vpc_name_or_error(
+def _get_vpc_id_subnets_ids_by_vpc_name_or_error(
     ec2_client: botocore.client.BaseClient,
     vpc_name: Optional[str],
     region: str,
@@ -1024,23 +1332,46 @@ def _get_vpc_id_subnet_id_by_vpc_name_or_error(
     )
 
 
+_ON_DEMAND_QUOTA_CODES = {
+    "L-1216C47A": "Standard/OnDemand",
+    "L-417A185B": "P/OnDemand",
+    "L-DB2E81BA": "G/OnDemand",
+}
+
+# `GetServiceQuota` errors that say nothing about dstack: the quota stays unknown and
+# the offer availability stays `UNKNOWN`. Any other error code is reported, since it
+# may mean the request is malformed.
+_EXPECTED_QUOTA_ERROR_CODES = {
+    "408",  # request timed out
+    "TooManyRequestsException",  # rate limits
+    "AccessDeniedException",  # no servicequotas:GetServiceQuota permission
+    "AuthFailure",  # invalid, expired, or deactivated credentials
+    "InvalidClientTokenId",
+    "RequestExpired",
+    "UnrecognizedClientException",
+}
+
+
 def _get_regions_to_quotas(
     session: boto3.Session, regions: List[str]
 ) -> Dict[str, Dict[str, int]]:
-    def get_region_quotas(client: botocore.client.BaseClient) -> Dict[str, int]:
+    def get_region_quotas(region_name: str, client: botocore.client.BaseClient) -> Dict[str, int]:
         region_quotas = {}
-        try:
-            for page in client.get_paginator("list_service_quotas").paginate(ServiceCode="ec2"):
-                for q in page["Quotas"]:
-                    if "On-Demand" in q["QuotaName"]:
-                        region_quotas[q["UsageMetric"]["MetricDimensions"]["Class"]] = q["Value"]
-        except botocore.exceptions.ClientError as e:
-            if len(e.args) > 0 and "TooManyRequestsException" in e.args[0]:
-                logger.warning(
-                    "Failed to get quotas due to rate limits. Quotas won't be accounted for."
-                )
-            else:
-                logger.exception(e)
+        for quota_code, quota_class in _ON_DEMAND_QUOTA_CODES.items():
+            try:
+                resp = client.get_service_quota(ServiceCode="ec2", QuotaCode=quota_code)
+                region_quotas[quota_class] = resp["Quota"]["Value"]
+            except botocore.exceptions.ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code in _EXPECTED_QUOTA_ERROR_CODES:
+                    logger.warning(
+                        "Failed to get quota %s in %s: %s",
+                        quota_code,
+                        region_name,
+                        e,
+                    )
+                else:
+                    logger.exception("Failed to get quota %s in %s", quota_code, region_name)
         return region_quotas
 
     regions_to_quotas = {}
@@ -1048,7 +1379,7 @@ def _get_regions_to_quotas(
         future_to_region = {}
         for region in regions:
             future = executor.submit(
-                get_region_quotas, session.client("service-quotas", region_name=region)
+                get_region_quotas, region, session.client("service-quotas", region_name=region)
             )
             future_to_region[future] = region
         for future in as_completed(future_to_region):
@@ -1083,7 +1414,11 @@ def _get_regions_to_zones(session: boto3.Session, regions: List[str]) -> Dict[st
     return regions_to_zones
 
 
-def _supported_instances(offer: InstanceOffer) -> bool:
+def _supported_instances(
+    offer: InstanceOffer, experimental_instance_types: Container[str]
+) -> bool:
+    if offer.instance.name in experimental_instance_types:
+        return True
     for family in [
         "m7i.",
         "c7i.",
@@ -1092,11 +1427,15 @@ def _supported_instances(offer: InstanceOffer) -> bool:
         "t2.small",
         "c5.",
         "m5.",
+        "p6-b300.",
+        "p6-b200.",
         "p5.",
         "p5e.",
+        "p5en.",
         "p4d.",
         "p4de.",
-        "p3.",
+        "g7.",
+        "g7e.",
         "g6.",
         "g6e.",
         "gr6.",
@@ -1143,3 +1482,139 @@ def _get_instance_ip(instance: Any, public_ip: bool) -> str:
 def _get_volume_price(size: int, iops: int) -> float:
     # https://aws.amazon.com/ebs/pricing/
     return size * 0.08 + (iops - 3000) * 0.005
+
+
+def _parse_instance_backend_data(backend_data: Optional[str]) -> "AWSInstanceBackendData":
+    if backend_data is None:
+        return AWSInstanceBackendData()
+    try:
+        return validate_json_extra_ignore(AWSInstanceBackendData, backend_data)
+    except ValidationError:
+        logger.exception("Failed to parse AWS instance backend_data; treating as empty")
+        return AWSInstanceBackendData()
+
+
+def _get_project_name_from_instance_tags(instance: Any) -> Optional[str]:
+    for tag in instance.tags or []:
+        if tag.get("Key") == "dstack_project":
+            return tag.get("Value")
+    return None
+
+
+def _allocate_and_associate_eip(
+    ec2_client: botocore.client.BaseClient,
+    instance: Any,
+    project_name: Optional[str],
+    backend_tags: Optional[Dict[str, str]],
+) -> Tuple[str, str]:
+    """
+    Allocates an Elastic IP and associates it with the primary ENI of `instance`.
+    Returns `(public_ip, allocation_id)`.
+    """
+    primary_nic_id = _get_primary_network_interface_id(instance)
+    tags = {
+        "owner": "dstack",
+        "dstack_instance": instance.instance_id,
+    }
+    if project_name is not None:
+        tags["dstack_project"] = project_name
+    if backend_tags:
+        for k, v in backend_tags.items():
+            tags.setdefault(k, v)
+    tags = aws_resources.filter_invalid_tags(tags)
+
+    try:
+        allocate_response = ec2_client.allocate_address(
+            Domain="vpc",
+            TagSpecifications=[
+                {
+                    "ResourceType": "elastic-ip",
+                    "Tags": aws_resources.make_tags(tags),
+                }
+            ],
+        )
+    except botocore.exceptions.ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        region = ec2_client.meta.region_name
+        if code == "AddressLimitExceeded":
+            raise ProvisioningError(
+                f"Elastic IP quota exceeded in {region}. "
+                "Raise the EC2 'EC2-VPC Elastic IPs' quota in Service Quotas, "
+                "or reduce concurrent multi-EFA instances."
+            )
+        raise ProvisioningError(f"Failed to allocate Elastic IP in {region}: {e}")
+
+    allocation_id = allocate_response["AllocationId"]
+    public_ip = allocate_response["PublicIp"]
+    try:
+        ec2_client.associate_address(
+            AllocationId=allocation_id,
+            NetworkInterfaceId=primary_nic_id,
+            AllowReassociation=False,
+        )
+    except botocore.exceptions.ClientError as e:
+        # Best-effort release; on failure the EIP leaks until manually released.
+        logger.warning(
+            "Failed to associate EIP %s to instance %s; releasing.",
+            allocation_id,
+            instance.instance_id,
+        )
+        try:
+            ec2_client.release_address(AllocationId=allocation_id)
+        except botocore.exceptions.ClientError:
+            logger.exception(
+                "Failed to release just-allocated EIP %s; release it manually.",
+                allocation_id,
+            )
+        raise ProvisioningError(
+            f"Failed to associate Elastic IP {allocation_id} to instance "
+            f"{instance.instance_id}: {e}"
+        )
+    return public_ip, allocation_id
+
+
+def _get_primary_network_interface_id(instance: Any) -> str:
+    for nic in instance.network_interfaces_attribute or []:
+        attachment = nic.get("Attachment") or {}
+        if attachment.get("DeviceIndex") == 0:
+            return nic["NetworkInterfaceId"]
+    raise ProvisioningError(
+        f"Instance {instance.instance_id} has no primary network interface (DeviceIndex=0)"
+    )
+
+
+def _release_eip(ec2_client: botocore.client.BaseClient, allocation_id: str) -> None:
+    """
+    Releases an Elastic IP by allocation ID. Disassociates first if the EIP is still
+    bound to an instance — `TerminateInstances` only initiates shutdown, and AWS
+    auto-disassociates only once the instance reaches `terminated`. Releasing
+    explicitly avoids the `InvalidIPAddress.InUse` race and the retry loop.
+    """
+    try:
+        response = ec2_client.describe_addresses(AllocationIds=[allocation_id])
+    except botocore.exceptions.ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("InvalidAllocationID.NotFound", "InvalidAddress.NotFound"):
+            logger.debug("Skipping EIP %s release. Already released.", allocation_id)
+            return
+        raise
+    addresses = response.get("Addresses", [])
+    if not addresses:
+        return
+    association_id = addresses[0].get("AssociationId")
+    if association_id is not None:
+        try:
+            ec2_client.disassociate_address(AssociationId=association_id)
+        except botocore.exceptions.ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            # AWS may have auto-disassociated between our Describe and Disassociate
+            # if the instance just reached `terminated`. Tolerated.
+            if code != "InvalidAssociationID.NotFound":
+                raise
+    try:
+        ec2_client.release_address(AllocationId=allocation_id)
+    except botocore.exceptions.ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("InvalidAllocationID.NotFound", "InvalidAddress.NotFound"):
+            return
+        raise

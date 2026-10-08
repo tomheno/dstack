@@ -3,18 +3,16 @@ from typing import List, Optional
 import pydantic
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import contains_eager, joinedload
 
 import dstack._internal.server.services.jobs as jobs_services
 from dstack._internal.core.consts import DSTACK_RUNNER_SSH_PORT
-from dstack._internal.core.models.backends.base import BackendType
+from dstack._internal.core.models.common import validate_json_extra_ignore
 from dstack._internal.core.models.configurations import ServiceConfiguration
-from dstack._internal.core.models.instances import RemoteConnectionInfo, SSHConnectionParams
+from dstack._internal.core.models.instances import SSHConnectionParams
 from dstack._internal.core.models.runs import (
     JobProvisioningData,
-    JobSpec,
     JobStatus,
-    RunSpec,
     RunStatus,
     ServiceSpec,
     get_service_port,
@@ -30,9 +28,17 @@ from dstack._internal.proxy.lib.models import (
     TGIChatModelFormat,
 )
 from dstack._internal.proxy.lib.repo import BaseProxyRepo
-from dstack._internal.server.models import JobModel, ProjectModel, RunModel
-from dstack._internal.server.settings import DEFAULT_SERVICE_CLIENT_MAX_BODY_SIZE
+from dstack._internal.server.models import InstanceModel, JobModel, ProjectModel, RunModel
+from dstack._internal.server.services.instances import get_instance_remote_connection_info
+from dstack._internal.server.services.jobs import get_job_spec
+from dstack._internal.server.services.runs import get_run_spec
+from dstack._internal.server.settings import (
+    DEFAULT_SERVICE_CLIENT_MAX_BODY_SIZE,
+    SERVICE_CLIENT_TIMEOUT,
+)
 from dstack._internal.utils.common import get_or_error
+
+_ANY_MODEL_ADAPTER = pydantic.TypeAdapter(AnyModel)
 
 
 class ServerProxyRepo(BaseProxyRepo):
@@ -58,28 +64,36 @@ class ServerProxyRepo(BaseProxyRepo):
                 JobModel.job_num == 0,
             )
             .options(
-                joinedload(JobModel.run),
-                joinedload(JobModel.instance),
+                contains_eager(JobModel.run),
+                contains_eager(JobModel.project),
+                joinedload(JobModel.instance).joinedload(InstanceModel.project),
             )
         )
         jobs = res.unique().scalars().all()
         if not len(jobs):
             return None
         run = jobs[0].run
-        run_spec = RunSpec.__response__.parse_raw(run.run_spec)
+        run_spec = get_run_spec(run)
         if not isinstance(run_spec.configuration, ServiceConfiguration):
             return None
+        router_group = next(
+            (g for g in run_spec.configuration.replica_groups if g.router is not None),
+            None,
+        )
+        has_router_replica = router_group is not None
         replicas = []
         for job in jobs:
-            jpd: JobProvisioningData = JobProvisioningData.__response__.parse_raw(
-                job.job_provisioning_data
+            jpd = validate_json_extra_ignore(
+                JobProvisioningData, get_or_error(job.job_provisioning_data)
             )
             assert jpd.hostname is not None
             assert jpd.ssh_port is not None
+            instance = get_or_error(job.instance)
             if not jpd.dockerized:
                 ssh_destination = f"{jpd.username}@{jpd.hostname}"
                 ssh_port = jpd.ssh_port
                 ssh_proxy = jpd.ssh_proxy
+                ssh_proxy_private_key = None
             else:
                 ssh_destination = "root@localhost"
                 ssh_port = DSTACK_RUNNER_SSH_PORT
@@ -92,28 +106,30 @@ class ServerProxyRepo(BaseProxyRepo):
                     username=jpd.username,
                     port=jpd.ssh_port,
                 )
-                if jpd.backend == BackendType.LOCAL:
-                    ssh_proxy = None
+                ssh_proxy_private_key = None
+                if job.project_id != instance.project_id:
+                    ssh_proxy_private_key = instance.project.ssh_private_key
             ssh_head_proxy: Optional[SSHConnectionParams] = None
             ssh_head_proxy_private_key: Optional[str] = None
-            instance = get_or_error(job.instance)
-            if instance.remote_connection_info is not None:
-                rci = RemoteConnectionInfo.__response__.parse_raw(instance.remote_connection_info)
-                if rci.ssh_proxy is not None:
-                    ssh_head_proxy = rci.ssh_proxy
-                    ssh_head_proxy_private_key = get_or_error(rci.ssh_proxy_keys)[0].private
-            job_spec: JobSpec = JobSpec.__response__.parse_raw(job.job_spec_data)
+            rci = get_instance_remote_connection_info(instance)
+            if rci is not None and rci.ssh_proxy is not None:
+                ssh_head_proxy = rci.ssh_proxy
+                ssh_head_proxy_private_key = get_or_error(rci.ssh_proxy_keys)[0].private
+            job_spec = get_job_spec(job)
             replica = Replica(
                 id=job.id.hex,
                 app_port=get_service_port(job_spec, run_spec.configuration),
                 ssh_destination=ssh_destination,
                 ssh_port=ssh_port,
                 ssh_proxy=ssh_proxy,
+                ssh_proxy_private_key=ssh_proxy_private_key,
                 ssh_head_proxy=ssh_head_proxy,
                 ssh_head_proxy_private_key=ssh_head_proxy_private_key,
+                internal_ip=jpd.internal_ip,
             )
             replicas.append(replica)
         return Service(
+            id=run.id.hex,
             project_name=project_name,
             run_name=run.run_name,
             domain=None,
@@ -122,6 +138,8 @@ class ServerProxyRepo(BaseProxyRepo):
             client_max_body_size=DEFAULT_SERVICE_CLIENT_MAX_BODY_SIZE,
             strip_prefix=run_spec.configuration.strip_prefix,
             replicas=tuple(replicas),
+            has_router_replica=has_router_replica,
+            read_timeout=SERVICE_CLIENT_TIMEOUT,
         )
 
     async def list_models(self, project_name: str) -> List[ChatModel]:
@@ -137,12 +155,12 @@ class ServerProxyRepo(BaseProxyRepo):
         )
         models = []
         for run in res.scalars().all():
-            service_spec: ServiceSpec = ServiceSpec.__response__.parse_raw(run.service_spec)
+            service_spec = validate_json_extra_ignore(ServiceSpec, get_or_error(run.service_spec))
             model_spec = service_spec.model
             model_options_obj = service_spec.options.get("openai", {}).get("model")
             if model_spec is None or model_options_obj is None:
                 continue
-            model_options = pydantic.parse_obj_as(AnyModel, model_options_obj)  # type: ignore[arg-type]
+            model_options = _ANY_MODEL_ADAPTER.validate_python(model_options_obj)
             model = ChatModel(
                 project_name=project_name,
                 name=model_spec.name,

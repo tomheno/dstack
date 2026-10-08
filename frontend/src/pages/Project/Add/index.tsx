@@ -1,21 +1,135 @@
-import React from 'react';
+import React, { useState } from 'react';
+import { Controller, useForm } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
+import { isNil } from 'lodash';
+import * as yup from 'yup';
+import { WizardProps } from '@cloudscape-design/components';
 
-import { ContentLayout, Header } from 'components';
+import {
+    Container,
+    FormField,
+    FormInput,
+    FormToggle,
+    InfoLink,
+    KeyValuePairs,
+    SelectCSD,
+    SpaceBetween,
+    Wizard,
+} from 'components';
 
-import { useBreadcrumbs, useNotifications } from 'hooks';
-import { getServerError } from 'libs';
+import { useBreadcrumbs, useConfirmationDialog, useHelpPanel, useNotifications } from 'hooks';
+import { isResponseServerError, isResponseServerFormFieldError } from 'libs';
 import { ROUTES } from 'routes';
+import { useApplyFleetMutation } from 'services/fleet';
 import { useCreateProjectMutation } from 'services/project';
 
-import { ProjectForm } from '../Form';
+import { FleetFormFields } from 'pages/Fleets/Add/FleetFormFields';
+import {
+    fleetFormDefaultValues,
+    getMaxInstancesValidator,
+    getMinInstancesValidator,
+    idleDurationValidator,
+} from 'pages/Fleets/Add/FleetFormFields/constants';
+
+import { DEFAULT_FLEET_INFO } from '../constants';
+import { useYupValidationResolver } from '../hooks/useYupValidationResolver';
+
+import { IProjectForm } from '../Form/types';
+import { FieldPath } from 'react-hook-form/dist/types/path';
+
+const requiredFieldError = 'This is required field';
+const namesFieldError = 'Only latin characters, dashes, underscores, and digits';
+
+const fleetStepIndex = 1;
+
+const projectValidationSchema = yup.object({
+    project_name: yup
+        .string()
+        .required(requiredFieldError)
+        .matches(/^[a-zA-Z0-9-_]+$/, namesFieldError),
+    is_public: yup.boolean(),
+    fleet: yup.object().shape({
+        min_instances: yup.number().when('enable_default', {
+            is: true,
+            then: getMinInstancesValidator('max_instances'),
+        }),
+        max_instances: yup.number().when('enable_default', {
+            is: true,
+            then: getMaxInstancesValidator('min_instances'),
+        }),
+        idle_duration: yup.string().when('enable_default', {
+            is: true,
+            then: idleDurationValidator,
+        }),
+        spot_policy: yup.string().required(requiredFieldError),
+    }),
+});
 
 export const ProjectAdd: React.FC = () => {
     const { t } = useTranslation();
     const navigate = useNavigate();
     const [pushNotification] = useNotifications();
+    const [openConfirmationDialog] = useConfirmationDialog();
+    const [openHelpPanel] = useHelpPanel();
     const [createProject, { isLoading }] = useCreateProjectMutation();
+    const [applyFleet, { isLoading: isApplyingFleet }] = useApplyFleetMutation();
+    const [activeStepIndex, setActiveStepIndex] = useState(0);
+    const resolver = useYupValidationResolver(projectValidationSchema);
+
+    const loading = isLoading || isApplyingFleet;
+
+    const formMethods = useForm<IProjectForm>({
+        resolver,
+        defaultValues: {
+            is_public: false,
+            fleet: {
+                ...fleetFormDefaultValues,
+                enable_default: true,
+            },
+        },
+    });
+
+    const { handleSubmit, control, setError, clearErrors, trigger, watch, getValues } = formMethods;
+    const formValues = watch();
+
+    const visibilityOptions = [
+        { label: t('projects.edit.visibility.private'), value: 'private' },
+        { label: t('projects.edit.visibility.public'), value: 'public' },
+    ];
+
+    const getFormValuesForServer = (): IProjectCreateRequestParams => {
+        const { project_name, is_public } = getValues();
+
+        return {
+            project_name,
+            is_public,
+        };
+    };
+
+    const getFormValuesForFleetApplying = (): IApplyFleetPlanRequestRequest => {
+        const {
+            fleet: { min_instances, max_instances, idle_duration, name, spot_policy },
+        } = getValues();
+
+        return {
+            plan: {
+                spec: {
+                    configuration: {
+                        ...(name ? { name } : {}),
+                        nodes: {
+                            min: min_instances,
+                            ...(max_instances ? { max: max_instances } : {}),
+                        },
+                        ...(idle_duration ? { idle_duration } : {}),
+                        spot_policy,
+                    },
+                    profile: {},
+                },
+            },
+            force: false,
+        };
+    };
 
     useBreadcrumbs([
         {
@@ -23,40 +137,251 @@ export const ProjectAdd: React.FC = () => {
             href: ROUTES.PROJECT.LIST,
         },
         {
-            text: t('common.create', { text: t('navigation.project') }),
+            text: t('common.create_wit_text', { text: t('navigation.project') }),
             href: ROUTES.PROJECT.ADD,
         },
     ]);
+
+    const validateNameAndType = async () => {
+        return await trigger(['project_name', 'is_public']);
+    };
+    const validateFleet = async () => {
+        return await trigger(['fleet.enable_default', 'fleet.min_instances', 'fleet.max_instances', 'fleet.idle_duration']);
+    };
+
+    const emptyValidator = async () => Promise.resolve(true);
+
+    const onNavigate = ({
+        requestedStepIndex,
+        reason,
+    }: {
+        requestedStepIndex: number;
+        reason: WizardProps.NavigationReason;
+    }) => {
+        const stepValidators = [validateNameAndType, validateFleet, emptyValidator];
+
+        if (reason === 'next') {
+            stepValidators[activeStepIndex]?.().then((isValid) => {
+                if (isValid) {
+                    if (activeStepIndex === fleetStepIndex && formValues?.['fleet']['min_instances'] > 0) {
+                        openConfirmationDialog({
+                            title: 'Are sure want to set min instances above than 0?',
+                            content: null,
+                            onConfirm: () => setActiveStepIndex(requestedStepIndex),
+                        });
+                    } else {
+                        setActiveStepIndex(requestedStepIndex);
+                    }
+                }
+            });
+        } else {
+            setActiveStepIndex(requestedStepIndex);
+        }
+    };
+
+    const onNavigateHandler: WizardProps['onNavigate'] = ({ detail: { requestedStepIndex, reason } }) => {
+        onNavigate({ requestedStepIndex, reason });
+    };
 
     const onCancelHandler = () => {
         navigate(ROUTES.PROJECT.LIST);
     };
 
-    const onSubmitHandler = async (data: IProject): Promise<IProject> => {
-        const request = createProject(data).unwrap();
+    const onSubmitWizard = async () => {
+        const isValid = await trigger();
+
+        const { fleet } = getValues();
+
+        if (!isValid) {
+            return;
+        }
+
+        clearErrors();
+
+        const request = createProject(getFormValuesForServer()).unwrap();
 
         request
-            .then((data) => {
+            .then(async (data) => {
                 pushNotification({
                     type: 'success',
                     content: t('projects.create.success_notification'),
                 });
 
+                if (fleet.enable_default) {
+                    await applyFleet({
+                        projectName: data.project_name,
+                        ...getFormValuesForFleetApplying(),
+                    }).unwrap();
+                }
+
                 navigate(ROUTES.PROJECT.DETAILS.SETTINGS.FORMAT(data.project_name));
             })
             .catch((error) => {
-                pushNotification({
-                    type: 'error',
-                    content: t('common.server_error', { error: getServerError(error) }),
-                });
-            });
+                const errorRequestData = error?.data;
 
-        return request;
+                if (isResponseServerError(errorRequestData)) {
+                    errorRequestData.detail.forEach((error) => {
+                        if (isResponseServerFormFieldError(error)) {
+                            setError(error.loc.join('.') as FieldPath<IProjectForm>, { type: 'custom', message: error.msg });
+                        } else {
+                            pushNotification({
+                                type: 'error',
+                                content: t('common.server_error', { error: error.msg }),
+                            });
+                        }
+                    });
+                } else {
+                    pushNotification({
+                        type: 'error',
+                        content: t('common.server_error', { error: error?.error ?? error }),
+                    });
+                }
+            });
+    };
+
+    const onSubmit = () => {
+        if (activeStepIndex < 2) {
+            onNavigate({ requestedStepIndex: activeStepIndex + 1, reason: 'next' });
+        } else {
+            onSubmitWizard().catch(console.log);
+        }
+    };
+
+    const getDefaultFleetSummary = () => {
+        const summaryFields: Array<keyof IProjectForm['fleet']> = [
+            'name',
+            'min_instances',
+            'max_instances',
+            'idle_duration',
+            'spot_policy',
+        ];
+
+        const result: string[] = [];
+
+        summaryFields.forEach((fieldName) => {
+            if (!isNil(formValues?.fleet?.[fieldName])) {
+                result.push(`${t(`fleets.edit.${fieldName}`)}: ${formValues['fleet'][fieldName]}`);
+            }
+        });
+
+        return result.join(', ');
     };
 
     return (
-        <ContentLayout header={<Header variant="awsui-h1-sticky">{t('projects.create.page_title')}</Header>}>
-            <ProjectForm onSubmit={onSubmitHandler} loading={isLoading} onCancel={onCancelHandler} />
-        </ContentLayout>
+        <form onSubmit={handleSubmit(onSubmit)}>
+            <Wizard
+                activeStepIndex={activeStepIndex}
+                onNavigate={onNavigateHandler}
+                onSubmit={onSubmitWizard}
+                i18nStrings={{
+                    stepNumberLabel: (stepNumber) => `Step ${stepNumber}`,
+                    navigationAriaLabel: 'Steps',
+                    cancelButton: t('common.cancel'),
+                    previousButton: t('common.previous'),
+                    nextButton: t('common.next'),
+                    optional: 'optional',
+                }}
+                onCancel={onCancelHandler}
+                submitButtonText={t('projects.wizard.submit')}
+                steps={[
+                    {
+                        title: 'Name and visibility',
+                        content: (
+                            <Container>
+                                <SpaceBetween direction="vertical" size="l">
+                                    <FormInput
+                                        label={t('projects.edit.project_name')}
+                                        description={t('projects.edit.project_name_description')}
+                                        control={control}
+                                        name="project_name"
+                                        disabled={loading}
+                                    />
+
+                                    <Controller
+                                        control={control}
+                                        name="is_public"
+                                        render={({ field, fieldState: { error } }) => (
+                                            <FormField
+                                                label={t('projects.edit.project_visibility')}
+                                                description={
+                                                    field.value
+                                                        ? 'Any authorized user can see this project and join it as a member'
+                                                        : 'Only project members and global admins can access this project'
+                                                }
+                                                errorText={error?.message}
+                                            >
+                                                <SelectCSD
+                                                    ref={field.ref}
+                                                    options={visibilityOptions}
+                                                    selectedOption={visibilityOptions[field.value ? 1 : 0]}
+                                                    onChange={({ detail }) =>
+                                                        field.onChange(detail.selectedOption.value === 'public')
+                                                    }
+                                                    onBlur={field.onBlur}
+                                                    disabled={loading}
+                                                    expandToViewport
+                                                    filteringType="auto"
+                                                />
+                                            </FormField>
+                                        )}
+                                    />
+                                </SpaceBetween>
+                            </Container>
+                        ),
+                    },
+                    {
+                        title: 'Fleets',
+                        content: (
+                            <Container>
+                                <SpaceBetween direction="vertical" size="l">
+                                    <FormToggle
+                                        toggleLabel={<strong>{t('projects.edit.default_fleet')}</strong>}
+                                        constraintText={t('projects.edit.default_fleet_description')}
+                                        toggleInfo={<InfoLink onFollow={() => openHelpPanel(DEFAULT_FLEET_INFO)} />}
+                                        control={control}
+                                        name="fleet.enable_default"
+                                    />
+
+                                    {formValues['fleet']['enable_default'] && (
+                                        <FleetFormFields<IProjectForm>
+                                            control={control}
+                                            disabledAllFields={loading}
+                                            fieldNamePrefix="fleet"
+                                        />
+                                    )}
+                                </SpaceBetween>
+                            </Container>
+                        ),
+                    },
+                    {
+                        title: 'Summary',
+                        content: (
+                            <Container>
+                                <KeyValuePairs
+                                    items={[
+                                        {
+                                            label: t('projects.edit.project_name'),
+                                            value: formValues['project_name'],
+                                        },
+                                        {
+                                            label: t('projects.edit.project_visibility'),
+                                            value: visibilityOptions[formValues.is_public ? 1 : 0].label,
+                                        },
+                                        ...(formValues['fleet']['enable_default']
+                                            ? [
+                                                  {
+                                                      label: 'Default fleet',
+                                                      value: getDefaultFleetSummary(),
+                                                  },
+                                              ]
+                                            : []),
+                                    ]}
+                                />
+                            </Container>
+                        ),
+                    },
+                ]}
+            />
+        </form>
     );
 };

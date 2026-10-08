@@ -4,13 +4,14 @@ from typing import Optional
 from unittest.mock import Mock
 
 import pytest
+from freezegun import freeze_time
 from rich.table import Table
 from rich.text import Text
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from dstack._internal.cli.utils.run import get_runs_table
+from dstack._internal.cli.utils.run import _format_pull_progress, get_runs_table
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.configurations import (
     AnyRunConfiguration,
@@ -21,6 +22,7 @@ from dstack._internal.core.models.instances import Disk, InstanceType, Resources
 from dstack._internal.core.models.profiles import Profile
 from dstack._internal.core.models.resources import Range
 from dstack._internal.core.models.runs import (
+    ImagePullProgress,
     JobProvisioningData,
     JobStatus,
     JobTerminationReason,
@@ -200,16 +202,15 @@ async def create_run_with_job(
     )
 
 
-pytestmark = [
-    pytest.mark.asyncio,
-    pytest.mark.usefixtures("test_db", "image_config_mock"),
-    pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True),
-]
-
-
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("test_db", "image_config_mock")
+@pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
 class TestGetRunsTable:
+    @freeze_time(datetime(2026, 1, 1))
     async def test_simple_run(self, session: AsyncSession):
-        api_run = await create_run_with_job(session=session)
+        api_run = await create_run_with_job(
+            session=session, submitted_at=datetime(2023, 1, 1, tzinfo=timezone.utc)
+        )
         table = get_runs_table([api_run], verbose=False)
 
         cells = get_table_cells(table)
@@ -254,7 +255,7 @@ class TestGetRunsTable:
                 JobTerminationReason.FAILED_TO_START_DUE_TO_NO_CAPACITY,
                 None,
                 None,
-                "no offers",
+                "no capacity",
                 "gold1",
             ),
             (
@@ -519,3 +520,62 @@ class TestGetRunsTable:
             assert f"replica={i - 1}" in job_row["NAME"]
             assert "job=" not in job_row["NAME"]
             assert job_row["STATUS"] == "running"
+
+
+@pytest.mark.parametrize(
+    "progress,expected",
+    [
+        pytest.param(
+            ImagePullProgress(
+                downloaded_bytes=300 * 2**20,
+                extracted_bytes=200 * 2**20,
+                total_bytes=500 * 2**20,
+                is_total_bytes_final=True,
+            ),
+            "200/300/500MB",
+            id="mb_final",
+        ),
+        pytest.param(
+            ImagePullProgress(
+                downloaded_bytes=300 * 2**20,
+                extracted_bytes=200 * 2**20,
+                total_bytes=500 * 2**20,
+                is_total_bytes_final=False,
+            ),
+            "200/300/≥500MB",
+            id="mb_non_final",
+        ),
+        pytest.param(
+            ImagePullProgress(
+                downloaded_bytes=int(1.5 * 2**30),
+                extracted_bytes=1 * 2**30,
+                total_bytes=2 * 2**30,
+                is_total_bytes_final=True,
+            ),
+            "1.00/1.50/2.00GB",
+            id="gb_final",
+        ),
+        pytest.param(
+            ImagePullProgress(
+                downloaded_bytes=int(1.5 * 2**30),
+                extracted_bytes=1 * 2**30,
+                total_bytes=2 * 2**30,
+                is_total_bytes_final=False,
+            ),
+            "1.00/1.50/≥2.00GB",
+            id="gb_non_final",
+        ),
+        pytest.param(
+            ImagePullProgress(
+                downloaded_bytes=0,
+                extracted_bytes=0,
+                total_bytes=2**30,
+                is_total_bytes_final=True,
+            ),
+            "0.00/0.00/1.00GB",
+            id="gb_boundary",
+        ),
+    ],
+)
+def test_format_pull_progress(progress: ImagePullProgress, expected: str) -> None:
+    assert _format_pull_progress(progress) == expected

@@ -7,7 +7,6 @@ require (
 	github.com/alexellis/go-execute/v2 v2.2.1
 	github.com/bluekeyes/go-gitdiff v0.7.2
 	github.com/codeclysm/extract/v4 v4.0.0
-	github.com/creack/pty v1.1.24
 	github.com/docker/docker v26.0.0+incompatible
 	github.com/docker/go-connections v0.5.0
 	github.com/docker/go-units v0.5.0
@@ -23,6 +22,7 @@ require (
 	github.com/urfave/cli/v3 v3.6.1
 	golang.org/x/crypto v0.22.0
 	golang.org/x/sys v0.26.0
+	kernel.org/pub/linux/libs/security/libcap/cap v1.2.77
 )
 
 require (
@@ -84,4 +84,5 @@ require (
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gotest.tools/v3 v3.5.1 // indirect
+	kernel.org/pub/linux/libs/security/libcap/psx v1.2.77 // indirect
 )

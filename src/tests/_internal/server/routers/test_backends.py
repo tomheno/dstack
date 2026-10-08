@@ -1,5 +1,4 @@
 import json
-import sys
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -87,18 +86,22 @@ class TestListBackendTypes:
             "aws",
             "azure",
             "cloudrift",
-            "cudo",
-            *(["datacrunch"] if sys.version_info >= (3, 10) else []),
+            "crusoe",
+            "datacrunch",
+            "daytona",
             "digitalocean",
             "gcp",
             "hotaisle",
+            "jarvislabs",
             "kubernetes",
             "lambda",
-            *(["nebius"] if sys.version_info >= (3, 10) else []),
+            "nebius",
             "oci",
             "runpod",
+            "slurm",
+            "seeweb",
             "vastai",
-            *(["verda"] if sys.version_info >= (3, 10) else []),
+            "verda",
             "vultr",
         ]
 
@@ -140,7 +143,7 @@ class TestCreateBackend:
         }
         with (
             patch("dstack._internal.core.backends.aws.auth.authenticate"),
-            patch("dstack._internal.core.backends.aws.compute.get_vpc_id_subnet_id_or_error"),
+            patch("dstack._internal.core.backends.aws.compute.get_vpc_id_subnets_ids_or_error"),
         ):
             response = await client.post(
                 f"/api/project/{project.name}/backends/create",
@@ -149,7 +152,11 @@ class TestCreateBackend:
             )
         assert response.status_code == 200, response.json()
         res = await session.execute(select(BackendModel))
-        assert len(res.scalars().all()) == 1
+        backend = res.scalars().one()
+        assert backend.source_config is not None
+        assert backend.source_auth is not None
+        assert json.loads(backend.source_config)["regions"] == ["us-west-1"]
+        assert json.loads(backend.source_auth.get_plaintext_or_error()) == body["creds"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -216,7 +223,6 @@ class TestCreateBackend:
         assert len(res.scalars().all()) == 1
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(sys.version_info < (3, 10), reason="Nebius requires Python 3.10")
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
     class TestNebius:
         @pytest.fixture(autouse=True)
@@ -488,9 +494,15 @@ class TestCreateBackend:
         }
         with (
             patch("dstack._internal.core.backends.azure.auth.authenticate") as authenticate_mock,
-            patch("azure.mgmt.subscription.SubscriptionClient") as SubscriptionClientMock,
-            patch("azure.mgmt.resource.ResourceManagementClient") as ResourceManagementClientMock,
-            patch("azure.mgmt.network.NetworkManagementClient") as NetworkManagementClientMock,
+            patch(
+                "dstack._internal.core.backends.azure.configurator.subscription_mgmt.SubscriptionClient"
+            ) as SubscriptionClientMock,
+            patch(
+                "dstack._internal.core.backends.azure.configurator.resource_mgmt.ResourceManagementClient"
+            ) as ResourceManagementClientMock,
+            patch(
+                "dstack._internal.core.backends.azure.configurator.network_mgmt.NetworkManagementClient"
+            ) as NetworkManagementClientMock,
         ):
             authenticate_mock.return_value = None, "test_tenant"
             subscription_client_mock = SubscriptionClientMock.return_value
@@ -541,7 +553,7 @@ class TestCreateBackend:
         }
         with (
             patch("dstack._internal.core.backends.aws.auth.authenticate"),
-            patch("dstack._internal.core.backends.aws.compute.get_vpc_id_subnet_id_or_error"),
+            patch("dstack._internal.core.backends.aws.compute.get_vpc_id_subnets_ids_or_error"),
         ):
             response = await client.post(
                 f"/api/project/{project.name}/backends/create",
@@ -604,7 +616,7 @@ class TestUpdateBackend:
         }
         with (
             patch("dstack._internal.core.backends.aws.auth.authenticate"),
-            patch("dstack._internal.core.backends.aws.compute.get_vpc_id_subnet_id_or_error"),
+            patch("dstack._internal.core.backends.aws.compute.get_vpc_id_subnets_ids_or_error"),
         ):
             response = await client.post(
                 f"/api/project/{project.name}/backends/update",
@@ -614,6 +626,10 @@ class TestUpdateBackend:
         assert response.status_code == 200, response.json()
         await session.refresh(backend)
         assert json.loads(backend.config)["regions"] == ["us-east-1"]
+        assert backend.source_config is not None
+        assert backend.source_auth is not None
+        assert json.loads(backend.source_config)["regions"] == ["us-east-1"]
+        assert json.loads(backend.source_auth.get_plaintext_or_error()) == body["creds"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -814,7 +830,8 @@ class TestGetConfigInfo:
             "iam_instance_profile": None,
             "tags": None,
             "os_images": None,
-            "creds": json.loads(backend.auth.plaintext),
+            "experimental_instance_types": None,
+            "creds": json.loads(backend.auth.get_plaintext_or_error()),
         }
 
 
@@ -856,7 +873,7 @@ class TestCreateBackendYAML:
         body = {"config_yaml": yaml.dump(config_dict)}
         with (
             patch("dstack._internal.core.backends.aws.auth.authenticate"),
-            patch("dstack._internal.core.backends.aws.compute.get_vpc_id_subnet_id_or_error"),
+            patch("dstack._internal.core.backends.aws.compute.get_vpc_id_subnets_ids_or_error"),
         ):
             response = await client.post(
                 f"/api/project/{project.name}/backends/create_yaml",
@@ -944,7 +961,7 @@ class TestUpdateBackendYAML:
         body = {"config_yaml": yaml.dump(config_dict)}
         with (
             patch("dstack._internal.core.backends.aws.auth.authenticate"),
-            patch("dstack._internal.core.backends.aws.compute.get_vpc_id_subnet_id_or_error"),
+            patch("dstack._internal.core.backends.aws.compute.get_vpc_id_subnets_ids_or_error"),
         ):
             response = await client.post(
                 f"/api/project/{project.name}/backends/update_yaml",

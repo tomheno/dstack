@@ -6,15 +6,16 @@ import string
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, ClassVar, Dict, List, Optional, Union
 
 import git
 import requests
 import yaml
-from cachetools import TTLCache, cachedmethod
+from cachetools import Cache, TTLCache, cachedmethod
 from gpuhunt import CPUArchitecture
 
 from dstack._internal import settings
@@ -25,11 +26,12 @@ from dstack._internal.core.consts import (
     DSTACK_RUNNER_SSH_PORT,
     DSTACK_SHIM_HTTP_PORT,
 )
-from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.compute_groups import ComputeGroup, ComputeGroupProvisioningData
 from dstack._internal.core.models.gateways import (
-    GatewayComputeConfiguration,
-    GatewayProvisioningData,
+    GatewayLoadBalancerConfiguration,
+    GatewayLoadBalancerData,
+    GatewayReplicaConfiguration,
+    GatewayReplicaProvisioningData,
 )
 from dstack._internal.core.models.instances import (
     InstanceConfiguration,
@@ -38,7 +40,6 @@ from dstack._internal.core.models.instances import (
     SSHKey,
 )
 from dstack._internal.core.models.placement import PlacementGroup, PlacementGroupProvisioningData
-from dstack._internal.core.models.routers import AnyRouterConfig
 from dstack._internal.core.models.runs import Job, JobProvisioningData, Requirements, Run
 from dstack._internal.core.models.volumes import (
     Volume,
@@ -89,6 +90,18 @@ class GoArchType(str, Enum):
         assert False, self
 
 
+@dataclass
+class ComputeCache:
+    cache: Cache
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+@dataclass
+class ComputeTTLCache:
+    cache: TTLCache
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
 class Compute(ABC):
     """
     A base class for all compute implementations with minimal features.
@@ -96,12 +109,30 @@ class Compute(ABC):
     """
 
     @abstractmethod
-    def get_offers(self, requirements: Requirements) -> Iterator[InstanceOfferWithAvailability]:
+    def get_offers(
+        self, requirements: Requirements, full_offers: bool, unallocated_resources: bool
+    ) -> Iterator[InstanceOfferWithAvailability]:
         """
         Returns offers with availability matching `requirements`.
         If the provider is added to gpuhunt, typically gets offers using
         `base.offers.get_catalog_offers()` and extends them with availability info.
         It is called from async code in executor. It can block on call but not between yields.
+
+        if `full_offers` set to `True`, the method should not adjust offer's resources according to
+        `requirements`. For most backends, this flag has no meaning, as they work with predefined
+        provider offers (even configurable disk size reflects the actual disk created once the
+        instance is provisioned), but some backends such as Kubernetes and Slurm allocate flexible
+        slices of instances (nodes) according to the requested resources; such Computes usually
+        generate synthetic offers from discovered nodes on the fly; these synthetic offers should
+        reflect either resources that would be allocated based on `requirements`
+        (`full_offers=False`) or full allocatable node resources (`full_offers=True`).
+
+        if `unallocated_resources` set to `True`, the method should exclude (subtract) already
+        allocated resources from offer's resources. As with `full_offers`, this flag has no meaning
+        for most backends and is intended for backends such as Kubernetes and Slurm where many jobs
+        can coexist on a single node. With such backends, the method should return full allocatable
+        node resources if `unallocated_resources=False` and only unallocated (available) resources
+        if `unallocated_resources=True`.
         """
         pass
 
@@ -115,11 +146,22 @@ class Compute(ABC):
         project_ssh_private_key: str,
         volumes: List[Volume],
         placement_group: Optional[PlacementGroup],
+        requirements: Requirements,
+        extra_authorized_keys: list[str],
     ) -> JobProvisioningData:
         """
         Launches a new instance for the job. It should return `JobProvisioningData` ASAP.
         If required to wait to get the IP address or SSH port, return partially filled `JobProvisioningData`
         and implement `update_provisioning_data()`.
+
+        `extra_authorized_keys` are the public keys to authorize on the job container in addition
+        to `project_ssh_public_key`, as decided by the caller -- typically the user key, or
+        nothing if the server does not let the user connect to the container directly. The project
+        key is never among them, and the keys are not validated; pass them to
+        `base.authorized_keys.build_authorized_keys()` to get the complete, validated list to
+        authorize. Only Computes that add the keys themselves need this argument; VM-based
+        (shim-based) Computes ignore it, as the server submits the keys to the shim once the
+        instance is up.
         """
         pass
 
@@ -163,23 +205,41 @@ class ComputeWithAllOffersCached(ABC):
     It caches all offers with availability and post-filters by requirements.
     """
 
+    unallocated_resources_argument_has_effect: ClassVar[bool] = False
+    """
+    Set to `True` if `get_all_offers_with_availability()` produces different results based on
+    the `unallocated_resources` value. Doubles the amount of cached data.
+    """
+
     def __init__(self) -> None:
         super().__init__()
         self._offers_cache_lock = threading.Lock()
-        self._offers_cache = TTLCache(maxsize=1, ttl=180)
+        self._offers_cache_execution_lock = threading.Lock()
+        self._offers_cache = TTLCache(
+            maxsize=(2 if self.unallocated_resources_argument_has_effect else 1),
+            ttl=180,
+        )
 
     @abstractmethod
-    def get_all_offers_with_availability(self) -> List[InstanceOfferWithAvailability]:
+    def get_all_offers_with_availability(
+        self, unallocated_resources: bool
+    ) -> List[InstanceOfferWithAvailability]:
         """
         Returns all backend offers with availability.
+
+        See `Compute.get_offers()` for the `unallocated_resources` argument description.
         """
         pass
 
-    def get_offers_modifiers(self, requirements: Requirements) -> Iterable[OfferModifier]:
+    def get_offers_modifiers(
+        self, requirements: Requirements, full_offers: bool
+    ) -> Iterable[OfferModifier]:
         """
         Returns functions that modify offers before they are filtered by requirements.
         A modifier function can return `None` to exclude the offer.
         E.g. can be used to set appropriate disk size based on requirements.
+
+        See `Compute.get_offers()` for the `full_offers` argument description.
         """
         return []
 
@@ -192,21 +252,36 @@ class ComputeWithAllOffersCached(ABC):
         """
         return None
 
-    def get_offers(self, requirements: Requirements) -> Iterator[InstanceOfferWithAvailability]:
-        cached_offers = self._get_all_offers_with_availability_cached()
-        offers = self.__apply_modifiers(cached_offers, self.get_offers_modifiers(requirements))
+    def get_offers(
+        self, requirements: Requirements, full_offers: bool, unallocated_resources: bool
+    ) -> Iterator[InstanceOfferWithAvailability]:
+        with self._offers_cache_execution_lock:
+            # Cache lock does not prevent concurrent execution.
+            # We use a separate lock to avoid requesting offers in parallel, re-doing the work and hitting rate limits.
+            cached_offers = self._get_all_offers_with_availability_cached(unallocated_resources)
+        offers = self.__apply_modifiers(
+            cached_offers, self.get_offers_modifiers(requirements, full_offers)
+        )
         offers = filter_offers_by_requirements(offers, requirements)
         post_filter = self.get_offers_post_filter(requirements)
         if post_filter is not None:
             offers = (o for o in offers if post_filter(o))
         return offers
 
+    def _get_all_offers_with_availability_cached_key(self, unallocated_resources: bool) -> int:
+        if self.unallocated_resources_argument_has_effect:
+            return hash(unallocated_resources)
+        return hash(None)
+
     @cachedmethod(
         cache=lambda self: self._offers_cache,
+        key=_get_all_offers_with_availability_cached_key,
         lock=lambda self: self._offers_cache_lock,
     )
-    def _get_all_offers_with_availability_cached(self) -> List[InstanceOfferWithAvailability]:
-        return self.get_all_offers_with_availability()
+    def _get_all_offers_with_availability_cached(
+        self, unallocated_resources: bool
+    ) -> List[InstanceOfferWithAvailability]:
+        return self.get_all_offers_with_availability(unallocated_resources)
 
     @staticmethod
     def __apply_modifiers(
@@ -228,6 +303,18 @@ class ComputeWithFilteredOffersCached(ABC):
     It caches offers using requirements as key.
     """
 
+    full_offers_argument_has_effect: ClassVar[bool] = False
+    """
+    Set to `True` if `get_offers_by_requirements()` produces different results based on
+    the `full_offers` value. Doubles the amount of cached data.
+    """
+
+    unallocated_resources_argument_has_effect: ClassVar[bool] = False
+    """
+    Set to `True` if `get_offers_by_requirements()` produces different results based on
+    the `unallocated_resources` value. Doubles the amount of cached data.
+    """
+
     def __init__(self) -> None:
         super().__init__()
         self._offers_cache_lock = threading.Lock()
@@ -235,19 +322,40 @@ class ComputeWithFilteredOffersCached(ABC):
 
     @abstractmethod
     def get_offers_by_requirements(
-        self, requirements: Requirements
+        self,
+        requirements: Requirements,
+        full_offers: bool,
+        unallocated_resources: bool,
     ) -> List[InstanceOfferWithAvailability]:
         """
         Returns backend offers with availability matching requirements.
+
+        See `Compute.get_offers()` for the `full_offers` argument description.
+        Set the class variable `full_offers_argument_has_effect` to `True` if the `full_offers`
+        value has an effect on the offers produced by this method.
+
+        See `Compute.get_offers()` for the `unallocated_resources` argument description.
+        Set the class variable `unallocated_resources_argument_has_effect` to `True` if
+        the `unallocated_resources` value has an effect on the offers produced by this method.
         """
         pass
 
-    def get_offers(self, requirements: Requirements) -> Iterator[InstanceOfferWithAvailability]:
-        return iter(self._get_offers_cached(requirements))
+    def get_offers(
+        self, requirements: Requirements, full_offers: bool, unallocated_resources: bool
+    ) -> Iterator[InstanceOfferWithAvailability]:
+        return iter(self._get_offers_cached(requirements, full_offers, unallocated_resources))
 
-    def _get_offers_cached_key(self, requirements: Requirements) -> int:
+    def _get_offers_cached_key(
+        self, requirements: Requirements, full_offers: bool, unallocated_resources: bool
+    ) -> int:
+        hash_items: list[Union[str, bool]] = []
         # Requirements is not hashable, so we use a hack to get arguments hash
-        return hash(requirements.json())
+        hash_items.append(requirements.model_dump_json())
+        if self.full_offers_argument_has_effect:
+            hash_items.append(full_offers)
+        if self.unallocated_resources_argument_has_effect:
+            hash_items.append(unallocated_resources)
+        return hash(tuple(hash_items))
 
     @cachedmethod(
         cache=lambda self: self._offers_cache,
@@ -255,9 +363,9 @@ class ComputeWithFilteredOffersCached(ABC):
         lock=lambda self: self._offers_cache_lock,
     )
     def _get_offers_cached(
-        self, requirements: Requirements
+        self, requirements: Requirements, full_offers: bool, unallocated_resources: bool
     ) -> List[InstanceOfferWithAvailability]:
-        return self.get_offers_by_requirements(requirements)
+        return self.get_offers_by_requirements(requirements, full_offers, unallocated_resources)
 
 
 class ComputeWithCreateInstanceSupport(ABC):
@@ -290,10 +398,15 @@ class ComputeWithCreateInstanceSupport(ABC):
         project_ssh_private_key: str,
         volumes: List[Volume],
         placement_group: Optional[PlacementGroup],
+        requirements: Requirements,
+        extra_authorized_keys: list[str],
     ) -> JobProvisioningData:
         """
         The default `run_job()` implementation for all backends that support `create_instance()`.
         Override only if custom `run_job()` behavior is required.
+
+        `extra_authorized_keys` is ignored -- all such backends are VM-based, and the server
+        submits the keys to the shim later, see `Compute.run_job()`.
         """
         instance_config = InstanceConfiguration(
             project_name=run.project_name,
@@ -301,10 +414,10 @@ class ComputeWithCreateInstanceSupport(ABC):
             user=run.user,
             ssh_keys=[SSHKey(public=project_ssh_public_key.strip())],
             volumes=volumes,
-            reservation=run.run_spec.configuration.reservation,
+            reservation=requirements.reservation,
             tags=run.run_spec.merged_profile.tags,
         )
-        instance_offer = instance_offer.copy()
+        instance_offer = instance_offer.model_copy()
         self._restrict_instance_offer_az_to_volumes_az(instance_offer, volumes)
         return self.create_instance(
             instance_offer, instance_config, placement_group=placement_group
@@ -341,7 +454,14 @@ class ComputeWithGroupProvisioningSupport(ABC):
         project_ssh_public_key: str,
         project_ssh_private_key: str,
         placement_group: Optional[PlacementGroup],
+        requirements: Requirements,
+        extra_authorized_keys: list[str],
     ) -> ComputeGroupProvisioningData:
+        """
+        Launches a compute group -- instances created all at once via the provider API -- running
+        one job per instance. See `Compute.run_job()` for the arguments shared with it, including
+        `extra_authorized_keys`.
+        """
         pass
 
     @abstractmethod
@@ -352,6 +472,15 @@ class ComputeWithGroupProvisioningSupport(ABC):
 class ComputeWithPrivilegedSupport:
     """
     Must be subclassed to support runs with `privileged: true`.
+    All VM-based Computes (that is, Computes that use the shim) should subclass this mixin.
+    """
+
+    pass
+
+
+class ComputeWithInstanceVolumesSupport:
+    """
+    Must be subclassed to support runs with `/host/path:/container/path` volumes.
     All VM-based Computes (that is, Computes that use the shim) should subclass this mixin.
     """
 
@@ -429,13 +558,20 @@ class ComputeWithPlacementGroupSupport(ABC):
         """
         pass
 
-    def are_placement_groups_compatible_with_reservations(self, backend_type: BackendType) -> bool:
+    def are_placement_groups_compatible_with_reservation(
+        self,
+        instance_offer: InstanceOffer,
+        reservation: str,
+    ) -> bool:
         """
-        Whether placement groups can be used for instances provisioned in reservations.
+        Whether a placement group can be used for an instance provisioned in the reservation.
+
+        May perform API calls.
 
         Arguments:
-            backend_type: matches the backend type of this compute, unless this compute is a proxy
-                for other backends (dstack Sky)
+            instance_offer: the offer to provision. Its backend matches the backend type of this
+                compute, unless this compute is a proxy for other backends (dstack Sky)
+            reservation: the reservation to provision the instance in
         """
         return True
 
@@ -446,25 +582,75 @@ class ComputeWithGatewaySupport(ABC):
     """
 
     @abstractmethod
-    def create_gateway(
+    def create_gateway_replica(
         self,
-        configuration: GatewayComputeConfiguration,
-    ) -> GatewayProvisioningData:
+        configuration: GatewayReplicaConfiguration,
+        gateway_backend_data: Optional[str] = None,
+    ) -> GatewayReplicaProvisioningData:
         """
-        Creates a gateway instance.
+        Creates a gateway replica instance.
         """
         pass
 
     @abstractmethod
-    def terminate_gateway(
+    def terminate_gateway_replica(
         self,
         instance_id: str,
-        configuration: GatewayComputeConfiguration,
+        configuration: GatewayReplicaConfiguration,
         backend_data: Optional[str] = None,
     ):
         """
-        Terminates a gateway instance. Generally, it passes the call to `terminate_instance()`,
-        but may perform additional work such as deleting a load balancer when a gateway has one.
+        Terminates a gateway replica instance. Generally, it passes the call to
+        `terminate_instance()`, but may perform additional work if necessary.
+        """
+        pass
+
+
+class ComputeWithGatewayLoadBalancerSupport(ABC):
+    """
+    Must be subclassed and implemented to support gateways with a load balancer that fronts
+    all replica instances.
+
+    Backends implementing this mixin must also implement `ComputeWithGatewaySupport`.
+    """
+
+    @abstractmethod
+    def create_gateway_load_balancer(
+        self,
+        configuration: GatewayLoadBalancerConfiguration,
+    ) -> GatewayLoadBalancerData:
+        """Creates the load balancer for a gateway."""
+        pass
+
+    @abstractmethod
+    def terminate_gateway_load_balancer(
+        self,
+        configuration: GatewayLoadBalancerConfiguration,
+        backend_data: Optional[str],
+    ) -> None:
+        """Deletes the load balancer."""
+        pass
+
+    @abstractmethod
+    def register_gateway_replica_with_load_balancer(
+        self,
+        instance_id: str,
+        configuration: GatewayLoadBalancerConfiguration,
+        gateway_backend_data: Optional[str],
+    ) -> None:
+        """Registers a gateway replica instance as a target of the load balancer."""
+        pass
+
+    @abstractmethod
+    def deregister_gateway_replica_from_load_balancer(
+        self,
+        instance_id: str,
+        configuration: GatewayLoadBalancerConfiguration,
+        gateway_backend_data: Optional[str],
+    ) -> None:
+        """Deregisters a gateway replica instance from the load balancer.
+
+        If the replica is not registered, it should not raise errors but return silently.
         """
         pass
 
@@ -472,7 +658,7 @@ class ComputeWithGatewaySupport(ABC):
 class ComputeWithPrivateGatewaySupport:
     """
     Must be subclassed to support private gateways.
-    `create_gateway()` must be able to create private gateways.
+    `create_gateway_replica()` must be able to create private gateways.
     """
 
     pass
@@ -592,15 +778,15 @@ def generate_unique_instance_name_for_job(
 
 
 def generate_unique_gateway_instance_name(
-    gateway_compute_configuration: GatewayComputeConfiguration,
+    gateway_replica_configuration: GatewayReplicaConfiguration,
     max_length: int = _DEFAULT_MAX_RESOURCE_NAME_LEN,
 ) -> str:
     """
     Generates a unique gateway instance name valid across all backends.
     """
     return generate_unique_backend_name(
-        resource_name=gateway_compute_configuration.instance_name,
-        project_name=gateway_compute_configuration.project_name,
+        resource_name=gateway_replica_configuration.instance_name,
+        project_name=gateway_replica_configuration.project_name,
         max_length=max_length,
     )
 
@@ -651,22 +837,39 @@ def generate_unique_backend_name(
         # project_name is not guaranteed to be valid in all backends,
         # so we add it only if it passes the validation
         prefix = f"dstack-{project_name}-{resource_name}"
-    return _generate_unique_backend_name_with_prefix(
+    return generate_unique_name(
         prefix=prefix,
         max_length=max_length,
     )
 
 
-def _generate_unique_backend_name_with_prefix(
-    prefix: str,
-    max_length: int,
+def generate_unique_short_backend_name() -> str:
+    """
+    Generates a unique 15-char resource name of the form "dstack-12345xyz".
+    Can be used for resources that have a very small length limit like AWS LBs.
+    """
+    return generate_unique_name(prefix="dstack")
+
+
+def generate_unique_name(
+    *,
+    prefix: Optional[str] = None,
+    suffix_length: Optional[int] = None,
+    max_length: Optional[int] = None,
 ) -> str:
-    prefix_len = max_length - _CLOUD_RESOURCE_SUFFIX_LEN - 1
-    prefix = prefix[:prefix_len]
+    if suffix_length is None:
+        suffix_length = _CLOUD_RESOURCE_SUFFIX_LEN
+    if max_length is not None:
+        assert max_length >= suffix_length
+        if prefix is not None:
+            prefix_len = max_length - suffix_length - 1
+            assert prefix_len > 0
+            prefix = prefix[:prefix_len]
     suffix = "".join(
-        random.choice(string.ascii_lowercase + string.digits)
-        for _ in range(_CLOUD_RESOURCE_SUFFIX_LEN)
+        random.choice(string.ascii_lowercase + string.digits) for _ in range(suffix_length)
     )
+    if prefix is None:
+        return suffix
     return f"{prefix}-{suffix}"
 
 
@@ -771,13 +974,6 @@ def get_dstack_shim_version() -> Optional[str]:
     if version := settings.DSTACK_VERSION:
         return version
     if version := settings.DSTACK_SHIM_VERSION:
-        return version
-    if version := settings.DSTACK_RUNNER_VERSION:
-        logger.warning(
-            "DSTACK_SHIM_VERSION is not set, using DSTACK_RUNNER_VERSION."
-            " Future versions will not fall back to DSTACK_RUNNER_VERSION."
-            " Set DSTACK_SHIM_VERSION to supress this warning."
-        )
         return version
     if version_url := settings.DSTACK_SHIM_VERSION_URL:
         return _fetch_version(version_url)
@@ -886,6 +1082,7 @@ def get_shim_pre_start_commands(
         f'sudo curl -sS --compressed --connect-timeout 60 --max-time 240 --retry 1 --output "$dlpath" "{url}"',
         f'sudo mv "$dlpath" {dstack_shim_binary_path}',
         f"sudo chmod +x {dstack_shim_binary_path}",
+        f"{{ sudo chcon system_u:object_r:bin_t:s0 {dstack_shim_binary_path} 2>/dev/null || true; }}",
         f"sudo mkdir {dstack_working_dir} -p",
     ]
 
@@ -911,7 +1108,7 @@ def get_run_shim_script(
     ]
 
 
-def get_gateway_user_data(authorized_key: str, router: Optional[AnyRouterConfig] = None) -> str:
+def get_gateway_user_data(authorized_key: str) -> str:
     return get_cloud_config(
         package_update=True,
         packages=[
@@ -921,13 +1118,7 @@ def get_gateway_user_data(authorized_key: str, router: Optional[AnyRouterConfig]
         snap={"commands": [["install", "--classic", "certbot"]]},
         runcmd=[
             ["ln", "-s", "/snap/bin/certbot", "/usr/bin/certbot"],
-            [
-                "sed",
-                "-i",
-                "s/# server_names_hash_bucket_size 64;/server_names_hash_bucket_size 128;/",
-                "/etc/nginx/nginx.conf",
-            ],
-            ["su", "ubuntu", "-c", " && ".join(get_dstack_gateway_commands(router))],
+            ["su", "ubuntu", "-c", " && ".join(get_dstack_gateway_commands())],
         ],
         ssh_authorized_keys=[authorized_key],
     )
@@ -936,6 +1127,7 @@ def get_gateway_user_data(authorized_key: str, router: Optional[AnyRouterConfig]
 def get_docker_commands(
     authorized_keys: list[str],
     bin_path: Optional[PathLike] = None,
+    pre_runner_commands: Optional[Iterable[str]] = None,
 ) -> list[str]:
     dstack_runner_binary_path = get_dstack_runner_binary_path(bin_path)
     commands = [
@@ -955,6 +1147,9 @@ def get_docker_commands(
         "if ! exists curl; then install_pkg curl; fi",
         ": )",
     ]
+
+    if pre_runner_commands is not None:
+        commands.extend(pre_runner_commands)
 
     runner_command = [
         dstack_runner_binary_path,
@@ -1023,28 +1218,23 @@ def get_latest_runner_build() -> Optional[str]:
     return None
 
 
-def get_dstack_gateway_wheel(build: str, router: Optional[AnyRouterConfig] = None) -> str:
-    channel = "release" if settings.DSTACK_RELEASE else "stgn"
-    base_url = f"https://dstack-gateway-downloads.s3.amazonaws.com/{channel}"
-    if build == "latest":
-        build = _fetch_version(f"{base_url}/latest-version") or "latest"
-        logger.debug("Found the latest gateway build: %s", build)
-    wheel = f"{base_url}/dstack_gateway-{build}-py3-none-any.whl"
-    # Build package spec with extras if router is specified
-    if router:
-        return f"dstack-gateway[{router.type}] @ {wheel}"
-    return f"dstack-gateway @ {wheel}"
+def get_dstack_gateway_package_and_target_version() -> tuple[str, str | None]:
+    if settings.DSTACK_GATEWAY_PACKAGE_URL:
+        return f"dstack[gateway] @ {settings.DSTACK_GATEWAY_PACKAGE_URL}", None
+    if settings.DSTACK_VERSION is not None:
+        return f"dstack[gateway]=={settings.DSTACK_VERSION}", settings.DSTACK_VERSION
+    package = "dstack[gateway] @ https://github.com/dstackai/dstack/archive/refs/heads/master.zip"
+    return package, None
 
 
-def get_dstack_gateway_commands(router: Optional[AnyRouterConfig] = None) -> List[str]:
-    build = get_dstack_runner_version() or "latest"
-    gateway_package = get_dstack_gateway_wheel(build, router)
+def get_dstack_gateway_commands() -> List[str]:
+    gateway_package, _ = get_dstack_gateway_package_and_target_version()
     return [
         "mkdir -p /home/ubuntu/dstack",
         "python3 -m venv /home/ubuntu/dstack/blue",
         "python3 -m venv /home/ubuntu/dstack/green",
         f"/home/ubuntu/dstack/blue/bin/pip install '{gateway_package}'",
-        "sudo /home/ubuntu/dstack/blue/bin/python -m dstack.gateway.systemd install --run",
+        "sudo /home/ubuntu/dstack/blue/bin/python -m dstack._internal.proxy.gateway.systemd install --run",
     ]
 
 

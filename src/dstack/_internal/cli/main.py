@@ -9,13 +9,16 @@ from dstack._internal.cli.commands.attach import AttachCommand
 from dstack._internal.cli.commands.completion import CompletionCommand
 from dstack._internal.cli.commands.delete import DeleteCommand
 from dstack._internal.cli.commands.event import EventCommand
+from dstack._internal.cli.commands.export import ExportCommand
 from dstack._internal.cli.commands.fleet import FleetCommand
 from dstack._internal.cli.commands.gateway import GatewayCommand
+from dstack._internal.cli.commands.import_ import ImportCommand
 from dstack._internal.cli.commands.init import InitCommand
 from dstack._internal.cli.commands.login import LoginCommand
 from dstack._internal.cli.commands.logs import LogsCommand
 from dstack._internal.cli.commands.metrics import MetricsCommand
 from dstack._internal.cli.commands.offer import OfferCommand
+from dstack._internal.cli.commands.preset import PresetCommand
 from dstack._internal.cli.commands.project import ProjectCommand
 from dstack._internal.cli.commands.ps import PsCommand
 from dstack._internal.cli.commands.run import RunCommand
@@ -66,13 +69,16 @@ def main():
     AttachCommand.register(subparsers)
     DeleteCommand.register(subparsers)
     EventCommand.register(subparsers)
+    ExportCommand.register(subparsers)
     FleetCommand.register(subparsers)
+    ImportCommand.register(subparsers)
     GatewayCommand.register(subparsers)
     InitCommand.register(subparsers)
     OfferCommand.register(subparsers)
     LoginCommand.register(subparsers)
     LogsCommand.register(subparsers)
     MetricsCommand.register(subparsers)
+    PresetCommand.register(subparsers)
     ProjectCommand.register(subparsers)
     PsCommand.register(subparsers)
     RunCommand.register(subparsers)

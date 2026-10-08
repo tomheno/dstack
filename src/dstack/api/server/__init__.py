@@ -2,9 +2,10 @@ import hashlib
 import os
 import pprint
 import time
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional, Type, Union
 
 import requests
+import requests_unixsocket
 
 from dstack import version
 from dstack._internal.core.errors import (
@@ -17,12 +18,15 @@ from dstack._internal.utils.logging import get_logger
 from dstack.api.server._auth import AuthAPIClient
 from dstack.api.server._backends import BackendsAPIClient
 from dstack.api.server._events import EventsAPIClient
+from dstack.api.server._exports import ExportsAPIClient
 from dstack.api.server._files import FilesAPIClient
 from dstack.api.server._fleets import FleetsAPIClient
 from dstack.api.server._gateways import GatewaysAPIClient
 from dstack.api.server._gpus import GpusAPIClient
+from dstack.api.server._imports import ImportsAPIClient
 from dstack.api.server._logs import LogsAPIClient
 from dstack.api.server._metrics import MetricsAPIClient
+from dstack.api.server._presets import PresetsAPIClient
 from dstack.api.server._projects import ProjectsAPIClient
 from dstack.api.server._repos import ReposAPIClient
 from dstack.api.server._runs import RunsAPIClient
@@ -50,6 +54,8 @@ class APIClient:
         logs: operations with logs
         gateways: operations with gateways
         volumes: operations with volumes
+        presets: operations with registry presets
+        exports: operations with exports
         files: operations with files
     """
 
@@ -61,6 +67,8 @@ class APIClient:
         """
         self._base_url = base_url.rstrip("/")
         self._s = requests.session()
+        if self._base_url.startswith("http+unix://"):
+            self._s.mount("http+unix://", requests_unixsocket.UnixAdapter())
         self._token = None
         if token is not None:
             self._token = token
@@ -127,12 +135,28 @@ class APIClient:
         return VolumesAPIClient(self._request, self._logger)
 
     @property
+    def presets(self) -> PresetsAPIClient:
+        return PresetsAPIClient(self._request, self._logger)
+
+    @property
+    def exports(self) -> ExportsAPIClient:
+        return ExportsAPIClient(self._request, self._logger)
+
+    @property
+    def imports(self) -> ImportsAPIClient:
+        return ImportsAPIClient(self._request, self._logger)
+
+    @property
     def files(self) -> FilesAPIClient:
         return FilesAPIClient(self._request, self._logger)
 
     @property
     def events(self) -> EventsAPIClient:
         return EventsAPIClient(self._request, self._logger)
+
+    @property
+    def token(self) -> Optional[str]:
+        return self._token
 
     def get_token_hash(self) -> str:
         if self._token is None:
@@ -142,7 +166,7 @@ class APIClient:
     def _request(
         self,
         path: str,
-        body: Optional[str] = None,
+        body: Optional[Union[str, bytes]] = None,
         raise_for_status: bool = True,
         method: str = "POST",
         **kwargs,

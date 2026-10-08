@@ -22,7 +22,8 @@ class RunpodApiClientError(BackendError):
 
 class RunpodApiClient:
     def __init__(self, api_key: str):
-        self.api_key = api_key
+        self._session = requests.Session()
+        self._session.headers.update({"Authorization": f"Bearer {api_key}"})
 
     def validate_api_key(self) -> bool:
         try:
@@ -70,6 +71,7 @@ class RunpodApiClient:
         network_volume_id: Optional[str] = None,
         allowed_cuda_versions: Optional[List[str]] = None,
         bid_per_gpu: Optional[float] = None,
+        container_registry_auth_id: Optional[str] = None,
     ) -> Dict:
         resp = self._make_request(
             {
@@ -95,21 +97,58 @@ class RunpodApiClient:
                     network_volume_id=network_volume_id,
                     allowed_cuda_versions=allowed_cuda_versions,
                     bid_per_gpu=bid_per_gpu,
+                    container_registry_auth_id=container_registry_auth_id,
                 )
             }
         )
         data = resp.json()["data"]
         return data["podRentInterruptable"] if bid_per_gpu else data["podFindAndDeployOnDemand"]
 
-    def edit_pod(
+    def create_cpu_pod(
+        self,
+        name: str,
+        image_name: str,
+        instance_id: str,
+        cloud_type: str,
+        deploy_cost: float,
+        start_ssh: bool = True,
+        data_center_id: Optional[str] = None,
+        container_disk_in_gb: Optional[int] = None,
+        docker_args: Optional[str] = None,
+        ports: Optional[str] = None,
+        volume_mount_path: Optional[str] = None,
+        env: Optional[Dict[str, Any]] = None,
+        template_id: Optional[str] = None,
+        network_volume_id: Optional[str] = None,
+        container_registry_auth_id: Optional[str] = None,
+    ) -> Dict:
+        resp = self._make_request(
+            {
+                "query": _generate_cpu_pod_deployment_mutation(
+                    name=name,
+                    image_name=image_name,
+                    instance_id=instance_id,
+                    cloud_type=cloud_type,
+                    deploy_cost=deploy_cost,
+                    start_ssh=start_ssh,
+                    data_center_id=data_center_id,
+                    container_disk_in_gb=container_disk_in_gb,
+                    docker_args=docker_args,
+                    ports=ports,
+                    volume_mount_path=volume_mount_path,
+                    env=env,
+                    template_id=template_id,
+                    network_volume_id=network_volume_id,
+                    container_registry_auth_id=container_registry_auth_id,
+                )
+            }
+        )
+        return resp.json()["data"]["deployCpuPod"]
+
+    def update_pod_container_registry_auth(
         self,
         pod_id: str,
-        image_name: str,
-        container_disk_in_gb: int,
         container_registry_auth_id: str,
-        # Default pod volume is 20GB.
-        # RunPod errors if it's not specified for podEditJob.
-        volume_in_gb: int = 20,
     ) -> str:
         resp = self._make_request(
             {
@@ -117,10 +156,7 @@ class RunpodApiClient:
                 mutation {{
                     podEditJob(input: {{
                         podId: "{pod_id}"
-                        imageName: "{image_name}"
-                        containerDiskInGb: {container_disk_in_gb}
                         containerRegistryAuthId: "{container_registry_auth_id}"
-                        volumeInGb: {volume_in_gb}
                     }}) {{
                         id
                     }}
@@ -312,15 +348,15 @@ class RunpodApiClient:
 
     def _make_request(self, data: Optional[Dict[str, Any]] = None) -> Response:
         try:
-            response = requests.request(
+            response = self._session.request(
                 method="POST",
-                url=f"{API_URL}?api_key={self.api_key}",
+                url=API_URL,
                 json=data,
                 timeout=120,
             )
             response.raise_for_status()
             response_json = response.json()
-            # RunPod returns 200 on client errors
+            # Runpod returns 200 on client errors
             if "errors" in response_json:
                 raise RunpodApiClientError(errors=response_json["errors"])
             return response
@@ -413,29 +449,24 @@ def _generate_pod_deployment_mutation(
     network_volume_id: Optional[str] = None,
     allowed_cuda_versions: Optional[List[str]] = None,
     bid_per_gpu: Optional[float] = None,
+    container_registry_auth_id: Optional[str] = None,
 ) -> str:
     """
     Generates a mutation to deploy pod.
     """
     input_fields = []
-
-    # ------------------------------ Required Fields ----------------------------- #
     input_fields.append(f'name: "{name}"')
     input_fields.append(f'imageName: "{image_name}"')
     input_fields.append(f'gpuTypeId: "{gpu_type_id}"')
-
-    # ------------------------------ Default Fields ------------------------------ #
     input_fields.append(f"cloudType: {cloud_type}")
+    input_fields.append(f'minCudaVersion: "{RunpodProvider.MIN_CUDA_VERSION}"')
 
     if start_ssh:
         input_fields.append("startSsh: true")
-
     if support_public_ip:
         input_fields.append("supportPublicIp: true")
     else:
         input_fields.append("supportPublicIp: false")
-
-    # ------------------------------ Optional Fields ----------------------------- #
     if bid_per_gpu is not None:
         input_fields.append(f"bidPerGpu: {bid_per_gpu}")
     if data_center_id is not None:
@@ -466,24 +497,93 @@ def _generate_pod_deployment_mutation(
         input_fields.append(f"env: [{env_string}]")
     if template_id is not None:
         input_fields.append(f'templateId: "{template_id}"')
-
     if network_volume_id is not None:
         input_fields.append(f'networkVolumeId: "{network_volume_id}"')
-
     if allowed_cuda_versions is not None:
         allowed_cuda_versions_string = ", ".join(
             [f'"{version}"' for version in allowed_cuda_versions]
         )
         input_fields.append(f"allowedCudaVersions: [{allowed_cuda_versions_string}]")
-
-    input_fields.append(f'minCudaVersion: "{RunpodProvider.MIN_CUDA_VERSION}"')
+    if container_registry_auth_id is not None:
+        input_fields.append(f'containerRegistryAuthId: "{container_registry_auth_id}"')
 
     pod_deploy = "podFindAndDeployOnDemand" if bid_per_gpu is None else "podRentInterruptable"
-    # Format input fields
+
     input_string = ", ".join(input_fields)
     return f"""
         mutation {{
           {pod_deploy}(
+            input: {{
+              {input_string}
+            }}
+          ) {{
+            id
+            lastStatusChange
+            imageName
+            machine {{
+              podHostId
+            }}
+          }}
+        }}
+        """
+
+
+def _generate_cpu_pod_deployment_mutation(
+    name: str,
+    image_name: str,
+    instance_id: str,
+    cloud_type: str,
+    deploy_cost: float,
+    start_ssh: bool = True,
+    data_center_id: Optional[str] = None,
+    container_disk_in_gb: Optional[int] = None,
+    docker_args: Optional[str] = None,
+    ports: Optional[str] = None,
+    volume_mount_path: Optional[str] = None,
+    env: Optional[Dict[str, Any]] = None,
+    template_id: Optional[str] = None,
+    network_volume_id: Optional[str] = None,
+    container_registry_auth_id: Optional[str] = None,
+) -> str:
+    """
+    Generates a mutation to deploy CPU pod.
+    """
+    input_fields = []
+    input_fields.append(f'name: "{name}"')
+    input_fields.append(f'imageName: "{image_name}"')
+    input_fields.append(f'instanceId: "{instance_id}"')
+    input_fields.append(f"cloudType: {cloud_type}")
+    input_fields.append(f"deployCost: {deploy_cost}")
+
+    if start_ssh:
+        input_fields.append("startSsh: true")
+    if data_center_id is not None:
+        input_fields.append(f'dataCenterId: "{data_center_id}"')
+    if container_disk_in_gb is not None:
+        input_fields.append(f"containerDiskInGb: {container_disk_in_gb}")
+    if docker_args is not None:
+        input_fields.append(f'dockerArgs: "{docker_args}"')
+    if ports is not None:
+        ports = ports.replace(" ", "")
+        input_fields.append(f'ports: "{ports}"')
+    if volume_mount_path is not None:
+        input_fields.append(f'volumeMountPath: "{volume_mount_path}"')
+    if env is not None:
+        env_string = ", ".join(
+            [f'{{ key: "{key}", value: "{value}" }}' for key, value in env.items()]
+        )
+        input_fields.append(f"env: [{env_string}]")
+    if template_id is not None:
+        input_fields.append(f'templateId: "{template_id}"')
+    if network_volume_id is not None:
+        input_fields.append(f'networkVolumeId: "{network_volume_id}"')
+    if container_registry_auth_id is not None:
+        input_fields.append(f'containerRegistryAuthId: "{container_registry_auth_id}"')
+
+    input_string = ", ".join(input_fields)
+    return f"""
+        mutation {{
+          deployCpuPod(
             input: {{
               {input_string}
             }}
@@ -600,7 +700,11 @@ def _generate_create_cluster_mutation(
         ports = ports.replace(" ", "")
         input_fields.append(f'ports: "{ports}"')
 
-    input_fields.append(f'minCudaVersion: "{RunpodProvider.MIN_CUDA_VERSION}"')
+    # Provisioning fails if minCudaVersion is specified for createCluster.
+    # See https://github.com/dstackai/dstack/issues/3910.
+    # TODO: Uncomment when RunPod fixes minCudaVersion for createCluster.
+    #
+    # input_fields.append(f'minCudaVersion: "{RunpodProvider.MIN_CUDA_VERSION}"')
 
     # Format input fields
     input_string = ", ".join(input_fields)

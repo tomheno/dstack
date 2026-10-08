@@ -1,0 +1,39 @@
+from typing import Annotated
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from dstack._internal.core.errors import ResourceNotExistsError
+from dstack._internal.server import settings
+from dstack._internal.server.db import get_session
+from dstack._internal.server.schemas.sshproxy import GetUpstreamRequest, GetUpstreamResponse
+from dstack._internal.server.security.permissions import AlwaysForbidden, ServiceAccount
+from dstack._internal.server.services.sshproxy.handlers import get_upstream_response
+from dstack._internal.server.utils.routers import (
+    CustomJSONResponse,
+    get_base_api_additional_responses,
+)
+
+if settings.SSHPROXY_API_TOKEN is not None:
+    _auth = ServiceAccount(settings.SSHPROXY_API_TOKEN)
+else:
+    _auth = AlwaysForbidden()
+
+
+router = APIRouter(
+    prefix="/api/sshproxy",
+    tags=["proxy"],
+    responses=get_base_api_additional_responses(),
+    dependencies=[Depends(_auth)],
+)
+
+
+@router.post("/get_upstream", summary="Get upstream", response_model=GetUpstreamResponse)
+async def get_upstream(
+    body: GetUpstreamRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+):
+    response = await get_upstream_response(session=session, upstream_id=body.id)
+    if response is None:
+        raise ResourceNotExistsError()
+    return CustomJSONResponse(response)

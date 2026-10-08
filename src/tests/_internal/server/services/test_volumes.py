@@ -5,18 +5,47 @@ from freezegun import freeze_time
 
 from dstack._internal.core.errors import ServerClientError
 from dstack._internal.core.models.backends.base import BackendType
-from dstack._internal.core.models.volumes import VolumeConfiguration, VolumeStatus
+from dstack._internal.core.models.volumes import (
+    AWSVolumeConfiguration,
+    DaytonaVolumeConfiguration,
+    VolumeStatus,
+    parse_volume_configuration,
+)
 from dstack._internal.server.services.volumes import (
     _get_volume_cost,
     _validate_volume_configuration,
 )
-from dstack._internal.server.testing.common import get_volume, get_volume_provisioning_data
+from dstack._internal.server.testing.common import (
+    get_volume,
+    get_volume_provisioning_data,
+)
 
 
 class TestValidateVolumeConfiguration:
+    def test_daytona_does_not_require_size_or_region(self):
+        _validate_volume_configuration(DaytonaVolumeConfiguration())
+
+    @pytest.mark.parametrize(
+        ("backend", "identifier_field"),
+        [
+            ("aws", "volume_id"),
+            ("gcp", "volume_id"),
+            ("runpod", "volume_id"),
+            ("kubernetes", "claim_name"),
+        ],
+    )
+    def test_regional_volume_requires_size_only_when_managed(self, backend, identifier_field):
+        configuration = {"backend": backend, "region": "us"}
+        with pytest.raises(ServerClientError, match="existing identifier or size"):
+            _validate_volume_configuration(parse_volume_configuration(configuration))
+
+        _validate_volume_configuration(
+            parse_volume_configuration({**configuration, identifier_field: "existing-volume"})
+        )
+
     def test_external_volume_with_auto_cleanup_duration_raises_error(self):
         """External volumes (with volume_id) should not allow auto_cleanup_duration"""
-        config = VolumeConfiguration(
+        config = AWSVolumeConfiguration(
             backend=BackendType.AWS,
             region="us-east-1",
             volume_id="vol-123456",
@@ -29,7 +58,7 @@ class TestValidateVolumeConfiguration:
 
     def test_external_volume_with_auto_cleanup_duration_int_raises_error(self):
         """External volumes with integer auto_cleanup_duration should also raise error"""
-        config = VolumeConfiguration(
+        config = AWSVolumeConfiguration(
             backend=BackendType.AWS,
             region="us-east-1",
             volume_id="vol-123456",
@@ -42,13 +71,13 @@ class TestValidateVolumeConfiguration:
 
     def test_external_volume_with_auto_cleanup_disabled_succeeds(self):
         """External volumes with auto_cleanup_duration='off' or -1 should be allowed"""
-        config1 = VolumeConfiguration(
+        config1 = AWSVolumeConfiguration(
             backend=BackendType.AWS,
             region="us-east-1",
             volume_id="vol-123456",
             auto_cleanup_duration="off",
         )
-        config2 = VolumeConfiguration(
+        config2 = AWSVolumeConfiguration(
             backend=BackendType.AWS,
             region="us-east-1",
             volume_id="vol-123456",
@@ -60,7 +89,7 @@ class TestValidateVolumeConfiguration:
 
     def test_external_volume_without_auto_cleanup_succeeds(self):
         """External volumes without auto_cleanup_duration should be allowed"""
-        config = VolumeConfiguration(
+        config = AWSVolumeConfiguration(
             backend=BackendType.AWS, region="us-east-1", volume_id="vol-123456"
         )
         # Should not raise any errors
@@ -68,7 +97,7 @@ class TestValidateVolumeConfiguration:
 
     def test_new_volume_with_auto_cleanup_duration_succeeds(self):
         """New volumes (without volume_id) with auto_cleanup_duration should be allowed"""
-        config = VolumeConfiguration(
+        config = AWSVolumeConfiguration(
             backend=BackendType.AWS, region="us-east-1", size=100, auto_cleanup_duration="1h"
         )
         # Should not raise any errors

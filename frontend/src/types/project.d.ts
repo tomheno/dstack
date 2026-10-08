@@ -7,9 +7,15 @@ declare type TCreateWizardProjectParams = {
     };
 };
 
-declare type TGetProjectsParams = {
-    only_no_fleets?: boolean;
+declare type TGetProjectListParams = TBaseRequestListParams & {
     include_not_joined?: boolean;
+    return_total_count?: boolean;
+    name_pattern?: string;
+};
+
+declare type TGetProjectListResponse = {
+    total_count: number;
+    data: IProject[];
 };
 
 declare type TProjectBackend = {
@@ -24,11 +30,19 @@ declare interface IProject {
     owner: IUser | { username: string };
     created_at: string;
     isPublic: boolean;
+    public_presets?: boolean;
+    templates_repo?: string | null;
+}
+
+declare interface IProjectMemberPermissions {
+    can_manage_ssh_fleets: boolean;
+    can_manage_secrets: boolean;
 }
 
 declare interface IProjectMember {
     project_role: TProjectRole;
     user: IUser | { username: string };
+    permissions?: IProjectMemberPermissions;
 }
 
 declare type TSetProjectMembersParams = {
@@ -46,3 +60,8 @@ declare interface IProjectSecret {
     name: string;
     value?: string;
 }
+
+declare type IProjectCreateRequestParams = Pick<IProject, 'project_name'> & {
+    is_public: boolean;
+    templates_repo?: string | null;
+};

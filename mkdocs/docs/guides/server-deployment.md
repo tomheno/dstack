@@ -1,0 +1,610 @@
+---
+title: Server Deployment
+description: Deploying the dstack server
+---
+
+The `dstack` server can run on your laptop or any environment with access to the cloud and on-prem clusters you plan to use.
+
+??? info "Hardware requirements"
+    The minimum hardware requirements for running the server are 1 CPU and 1GB of RAM. The recommended RAM is
+    "8MB × number of active instances". For example, a server with 1000 active instances should have 8GB of RAM.
+    You can set the `DSTACK_SERVER_SSH_POOL_DISABLED` env var to minimize RAM usage at the expense of slower processing.
+
+=== "pip"
+    > The server can be set up via `pip` on Linux, macOS, and Windows (via WSL 2). It requires Git and OpenSSH.
+
+    <div class="termy">
+    
+    ```shell
+    $ pip install "dstack[all]" -U
+    $ dstack server
+
+    Applying ~/.dstack/server/config.yml...
+
+    The admin token is "bbae0f28-d3dd-4820-bf61-8f4bb40815da"
+    The server is running at http://127.0.0.1:3000/
+    ```
+    
+    </div>
+
+=== "uv"
+
+    > The server can be set up via `uv` on Linux, macOS, and Windows (via WSL 2). It requires Git and OpenSSH.
+
+    <div class="termy">
+    
+    ```shell
+    $ uv tool install 'dstack[all]' -U
+    $ dstack server
+
+    Applying ~/.dstack/server/config.yml...
+
+    The admin token is "bbae0f28-d3dd-4820-bf61-8f4bb40815da"
+    The server is running at http://127.0.0.1:3000/
+    ```
+    
+    </div>
+
+=== "Docker"
+     > For production deployments, it's recommended to use `dstackai/dstack` Docker image.
+
+    <div class="termy">
+    
+    ```shell
+    $ docker run -p 3000:3000 \
+        -v $HOME/.dstack/server/:/root/.dstack/server \
+        dstackai/dstack
+
+    Applying ~/.dstack/server/config.yml...
+
+    The admin token is "bbae0f28-d3dd-4820-bf61-8f4bb40815da"
+    The server is running at http://127.0.0.1:3000/
+    ```
+        
+    </div>
+
+??? info "AWS CloudFormation"
+    If you'd like to deploy the server to a private AWS VPC, you can use 
+    our CloudFormation [template](https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate?templateURL=https://get-dstack.s3.eu-west-1.amazonaws.com/cloudformation/template.yaml).
+
+    First, ensure you've set up a private VPC with public and private subnets.
+
+    ![](https://dstack.ai/static-assets/static-assets/images/dstack-aws-private-vpc-example-v2.png)
+
+    Create a stack using the template, and specify the VPC and private subnets.
+    Once, the stack is created, go to `Outputs` for the server URL and admin token.
+
+    To access the server URL, ensure you're connected to the VPC, e.g. via VPN client.
+
+    > If you'd like to adjust anything, the source code of the template can be found at
+    [`examples/server-deployment/cloudformation/template.yaml`](https://github.com/dstackai/dstack/blob/master/examples/server-deployment/cloudformation/template.yaml).
+
+## Backend configuration
+
+To use `dstack` with cloud providers, configure [backends](../concepts/backends.md) 
+via the `~/.dstack/server/config.yml` file.
+The server loads this file on startup. 
+
+Alternatively, you can configure backends on the [project settings page](../concepts/projects.md#backends) via UI.
+
+> For using `dstack` with on-prem servers, no backend configuration is required.
+> Use [SSH fleets](../concepts/fleets.md#ssh-fleets) instead.
+
+## State persistence
+
+The `dstack` server can store its internal state in SQLite or Postgres.
+By default, it stores the state locally in `~/.dstack/server` using SQLite.
+With SQLite, you can run at most one server replica.
+Postgres has no such limitation and is recommended for production deployment.
+
+??? info "Replicate SQLite to cloud storage"
+    You can configure automatic replication of your SQLite state to a cloud object storage using Litestream.
+    This allows persisting the server state across re-deployments when using SQLite.
+
+    To enable Litestream replication, set the following environment variables:
+    
+    - `LITESTREAM_REPLICA_URL` - The url of the cloud object storage.
+      Examples: `s3://<bucket-name>/<path>`, `gcs://<bucket-name>/<path>`, `abs://<storage-account>@<container-name>/<path>`, etc.
+    
+    You also need to configure cloud storage credentials.
+    
+    **AWS S3**
+    
+    To persist state into an AWS S3 bucket, provide the following environment variables:
+    
+    - `AWS_ACCESS_KEY_ID` - The AWS access key ID
+    - `AWS_SECRET_ACCESS_KEY` -  The AWS secret access key
+    
+    **GCP Storage**
+    
+    To persist state into a GCP Storage bucket, provide one of the following environment variables:
+    
+    - `GOOGLE_APPLICATION_CREDENTIALS` - The path to the GCP service account key JSON file
+    - `GOOGLE_APPLICATION_CREDENTIALS_JSON` - The GCP service account key JSON
+
+    **Azure Blob Storage**
+    
+    To persist state into an Azure blog storage, provide the following environment variable.
+    
+    - `LITESTREAM_AZURE_ACCOUNT_KEY` - The Azure storage account key
+    
+    More [details](https://litestream.io/guides/) on options for configuring replication.
+
+### PostgreSQL
+
+To store the server state in Postgres, set the `DSTACK_DATABASE_URL` environment variable:
+
+```shell
+$ DSTACK_DATABASE_URL=postgresql+asyncpg://user:password@db-host:5432/dstack dstack server
+```
+
+The minimum requirements for the DB instance are 2 CPU, 2GB of RAM, and at least 50 `max_connections` per server replica
+or a configured connection pooler to handle that many connections.
+If you're using a smaller DB instance, you may need to set lower `DSTACK_DB_POOL_SIZE` and `DSTACK_DB_MAX_OVERFLOW`, e.g.
+`DSTACK_DB_POOL_SIZE=10` and `DSTACK_DB_MAX_OVERFLOW=0`.
+
+??? info "Migrate from SQLite to PostgreSQL"
+    You can migrate the existing state from SQLite to PostgreSQL using `pgloader`:
+
+    1. Create a new PostgreSQL database
+    2. Clone the `dstack` repo and [install](https://github.com/dstackai/dstack/blob/master/contributing/DEVELOPMENT.md) `dstack` from source.
+       Ensure you've checked out the tag that corresponds to your server version (e.g. `git checkout 0.18.10`).
+    3. Apply database migrations to the new database:
+      ```bash
+      cd src/dstack/_internal/server/
+      export DSTACK_DATABASE_URL="postgresql+asyncpg://..."
+      alembic upgrade head
+      ```
+    4. Install [pgloader :material-arrow-top-right-thin:{.external }](https://github.com/dimitri/pgloader)
+    5. Pass the path to the `~/.dstack/server/data/sqlite.db` file to `SOURCE_PATH` and 
+       set `TARGET_PATH` with the URL of the PostgreSQL database. Example:
+       ```bash
+       cd scripts/
+       export SOURCE_PATH=sqlite:///Users/me/.dstack/server/data/sqlite.db
+       export TARGET_PATH=postgresql://postgres:postgres@localhost:5432/postgres
+       pgloader sqlite_to_psql.load
+       ```
+       The `pgloader` script will migrate the SQLite data to PostgreSQL. It may emit warnings that are safe to ignore. 
+       
+       If you encounter errors, please [submit an issue](https://github.com/dstackai/dstack/issues/new/choose).
+
+> For a local setup running PostgreSQL and the [SSH proxy](#ssh-proxy) together, see the example
+> [`docker-compose.yml`](https://github.com/dstackai/dstack/blob/master/docker/server/docker-compose.yml).
+
+## Logs storage
+
+By default, `dstack` stores workload logs locally in `~/.dstack/server/projects/<project_name>/logs`.
+For multi-replica server deployments, it's required to store logs externally.
+`dstack` supports storing logs using AWS CloudWatch, GCP Logging, or Fluent-bit with Elasticsearch / Opensearch.
+
+### AWS CloudWatch
+
+To store logs in AWS CloudWatch, set the `DSTACK_SERVER_CLOUDWATCH_LOG_GROUP` and
+the `DSTACK_SERVER_CLOUDWATCH_LOG_REGION` environment variables. 
+
+The log group must be created beforehand. `dstack` won't try to create it.
+
+??? info "Required permissions"
+
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+          {
+              "Sid": "DstackLogStorageAllow",
+              "Effect": "Allow",
+              "Action": [
+                  "logs:DescribeLogStreams",
+                  "logs:CreateLogStream",
+                  "logs:GetLogEvents",
+                  "logs:PutLogEvents"
+              ],
+              "Resource": [
+                  "arn:aws:logs:::log-group:<group name>",
+                  "arn:aws:logs:::log-group:<group name>:*"
+              ]
+          }
+      ]
+    }
+    ```
+
+### GCP Logging
+
+To store logs using GCP Logging, set the `DSTACK_SERVER_GCP_LOGGING_PROJECT` environment variable.
+
+??? info "Required permissions"
+    Ensure you've configured Application Default Credentials with the following permissions:
+
+    ```
+    logging.logEntries.create
+    logging.logEntries.list
+    ```
+
+??? info "Logs management"
+    `dstack` writes all the logs to the `projects/[PROJECT]/logs/dstack-run-logs` log name.
+    If you want to set up a custom retention policy for `dstack` logs, create a new bucket and configure a sink:
+    
+    <div class="termy">
+
+    ```shell
+    $ gcloud logging buckets create dstack-bucket \
+        --location=global \
+        --description="Bucket for storing dstack run logs" \
+        --retention-days=10
+    $ gcloud logging sinks create dstack-sink \
+        logging.googleapis.com/projects/[PROJECT]/locations/global/buckets/dstack-bucket \
+        --log-filter='logName = "projects/[PROJECT]/logs/dstack-run-logs"'
+    ```
+
+    </div>
+
+### Fluent-bit
+
+To store logs using Fluent-bit, set the `DSTACK_SERVER_FLUENTBIT_HOST` environment variable.
+Fluent-bit supports two modes depending on how you want to access logs.
+
+=== "Full mode"
+
+    Logs are shipped to Fluent-bit and can be read back through the `dstack` UI and CLI via Elasticsearch or OpenSearch.
+    Use this mode when you want a complete integration with log viewing in `dstack`:
+
+    ```shell
+    $ DSTACK_SERVER_FLUENTBIT_HOST=fluentbit.example.com \
+      DSTACK_SERVER_ELASTICSEARCH_HOST=https://elasticsearch.example.com:9200 \
+      dstack server
+    ```
+
+=== "Ship-only mode"
+
+    Logs are forwarded to Fluent-bit but cannot be read through `dstack`. 
+    The dstack UI/CLI will show empty logs. Use this mode when:
+
+    - You have an existing logging infrastructure (Kibana, Grafana, Datadog, etc.)
+    - You only need to forward logs without reading them back through `dstack`
+    - You want to reduce operational complexity by not running Elasticsearch/OpenSearch
+
+    ```shell
+    $ DSTACK_SERVER_FLUENTBIT_HOST=fluentbit.example.com \
+      dstack server
+    ```
+
+??? info "Additional configuration"
+    The following optional environment variables can be used to customize the Fluent-bit integration:
+
+    **Fluent-bit settings:**
+
+    - `DSTACK_SERVER_FLUENTBIT_PORT` – The Fluent-bit port. Defaults to `24224`.
+    - `DSTACK_SERVER_FLUENTBIT_PROTOCOL` – The protocol to use: `forward` or `http`. Defaults to `forward`.
+    - `DSTACK_SERVER_FLUENTBIT_TAG_PREFIX` – The tag prefix for logs. Defaults to `dstack`.
+
+    **Elasticsearch/OpenSearch settings (for full mode only):**
+
+    - `DSTACK_SERVER_ELASTICSEARCH_HOST` – The Elasticsearch/OpenSearch host for reading logs. If not set, runs in ship-only mode.
+    - `DSTACK_SERVER_ELASTICSEARCH_INDEX` – The Elasticsearch/OpenSearch index pattern. Defaults to `dstack-logs`.
+    - `DSTACK_SERVER_ELASTICSEARCH_API_KEY` – The Elasticsearch/OpenSearch API key for authentication.
+
+??? info "Fluent-bit configuration"
+    Configure Fluent-bit to receive logs and forward them to Elasticsearch or OpenSearch. Example configuration:
+
+    ```ini
+    [INPUT]
+        Name        forward
+        Listen      0.0.0.0
+        Port        24224
+
+    [OUTPUT]
+        Name            es
+        Match           dstack.*
+        Host            elasticsearch.example.com
+        Port            9200
+        Index           dstack-logs
+        Suppress_Type_Name On
+    ```
+
+??? info "Required dependencies"
+    To use Fluent-bit log storage, install the `fluentbit` extras:
+
+    ```shell
+    $ pip install "dstack[all]" -U
+    # or
+    $ pip install "dstack[fluentbit]" -U
+    ```
+
+## File storage
+
+When using  [files](../concepts/dev-environments.md#files) or [repos](../concepts/dev-environments.md#repos), `dstack` uploads local files and diffs to the server so that you can have access to them within runs. By default, the files are stored in the DB and each upload is limited to 2MB. You can configure an object storage to be used for uploads and increase the default limit by setting the `DSTACK_SERVER_CODE_UPLOAD_LIMIT` environment variable
+
+### S3
+
+To use S3 for storing uploaded files, set the `DSTACK_SERVER_S3_BUCKET` and `DSTACK_SERVER_S3_BUCKET_REGION` environment variables.
+The bucket must be created beforehand. `dstack` won't try to create it.
+
+??? info "Required permissions"
+
+    ```json
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::<bucket-name>",
+                "arn:aws:s3:::<bucket-name>/*"
+            ]
+            }
+        ]
+    }
+    ```
+
+### GCS
+
+To use GCS for storing uploaded files, set the `DSTACK_SERVER_GCS_BUCKET` environment variable.
+The bucket must be created beforehand. `dstack` won't try to create it.
+
+??? info "Required permissions"
+    Ensure you've configured Application Default Credentials with the following permissions:
+
+    ```
+    storage.buckets.get
+    storage.buckets.list
+    storage.objects.get
+    storage.objects.list
+    storage.objects.create
+    storage.objects.delete
+    storage.objects.update
+    ```
+
+## SSH proxy
+
+To connect to a run over SSH, `dstack` establishes a connection to the job's container, routed through the job's host and, for [SSH fleets](../concepts/fleets.md#ssh-fleets) with a head node, through that head node.
+
+[`dstack-sshproxy`](https://github.com/dstackai/sshproxy) is an optional service that you deploy alongside the `dstack` server. When it's enabled, `dstack attach` connects to the proxy instead of to the job's host (and the head node if the SSH fleet has one).
+
+This lets you:
+
+- Restrict users to the job's container. Without the proxy, an attached user can SSH into the host, not just the container.
+- Reach runs on SSH fleets with a head node without giving users the head node's SSH key.
+- Let users connect to runs without `dstack attach`. This requires uploading their public SSH key(s) to the `dstack` server.
+
+<!-- TODO: once connecting through the proxy without `dstack attach` is exposed in the UI/CLI, document the steps in this section. -->
+
+### Deployment
+
+To deploy the SSH proxy, follow its [deployment guide](https://github.com/dstackai/sshproxy/blob/main/DEPLOYMENT.md). Then connect the `dstack` server to it by setting the following environment variables:
+
+* `DSTACK_SSHPROXY_API_TOKEN` – the token used to authenticate requests to the SSH proxy. It must match the token the SSH proxy is deployed with.
+* `DSTACK_SERVER_SSHPROXY_ADDRESS` – the address where users reach the SSH proxy, in the `HOSTNAME[:PORT]` form (`PORT` defaults to 22).
+
+<!-- TODO: once the Tenant isolation guide (#3913) is merged, document blocking host SSH access here (DSTACK_SERVER_SSHPROXY_ENFORCED) with a link to that guide. -->
+
+> For a local setup running [PostgreSQL](#postgresql) and the SSH proxy together, see the example
+> [`docker-compose.yml`](https://github.com/dstackai/dstack/blob/master/docker/server/docker-compose.yml).
+
+## Observability
+
+Besides [workload metrics](../concepts/metrics.md), the `dstack` server can report its own errors, traces, logs,
+and metrics for monitoring the server. Two integrations are supported: Sentry and OpenTelemetry.
+They are independent and can be enabled together, e.g. Sentry for error tracking and OpenTelemetry for tracing.
+
+### Sentry
+
+To report server errors and traces via the Sentry SDK, set the `DSTACK_SENTRY_DSN` environment variable.
+
+The DSN can point to [Sentry :material-arrow-top-right-thin:{.external }](https://sentry.io/)
+or any Sentry-compatible error tracker such as
+[Bugsink :material-arrow-top-right-thin:{.external }](https://www.bugsink.com/) or
+[GlitchTip :material-arrow-top-right-thin:{.external }](https://glitchtip.com/).
+
+The following optional environment variables control sampling:
+
+- `DSTACK_SENTRY_TRACES_SAMPLE_RATE` – The sample rate for API request traces. Defaults to `0.1`.
+- `DSTACK_SENTRY_TRACES_BACKGROUND_SAMPLE_RATE` – The sample rate for background task traces. Defaults to `0.01`.
+- `DSTACK_SENTRY_PROFILES_SAMPLE_RATE` – The profiling sample rate, relative to the traces sample rate. Defaults to `0`.
+
+### OpenTelemetry
+
+The server can export traces, logs, and metrics using OpenTelemetry. Each signal is enabled independently:
+
+- `DSTACK_OTEL_TRACES_ENABLED` – Enables tracing. API requests, DB queries, outgoing HTTP requests, and background tasks are instrumented automatically.
+- `DSTACK_OTEL_LOGS_ENABLED` – Enables server log export. When tracing is also enabled, logs are correlated with traces via `trace_id`.
+- `DSTACK_OTEL_METRICS_ENABLED` – Enables metrics: HTTP server and client request durations, process CPU/memory/GC metrics, etc.
+
+The export destination and protocol are configured via the standard
+[`OTEL_*` environment variables :material-arrow-top-right-thin:{.external }](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/).
+Traces and logs are exported via OTLP over HTTP (`OTEL_EXPORTER_OTLP_PROTOCOL` has no effect). Example:
+
+```shell
+$ DSTACK_OTEL_TRACES_ENABLED=1 \
+  DSTACK_OTEL_LOGS_ENABLED=1 \
+  DSTACK_OTEL_METRICS_ENABLED=1 \
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.example.com:4318 \
+  dstack server
+```
+
+??? info "Required dependencies"
+    To use the OpenTelemetry integration, install the `otel` extras:
+
+    ```shell
+    $ pip install "dstack[all]" -U
+    # or
+    $ pip install "dstack[otel]" -U
+    ```
+
+??? info "Trace sampling"
+    By default, all traces are exported (sample rate `1.0`), assuming sampling is done downstream,
+    e.g. in an OTel Collector. To sample in the server instead, set:
+
+    - `DSTACK_OTEL_TRACES_SAMPLE_RATE` – The head sampling rate for API request traces.
+    - `DSTACK_OTEL_TRACES_BACKGROUND_SAMPLE_RATE` – The head sampling rate for background task traces.
+
+??? info "Metrics exporters"
+    By default, metrics are pushed via OTLP like traces and logs. Set
+    `DSTACK_OTEL_METRICS_EXPORTERS=prometheus` to instead expose them on the
+    [Prometheus `/metrics` endpoint](../concepts/metrics.md) alongside the built-in `dstack`
+    metrics (a comma-separated list enables both exporters at once).
+
+    If you run multiple server replicas, only use the `prometheus` exporter if Prometheus
+    scrapes each replica directly. Scraping through a load balancer interleaves the
+    replicas' counters into the same series and silently corrupts all rates.
+
+    When pushed metrics end up in Prometheus (e.g. via an OTel Collector), the sample
+    cadence is set by `OTEL_METRIC_EXPORT_INTERVAL` (milliseconds; defaults to `60000`).
+    If it's much larger than Prometheus' configured `timeInterval` (defaults to 15s),
+    `rate()` queries may be empty. Set e.g. `OTEL_METRIC_EXPORT_INTERVAL=30000`,
+    and make sure the datasource's `timeInterval` reflects the cadence you choose.
+
+## Encryption
+
+By default, `dstack` stores data in plaintext. To enforce encryption, you 
+specify one or more encryption keys.
+
+`dstack` currently supports AES and identity (plaintext) encryption keys.
+Support for external providers like HashiCorp Vault and AWS KMS is planned.
+
+=== "AES"
+    The `aes` encryption key encrypts data using [AES-256](https://en.wikipedia.org/wiki/Advanced_Encryption_Standard) in GCM mode.
+    To configure the `aes` encryption, generate a random 32-byte key:
+
+    <div class="termy">
+    
+    ```shell
+    $ head -c 32 /dev/urandom | base64
+    
+    opmx+r5xGJNVZeErnR0+n+ElF9ajzde37uggELxL
+    ```
+
+    </div>
+    
+    And specify it as `secret`:
+    
+    ```yaml
+    # ...
+
+    encryption:
+      keys:
+        - type: aes
+          name: key1
+          secret: opmx+r5xGJNVZeErnR0+n+ElF9ajzde37uggELxL
+    ```
+
+=== "Identity"
+    The `identity` encryption performs no encryption and stores data in plaintext.
+    You can specify an `identity` encryption key explicitly if you want to decrypt the data:
+
+    <div editor-title="~/.dstack/server/config.yml">
+    
+    ```yaml
+    # ...
+
+    encryption:
+      keys:
+      - type: identity
+      - type: aes
+        name: key1
+        secret: opmx+r5xGJNVZeErnR0+n+ElF9ajzde37uggELxL
+    ```
+
+    </div>
+    
+    With this configuration, the `aes` key will still be used to decrypt the old data,
+    but new writes will store the data in plaintext.
+
+??? info "Key rotation"
+    If multiple keys are specified, the first is used for encryption, and all are tried for decryption. This enables key
+    rotation by specifying a new encryption key.
+
+    <div editor-title="~/.dstack/server/config.yml">
+    
+    ```yaml
+    # ...
+
+    encryption:
+      keys:
+      - type: aes
+        name: key2
+        secret: cR2r1JmkPyL6edBQeHKz6ZBjCfS2oWk87Gc2G3wHVoA=
+
+      - type: aes
+        name: key1
+        secret: E5yzN6V3XvBq/f085ISWFCdgnOGED0kuFaAkASlmmO4=
+    ```
+
+    </div>
+    
+    Old keys may be deleted once all existing records have been updated to re-encrypt sensitive data. 
+    Encrypted values are prefixed with key names, allowing DB admins to identify the keys used for encryption.
+
+## Default permissions
+
+By default, all users can create and manage their own projects. You can specify `default_permissions`
+to `false` so that only global admins can create and manage projects:
+
+<div editor-title="~/.dstack/server/config.yml">
+
+```yaml
+# ...
+
+default_permissions:
+  allow_non_admins_create_projects: false
+```
+
+</div>
+
+## Backward compatibility
+
+`dstack` follows the `{major}.{minor}.{patch}` versioning scheme.
+Backward compatibility is maintained based on these principles:
+
+* The server backward compatibility is maintained on a best-effort basis across minor and patch releases. The specific features can be removed, but the removal is preceded with deprecation warnings for several minor releases. This means you can use older client versions with newer server versions.
+* The client backward compatibility is maintained across patch releases. A new minor release indicates that the release breaks client backward compatibility. This means you don't need to update the server when you update the client to a new patch release. Still, upgrading a client to a new minor version requires upgrading the server too.
+
+## Server limits
+
+A single `dstack` server replica can support at least
+
+* 1000 active instances
+* 1000 active runs
+* 1000 active jobs.
+
+If you hit server performance limits, try scale up server instances and/or configure Postgres with multiple server replicas.
+Also, please [submit a GitHub issue](https://github.com/dstackai/dstack/issues) describing your setup – we strive to improve `dstack` scalability and efficiency.
+
+## Server upgrades
+
+When upgrading the `dstack` server, follow these guidelines to ensure a smooth transition and minimize downtime.
+
+### Before upgrading
+
+1. **Check the changelog**: Review the [release notes](https://github.com/dstackai/dstack/releases) for breaking changes, new features, and migration notes.
+2. **Review backward compatibility**: Understand the [backward compatibility](#backward-compatibility) policy.
+3. **Back up your data**: Ensure you always create a backup before upgrading.
+
+### Best practices
+
+- **Test in staging**: Always test upgrades in a non-production environment first.
+- **Monitor logs**: Watch server logs during and after the upgrade for any errors or warnings.
+- **Keep backups**: Retain backups for at least a few days after a successful upgrade.
+
+### Troubleshooting
+
+**Deadlock when upgrading a multi-replica PostgreSQL deployment**
+
+If a deployment is stuck due to a deadlock when applying DB migrations, try scaling server replicas to 1 and retry the deployment multiple times. Some releases may not support rolling deployments, which is always noted in the release notes. If you think there is a bug, please [file an issue](https://github.com/dstackai/dstack/issues).
+
+## FAQs
+
+??? info "Can I run multiple replicas of dstack server?"
+
+    Yes, you can if you configure `dstack` to use [PostgreSQL](#postgresql) and an external log storage
+    such as [AWS CloudWatch](#aws-cloudwatch), [GCP Logging](#gcp-logging), or [Fluent-bit](#fluent-bit).
+
+??? info "Does dstack server support blue-green or rolling deployments?"
+
+    Yes, it does if you configure `dstack` to use [PostgreSQL](#postgresql) and an external log storage
+    such as [AWS CloudWatch](#aws-cloudwatch), [GCP Logging](#gcp-logging), or [Fluent-bit](#fluent-bit).

@@ -18,7 +18,7 @@ export const UserProjectList: React.FC = () => {
     const params = useParams();
     const paramUserName = params.userName ?? '';
 
-    const { isLoading, isFetching, data } = useGetProjectsQuery();
+    const { isLoading, isFetching, data } = useGetProjectsQuery({ limit: 200 });
 
     useBreadcrumbs([
         {
@@ -29,23 +29,21 @@ export const UserProjectList: React.FC = () => {
             text: paramUserName,
             href: ROUTES.USER.DETAILS.FORMAT(paramUserName),
         },
+        {
+            text: t('users.projects'),
+            href: ROUTES.USER.PROJECTS.FORMAT(paramUserName),
+        },
     ]);
 
     const renderEmptyMessage = (): React.ReactNode => {
-        return (
-            <ListEmptyMessage
-                title={t('projects.empty_message_title')}
-                message={t('projects.empty_message_text')}
-            ></ListEmptyMessage>
-        );
+        return <ListEmptyMessage title={t('projects.empty_message_title')} message={t('projects.empty_message_text')} />;
     };
 
     const filteredData = useMemo<IProject[]>(() => {
-        if (!data) return [];
+        if (!data?.data) return [];
 
-        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-        // @ts-ignore
-        return [...data]
+        // eslint-disable-next-line no-unsafe-optional-chaining
+        return [...data?.data]
             .filter((p) => p.owner.username === paramUserName)
             .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     }, [data]);
@@ -75,7 +73,6 @@ export const UserProjectList: React.FC = () => {
     return (
         <Table
             {...collectionProps}
-            variant="borderless"
             columnDefinitions={columns}
             items={items}
             loading={isLoading || isFetching}

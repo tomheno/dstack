@@ -2,47 +2,79 @@ import React from 'react';
 import type { RouteObject } from 'react-router-dom';
 import { createBrowserRouter } from 'react-router-dom';
 import { Navigate } from 'react-router-dom';
+import { product } from 'product';
+import { PublicApp } from 'PublicApp';
+import { PresetApp } from 'PublicApp/PresetApp';
 
 import App from 'App';
+import { Login } from 'App/Login';
 import { LoginByEntraIDCallback } from 'App/Login/EntraID/LoginByEntraIDCallback';
 import { LoginByGithubCallback } from 'App/Login/LoginByGithubCallback';
 import { LoginByGoogleCallback } from 'App/Login/LoginByGoogleCallback';
 import { LoginByOktaCallback } from 'App/Login/LoginByOktaCallback';
 import { TokenLogin } from 'App/Login/TokenLogin';
 import { Logout } from 'App/Logout';
-import { FleetDetails, FleetList } from 'pages/Fleets';
+import { FleetAdd, FleetDetails, FleetList } from 'pages/Fleets';
 import { EventsList as FleetEventsList } from 'pages/Fleets/Details/Events';
 import { FleetDetails as FleetDetailsGeneral } from 'pages/Fleets/Details/FleetDetails';
 import { FleetInspect } from 'pages/Fleets/Details/Inspect';
-import { InstanceList } from 'pages/Instances';
+import { InstanceDetailsPage, InstanceList } from 'pages/Instances';
+import { EventsList as InstanceEventsList } from 'pages/Instances/Details/Events';
+import { InstanceInspect } from 'pages/Instances/Details/Inspect';
+import { InstanceDetails } from 'pages/Instances/Details/InstanceDetails';
 import { ModelsList } from 'pages/Models';
 import { ModelDetails } from 'pages/Models/Details';
-import { CreateProjectWizard, ProjectAdd, ProjectDetails, ProjectList, ProjectSettings } from 'pages/Project';
+import { CreateProjectWizard, ProjectAdd, ProjectDetails, ProjectEvents, ProjectList, ProjectSettings } from 'pages/Project';
 import { BackendAdd, BackendEdit } from 'pages/Project/Backends';
 import { AddGateway, EditGateway } from 'pages/Project/Gateways';
-import {
-    CreateDevEnvironment,
-    EventsList as RunEvents,
-    JobLogs,
-    JobMetrics,
-    RunDetails,
-    RunDetailsPage,
-    RunList,
-} from 'pages/Runs';
+import { EventsList as RunEvents, JobLogs, JobMetrics, Launch, RunDetails, RunDetailsPage, RunList } from 'pages/Runs';
 import { RunInspect } from 'pages/Runs/Details/Inspect';
 import { JobDetailsPage } from 'pages/Runs/Details/Jobs/Details';
 import { EventsList as JobEvents } from 'pages/Runs/Details/Jobs/Events';
 import { CreditsHistoryAdd, UserAdd, UserDetails, UserEdit, UserList } from 'pages/User';
-import { UserBilling, UserProjects, UserSettings } from 'pages/User/Details';
+import { UserBilling, UserEvents, UserProjects, UserSettings } from 'pages/User/Details';
 
 import { AuthErrorMessage } from './App/AuthErrorMessage';
 import { EventList } from './pages/Events';
 import { OfferList } from './pages/Offers';
+import { PresetDeploy, PresetDetails, PresetDetailsOverview, PresetInspect, PresetList } from './pages/Presets';
 import { JobDetails } from './pages/Runs/Details/Jobs/Details/JobDetails';
 import { VolumeList } from './pages/Volumes';
 import { ROUTES } from './routes';
 
 export const router = createBrowserRouter([
+    ...(product.hasPresets
+        ? [
+              {
+                  element: <PublicApp />,
+                  errorElement: <AuthErrorMessage title="Not Found" text="Page not found" />,
+                  children: [
+                      { path: ROUTES.BASE, element: <Login /> },
+                      { path: ROUTES.AUTH.TOKEN, element: <TokenLogin /> },
+                  ],
+              },
+              {
+                  element: <PresetApp />,
+                  errorElement: <AuthErrorMessage title="Not Found" text="Page not found" />,
+                  children: [
+                      {
+                          path: ROUTES.PRESETS.LIST,
+                          element: <PresetList />,
+                      },
+                      {
+                          path: ROUTES.PRESETS.DETAILS.TEMPLATE,
+                          element: <PresetDetails />,
+                          children: [
+                              { index: true, element: <PresetDetailsOverview /> },
+                              { path: ROUTES.PRESETS.DETAILS.DEPLOY.TEMPLATE, element: <PresetDeploy /> },
+                              { path: 'verified-on', element: <Navigate to=".." replace /> },
+                              { path: ROUTES.PRESETS.DETAILS.INSPECT.TEMPLATE, element: <PresetInspect /> },
+                          ],
+                      },
+                  ],
+              },
+          ]
+        : []),
     {
         path: '/',
         element: <App />,
@@ -65,15 +97,9 @@ export const router = createBrowserRouter([
                 path: ROUTES.AUTH.GOOGLE_CALLBACK,
                 element: <LoginByGoogleCallback />,
             },
-            {
-                path: ROUTES.AUTH.TOKEN,
-                element: <TokenLogin />,
-            },
+            ...(!product.hasPresets ? [{ path: ROUTES.AUTH.TOKEN, element: <TokenLogin /> }] : []),
             // hubs
-            {
-                path: ROUTES.BASE,
-                element: <Navigate replace to={ROUTES.RUNS.LIST} />,
-            },
+            ...(!product.hasPresets ? [{ path: ROUTES.BASE, element: <Navigate replace to={ROUTES.RUNS.LIST} /> }] : []),
             {
                 path: ROUTES.PROJECT.LIST,
                 element: <ProjectList />,
@@ -85,6 +111,10 @@ export const router = createBrowserRouter([
                     {
                         index: true,
                         element: <ProjectSettings />,
+                    },
+                    product.hasEvents && {
+                        path: ROUTES.PROJECT.DETAILS.EVENTS.TEMPLATE,
+                        element: <ProjectEvents />,
                     },
                     {
                         path: ROUTES.PROJECT.BACKEND.ADD.TEMPLATE,
@@ -102,7 +132,7 @@ export const router = createBrowserRouter([
                         path: ROUTES.PROJECT.GATEWAY.EDIT.TEMPLATE,
                         element: <EditGateway />,
                     },
-                ],
+                ].filter(Boolean) as RouteObject[],
             },
             {
                 path: ROUTES.PROJECT.DETAILS.RUNS.DETAILS.TEMPLATE,
@@ -154,11 +184,11 @@ export const router = createBrowserRouter([
             },
 
             ...([
-                process.env.UI_VERSION !== 'sky' && {
+                !product.hasBilling && {
                     path: ROUTES.PROJECT.ADD,
                     element: <ProjectAdd />,
                 },
-                process.env.UI_VERSION === 'sky' && {
+                product.hasBilling && {
                     path: ROUTES.PROJECT.ADD,
                     element: <CreateProjectWizard />,
                 },
@@ -172,7 +202,7 @@ export const router = createBrowserRouter([
 
             {
                 path: ROUTES.RUNS.CREATE_DEV_ENV,
-                element: <CreateDevEnvironment />,
+                element: <Launch />,
             },
 
             // Offers
@@ -191,16 +221,22 @@ export const router = createBrowserRouter([
                 element: <ModelDetails />,
             },
 
-            // Events
-            {
-                path: ROUTES.EVENTS.LIST,
-                element: <EventList />,
-            },
+            // Events, Enterprise and above
+            ...([
+                product.hasEvents && {
+                    path: ROUTES.EVENTS.LIST,
+                    element: <EventList />,
+                },
+            ].filter(Boolean) as RouteObject[]),
 
             // Fleets
             {
                 path: ROUTES.FLEETS.LIST,
                 element: <FleetList />,
+            },
+            {
+                path: ROUTES.FLEETS.ADD.TEMPLATE,
+                element: <FleetAdd />,
             },
             {
                 path: ROUTES.FLEETS.DETAILS.TEMPLATE,
@@ -225,6 +261,24 @@ export const router = createBrowserRouter([
             {
                 path: ROUTES.INSTANCES.LIST,
                 element: <InstanceList />,
+            },
+            {
+                path: ROUTES.INSTANCES.DETAILS.TEMPLATE,
+                element: <InstanceDetailsPage />,
+                children: [
+                    {
+                        index: true,
+                        element: <InstanceDetails />,
+                    },
+                    {
+                        path: ROUTES.INSTANCES.DETAILS.EVENTS.TEMPLATE,
+                        element: <InstanceEventsList />,
+                    },
+                    {
+                        path: ROUTES.INSTANCES.DETAILS.INSPECT.TEMPLATE,
+                        element: <InstanceInspect />,
+                    },
+                ],
             },
 
             // Volumes
@@ -254,7 +308,16 @@ export const router = createBrowserRouter([
                         path: ROUTES.USER.PROJECTS.TEMPLATE,
                         element: <UserProjects />,
                     },
-                    process.env.UI_VERSION === 'sky' && {
+                    product.hasEvents && {
+                        path: ROUTES.USER.EVENTS.TEMPLATE,
+                        element: <UserEvents />,
+                    },
+                    {
+                        // SSH keys moved to a section inside the Settings tab
+                        path: ROUTES.USER.PUBLIC_KEYS.TEMPLATE,
+                        element: <Navigate replace to=".." />,
+                    },
+                    product.hasBilling && {
                         path: ROUTES.USER.BILLING.LIST.TEMPLATE,
                         element: <UserBilling />,
                     },

@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 from uuid import UUID
 
 import pytest
@@ -14,7 +14,6 @@ from dstack._internal.core.models.users import GlobalRole, ProjectRole
 from dstack._internal.server.models import VolumeAttachmentModel, VolumeModel
 from dstack._internal.server.services.projects import add_project_member
 from dstack._internal.server.testing.common import (
-    ComputeMockSpec,
     create_instance,
     create_project,
     create_user,
@@ -22,15 +21,13 @@ from dstack._internal.server.testing.common import (
     get_auth_headers,
     get_volume_configuration,
     get_volume_provisioning_data,
+    list_events,
 )
 
 
 class TestListVolumes:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/volumes/list")
         assert response.status_code in [401, 403]
 
@@ -70,8 +67,8 @@ class TestListVolumes:
                 "user": user.name,
                 "configuration": json.loads(volume2.configuration),
                 "external": False,
-                "created_at": "2023-01-02T03:05:00+00:00",
-                "last_processed_at": "2023-01-02T03:05:00+00:00",
+                "created_at": "2023-01-02T03:05:00Z",
+                "last_processed_at": "2023-01-02T03:05:00Z",
                 "status": "submitted",
                 "status_message": None,
                 "deleted": False,
@@ -89,8 +86,8 @@ class TestListVolumes:
                 "user": user.name,
                 "configuration": json.loads(volume1.configuration),
                 "external": False,
-                "created_at": "2023-01-02T03:04:00+00:00",
-                "last_processed_at": "2023-01-02T03:04:00+00:00",
+                "created_at": "2023-01-02T03:04:00Z",
+                "last_processed_at": "2023-01-02T03:04:00Z",
                 "status": "submitted",
                 "status_message": None,
                 "deleted": False,
@@ -106,7 +103,7 @@ class TestListVolumes:
             "/api/volumes/list",
             headers=get_auth_headers(user.token),
             json={
-                "prev_created_at": "2023-01-02T03:05:00+00:00",
+                "prev_created_at": "2023-01-02T03:05:00Z",
                 "prev_id": str(volume2.id),
             },
         )
@@ -119,8 +116,8 @@ class TestListVolumes:
                 "user": user.name,
                 "configuration": json.loads(volume1.configuration),
                 "external": False,
-                "created_at": "2023-01-02T03:04:00+00:00",
-                "last_processed_at": "2023-01-02T03:04:00+00:00",
+                "created_at": "2023-01-02T03:04:00Z",
+                "last_processed_at": "2023-01-02T03:04:00Z",
                 "status": "submitted",
                 "status_message": None,
                 "deleted": False,
@@ -176,8 +173,8 @@ class TestListVolumes:
                 "user": user1.name,
                 "configuration": json.loads(volume1.configuration),
                 "external": False,
-                "created_at": "2023-01-02T03:04:00+00:00",
-                "last_processed_at": "2023-01-02T03:04:00+00:00",
+                "created_at": "2023-01-02T03:04:00Z",
+                "last_processed_at": "2023-01-02T03:04:00Z",
                 "status": "submitted",
                 "status_message": None,
                 "deleted": False,
@@ -193,10 +190,7 @@ class TestListVolumes:
 
 class TestListProjectVolumes:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/project/main/volumes/list")
         assert response.status_code in [401, 403]
 
@@ -227,8 +221,8 @@ class TestListProjectVolumes:
                 "user": user.name,
                 "configuration": json.loads(volume.configuration),
                 "external": False,
-                "created_at": "2023-01-02T03:04:00+00:00",
-                "last_processed_at": "2023-01-02T03:04:00+00:00",
+                "created_at": "2023-01-02T03:04:00Z",
+                "last_processed_at": "2023-01-02T03:04:00Z",
                 "status": "submitted",
                 "status_message": None,
                 "deleted": False,
@@ -244,10 +238,7 @@ class TestListProjectVolumes:
 
 class TestGetVolume:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/project/main/volumes/get")
         assert response.status_code in [401, 403]
 
@@ -278,8 +269,8 @@ class TestGetVolume:
             "user": user.name,
             "configuration": json.loads(volume.configuration),
             "external": False,
-            "created_at": "2023-01-02T03:04:00+00:00",
-            "last_processed_at": "2023-01-02T03:04:00+00:00",
+            "created_at": "2023-01-02T03:04:00Z",
+            "last_processed_at": "2023-01-02T03:04:00Z",
             "status": "submitted",
             "status_message": None,
             "deleted": False,
@@ -311,10 +302,7 @@ class TestGetVolume:
 
 class TestCreateVolume:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/project/main/volumes/create")
         assert response.status_code in [401, 403]
 
@@ -333,18 +321,18 @@ class TestCreateVolume:
             response = await client.post(
                 f"/api/project/{project.name}/volumes/create",
                 headers=get_auth_headers(user.token),
-                json={"configuration": configuration.dict()},
+                json={"configuration": configuration.model_dump()},
             )
         assert response.status_code == 200
         assert response.json() == {
             "id": "1b0e1b45-2f8c-4ab6-8010-a0d1a3e44e0e",
             "name": configuration.name,
             "project_name": project.name,
-            "configuration": configuration,
+            "configuration": configuration.model_dump(mode="json"),
             "user": user.name,
             "external": False,
-            "created_at": "2023-01-02T03:04:00+00:00",
-            "last_processed_at": "2023-01-02T03:04:00+00:00",
+            "created_at": "2023-01-02T03:04:00Z",
+            "last_processed_at": "2023-01-02T03:04:00Z",
             "status": "submitted",
             "status_message": None,
             "deleted": False,
@@ -357,14 +345,14 @@ class TestCreateVolume:
         }
         res = await session.execute(select(VolumeModel))
         assert res.scalar_one()
+        events = await list_events(session)
+        assert len(events) == 1
+        assert events[0].message == "Volume created. Status: SUBMITTED"
 
 
 class TestDeleteVolumes:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_returns_40x_if_not_authenticated(
-        self, test_db, session: AsyncSession, client: AsyncClient
-    ):
+    async def test_returns_40x_if_not_authenticated(self, client: AsyncClient):
         response = await client.post("/api/project/main/volumes/delete")
         assert response.status_code in [401, 403]
 
@@ -382,21 +370,17 @@ class TestDeleteVolumes:
             user=user,
             volume_provisioning_data=get_volume_provisioning_data(),
         )
-        with patch(
-            "dstack._internal.server.services.backends.get_project_backend_by_type_or_error"
-        ) as m:
-            aws_mock = Mock()
-            m.return_value = aws_mock
-            aws_mock.compute.return_value = Mock(spec=ComputeMockSpec)
-            response = await client.post(
-                f"/api/project/{project.name}/volumes/delete",
-                headers=get_auth_headers(user.token),
-                json={"names": [volume.name]},
-            )
-            aws_mock.compute.return_value.delete_volume.assert_called()
+        response = await client.post(
+            f"/api/project/{project.name}/volumes/delete",
+            headers=get_auth_headers(user.token),
+            json={"names": [volume.name]},
+        )
         assert response.status_code == 200
         await session.refresh(volume)
-        assert volume.deleted
+        assert volume.to_be_deleted
+        events = await list_events(session)
+        assert len(events) == 1
+        assert events[0].message == "Volume marked for deletion"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -428,3 +412,5 @@ class TestDeleteVolumes:
         assert response.status_code == 400
         await session.refresh(volume)
         assert not volume.deleted
+        events = await list_events(session)
+        assert len(events) == 0

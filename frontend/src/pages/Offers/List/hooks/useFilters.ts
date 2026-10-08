@@ -3,23 +3,36 @@ import { useSearchParams } from 'react-router-dom';
 
 import type { MultiselectProps, PropertyFilterProps } from 'components';
 
-import { useProjectFilter } from 'hooks/useProjectFilter';
 import {
     EMPTY_QUERY,
+    getTokenAwareNamePatternFilterRequestParams,
     requestParamsToArray,
     requestParamsToTokens,
     tokensToRequestParams,
     tokensToSearchParams,
 } from 'libs/filters';
+import { useLazyGetProjectFleetsQuery } from 'services/fleet';
+import { useGetProjectsQuery, useLazyGetProjectsQuery } from 'services/project';
 
-import { getPropertyFilterOptions } from '../helpers';
+import { getFleetFilterValue, getPropertyFilterOptions } from '../helpers';
 
-type Args = {
+type RequestParamsKeys =
+    | 'project_name'
+    | 'gpu_name'
+    | 'gpu_count'
+    | 'gpu_memory'
+    | 'backend'
+    | 'fleet'
+    | 'spot_policy'
+    | 'group_by';
+
+export type UseFiltersArgs = {
     gpus: IGpu[];
     withSearchParams?: boolean;
+    showFleetFilter?: boolean;
+    permanentFilters?: Partial<Record<RequestParamsKeys, string>>;
+    defaultFilters?: Partial<Record<RequestParamsKeys, string | string[]>>;
 };
-
-type RequestParamsKeys = 'project_name' | 'gpu_name' | 'gpu_count' | 'gpu_memory' | 'backend' | 'spot_policy' | 'group_by';
 
 export const filterKeys: Record<string, RequestParamsKeys> = {
     PROJECT_NAME: 'project_name',
@@ -27,10 +40,11 @@ export const filterKeys: Record<string, RequestParamsKeys> = {
     GPU_COUNT: 'gpu_count',
     GPU_MEMORY: 'gpu_memory',
     BACKEND: 'backend',
+    FLEET: 'fleet',
     SPOT_POLICY: 'spot_policy',
 };
 
-const multipleChoiseKeys: RequestParamsKeys[] = ['gpu_name', 'backend'];
+const multipleChoiceKeys: RequestParamsKeys[] = ['gpu_name', 'backend', 'fleet'];
 
 const spotPolicyOptions = [
     {
@@ -47,20 +61,94 @@ const spotPolicyOptions = [
     },
 ];
 
+const filteringProperties = [
+    {
+        key: filterKeys.PROJECT_NAME,
+        operators: ['='],
+        propertyLabel: 'Project',
+        groupValuesLabel: 'Project values',
+    },
+    {
+        key: filterKeys.GPU_NAME,
+        operators: ['='],
+        propertyLabel: 'GPU name',
+        groupValuesLabel: 'GPU name values',
+    },
+    {
+        key: filterKeys.GPU_COUNT,
+        operators: ['<=', '>='],
+        propertyLabel: 'GPU count',
+        groupValuesLabel: 'GPU count values',
+    },
+    {
+        key: filterKeys.GPU_MEMORY,
+        operators: ['<=', '>='],
+        propertyLabel: 'GPU memory',
+        groupValuesLabel: 'GPU memory values',
+    },
+    {
+        key: filterKeys.BACKEND,
+        operators: ['='],
+        propertyLabel: 'Backend',
+        groupValuesLabel: 'Backend values',
+    },
+    {
+        key: filterKeys.FLEET,
+        operators: ['='],
+        propertyLabel: 'Fleet',
+        groupValuesLabel: 'Fleet values',
+    },
+    {
+        key: filterKeys.SPOT_POLICY,
+        operators: ['='],
+        propertyLabel: 'Spot policy',
+        groupValuesLabel: 'Spot policy values',
+    },
+];
+
 const gpuFilterOption = { label: 'GPU', value: 'gpu' };
-
 const defaultGroupByOptions = [{ ...gpuFilterOption }, { label: 'Backend', value: 'backend' }];
-
 const groupByRequestParamName: RequestParamsKeys = 'group_by';
+const limit = 100;
 
-export const useFilters = ({ gpus, withSearchParams = true }: Args) => {
+export const useFilters = ({
+    gpus,
+    withSearchParams = true,
+    showFleetFilter = false,
+    permanentFilters = {},
+    defaultFilters,
+}: UseFiltersArgs) => {
     const [searchParams, setSearchParams] = useSearchParams();
-    const { projectOptions } = useProjectFilter({ localStorePrefix: 'offers-list-projects' });
+    const [dynamicFilteringOptions, setDynamicFilteringOptions] = useState<PropertyFilterProps.FilteringOption[]>([]);
+    const [filteringStatusType, setFilteringStatusType] = useState<PropertyFilterProps.StatusType | undefined>();
+    const [getProjects] = useLazyGetProjectsQuery();
+    const [getProjectFleets] = useLazyGetProjectFleetsQuery();
+    const { data: projectsData } = useGetProjectsQuery({ limit: 1 });
     const projectNameIsChecked = useRef(false);
+    const prevSelectedProjectName = useRef<string | undefined>();
 
-    const [propertyFilterQuery, setPropertyFilterQuery] = useState<PropertyFilterProps.Query>(() =>
-        requestParamsToTokens<RequestParamsKeys>({ searchParams, filterKeys }),
-    );
+    const [propertyFilterQuery, setPropertyFilterQuery] = useState<PropertyFilterProps.Query>(() => {
+        const queryFromSearchParams = requestParamsToTokens<RequestParamsKeys>({
+            searchParams,
+            filterKeys,
+            defaultFilterValues: defaultFilters,
+        });
+
+        const tokens = showFleetFilter
+            ? queryFromSearchParams.tokens
+            : queryFromSearchParams.tokens.filter((token) => token.propertyKey !== filterKeys.FLEET);
+
+        const query = {
+            ...queryFromSearchParams,
+            tokens,
+        };
+
+        if (query.tokens.length > 0) {
+            return query;
+        }
+
+        return EMPTY_QUERY;
+    });
 
     const [groupBy, setGroupBy] = useState<MultiselectProps.Options>(() => {
         const selectedGroupBy = requestParamsToArray<RequestParamsKeys>({
@@ -84,17 +172,9 @@ export const useFilters = ({ gpus, withSearchParams = true }: Args) => {
     };
 
     const filteringOptions = useMemo(() => {
-        const options: PropertyFilterProps.FilteringOption[] = [...spotPolicyOptions];
+        const options: PropertyFilterProps.FilteringOption[] = [...spotPolicyOptions, ...dynamicFilteringOptions];
 
         const { names, backends } = getPropertyFilterOptions(gpus);
-
-        projectOptions.forEach(({ value }) => {
-            if (value)
-                options.push({
-                    propertyKey: filterKeys.PROJECT_NAME,
-                    value,
-                });
-        });
 
         Array.from(names).forEach((name) => {
             options.push({
@@ -111,7 +191,7 @@ export const useFilters = ({ gpus, withSearchParams = true }: Args) => {
         });
 
         return options;
-    }, [gpus]);
+    }, [gpus, dynamicFilteringOptions]);
 
     const groupByOptions: MultiselectProps.Options = useMemo(() => {
         return defaultGroupByOptions.map((option) => {
@@ -133,6 +213,17 @@ export const useFilters = ({ gpus, withSearchParams = true }: Args) => {
         });
     }, [groupBy]);
 
+    const filteringPropertiesForShowing = useMemo(() => {
+        const permanentFilterKeys = Object.keys(permanentFilters);
+        return filteringProperties.filter(({ key }) => {
+            if (key === filterKeys.FLEET && !showFleetFilter) {
+                return false;
+            }
+
+            return !permanentFilterKeys.includes(key);
+        });
+    }, [permanentFilters, showFleetFilter]);
+
     const setSearchParamsHandle = ({
         tokens,
         groupBy,
@@ -151,43 +242,10 @@ export const useFilters = ({ gpus, withSearchParams = true }: Args) => {
         setSearchParams(searchParams);
     };
 
-    const filteringProperties = [
-        {
-            key: filterKeys.PROJECT_NAME,
-            operators: ['='],
-            propertyLabel: 'Project',
-        },
-        {
-            key: filterKeys.GPU_NAME,
-            operators: ['='],
-            propertyLabel: 'GPU name',
-        },
-        {
-            key: filterKeys.GPU_COUNT,
-            operators: ['<=', '>='],
-            propertyLabel: 'GPU count',
-        },
-        {
-            key: filterKeys.GPU_MEMORY,
-            operators: ['<=', '>='],
-            propertyLabel: 'GPU memory',
-        },
-        {
-            key: filterKeys.BACKEND,
-            operators: ['='],
-            propertyLabel: 'Backend',
-        },
-        {
-            key: filterKeys.SPOT_POLICY,
-            operators: ['='],
-            propertyLabel: 'Spot policy',
-        },
-    ];
-
     const onChangePropertyFilterHandle = ({ tokens, operation }: PropertyFilterProps.Query) => {
         const filteredTokens = tokens.filter((token, tokenIndex) => {
             return (
-                multipleChoiseKeys.includes(token.propertyKey as RequestParamsKeys) ||
+                multipleChoiceKeys.includes(token.propertyKey as RequestParamsKeys) ||
                 !tokens.some((item, index) => token.propertyKey === item.propertyKey && index > tokenIndex)
             );
         });
@@ -227,16 +285,68 @@ export const useFilters = ({ gpus, withSearchParams = true }: Args) => {
     const filteringRequestParams = useMemo(() => {
         const params = tokensToRequestParams<RequestParamsKeys>({
             tokens: propertyFilterQuery.tokens,
-            arrayFieldKeys: multipleChoiseKeys,
+            arrayFieldKeys: multipleChoiceKeys,
         });
 
         return {
             ...params,
-        } as Partial<TRunsRequestParams>;
-    }, [propertyFilterQuery]);
+            ...permanentFilters,
+        };
+    }, [propertyFilterQuery, permanentFilters]);
+
+    const selectedProjectName = useMemo(() => {
+        const projectName = filteringRequestParams['project_name'];
+
+        return typeof projectName === 'string' ? projectName : undefined;
+    }, [filteringRequestParams]);
+
+    const handleLoadItems: PropertyFilterProps['onLoadItems'] = async ({ detail: { filteringProperty, filteringText } }) => {
+        setDynamicFilteringOptions([]);
+
+        setFilteringStatusType('loading');
+
+        if (filteringProperty?.key === filterKeys.PROJECT_NAME) {
+            await getProjects(
+                getTokenAwareNamePatternFilterRequestParams({
+                    filteringText,
+                    limit,
+                    propertyKey: filterKeys.PROJECT_NAME,
+                    tokens: propertyFilterQuery.tokens,
+                }),
+            )
+                .unwrap()
+                .then(({ data }) =>
+                    data.map(({ project_name }) => ({
+                        propertyKey: filterKeys.PROJECT_NAME,
+                        value: project_name,
+                    })),
+                )
+                .then(setDynamicFilteringOptions);
+        }
+
+        if (showFleetFilter && filteringProperty?.key === filterKeys.FLEET && selectedProjectName) {
+            await getProjectFleets({
+                projectName: selectedProjectName,
+                includeImported: true,
+            })
+                .unwrap()
+                .then((fleets) =>
+                    fleets
+                        .map((fleet) => ({
+                            propertyKey: filterKeys.FLEET,
+                            value: getFleetFilterValue(fleet, selectedProjectName),
+                        }))
+                        .filter(({ value }) => value.toLowerCase().includes(filteringText.toLowerCase()))
+                        .slice(0, limit),
+                )
+                .then(setDynamicFilteringOptions);
+        }
+
+        setFilteringStatusType(undefined);
+    };
 
     useEffect(() => {
-        if (!projectNameIsChecked.current && projectOptions.length) {
+        if (!projectNameIsChecked.current && projectsData?.data?.length) {
             projectNameIsChecked.current = true;
 
             if (!filteringRequestParams['project_name']) {
@@ -246,14 +356,32 @@ export const useFilters = ({ gpus, withSearchParams = true }: Args) => {
                         {
                             operator: '=',
                             propertyKey: filterKeys.PROJECT_NAME,
-                            value: projectOptions[0].value,
+                            value: projectsData.data[0].project_name,
                         },
                     ],
                     operation: 'and',
                 });
             }
         }
-    }, [projectOptions]);
+    }, [projectsData]);
+
+    useEffect(() => {
+        const prevProjectName = prevSelectedProjectName.current;
+        prevSelectedProjectName.current = selectedProjectName;
+
+        if (!showFleetFilter || prevProjectName === selectedProjectName) {
+            return;
+        }
+
+        if (!propertyFilterQuery.tokens.some((token) => token.propertyKey === filterKeys.FLEET)) {
+            return;
+        }
+
+        onChangePropertyFilterHandle({
+            tokens: propertyFilterQuery.tokens.filter((token) => token.propertyKey !== filterKeys.FLEET),
+            operation: propertyFilterQuery.operation,
+        });
+    }, [propertyFilterQuery, selectedProjectName, showFleetFilter]);
 
     return {
         filteringRequestParams,
@@ -261,9 +389,11 @@ export const useFilters = ({ gpus, withSearchParams = true }: Args) => {
         propertyFilterQuery,
         onChangePropertyFilter,
         filteringOptions,
-        filteringProperties,
+        filteringProperties: filteringPropertiesForShowing,
         groupBy,
         groupByOptions,
         onChangeGroupBy,
+        filteringStatusType,
+        handleLoadItems,
     } as const;
 };

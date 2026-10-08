@@ -1,8 +1,8 @@
+import uuid
 from collections.abc import Iterable
 from typing import Optional
 from uuid import UUID
 
-from git import List
 from sqlalchemy import and_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,6 +11,7 @@ from dstack._internal.core.backends.base.compute import (
     generate_unique_placement_group_name,
 )
 from dstack._internal.core.errors import BackendError, PlacementGroupNotSupportedError
+from dstack._internal.core.models.common import validate_json_extra_ignore
 from dstack._internal.core.models.instances import InstanceOffer
 from dstack._internal.core.models.placement import (
     PlacementGroup,
@@ -18,7 +19,8 @@ from dstack._internal.core.models.placement import (
     PlacementGroupProvisioningData,
     PlacementStrategy,
 )
-from dstack._internal.server.models import FleetModel, InstanceModel, PlacementGroupModel
+from dstack._internal.server.models import FleetModel, PlacementGroupModel
+from dstack._internal.server.services.instances import is_placeholder_instance
 from dstack._internal.utils.common import run_async
 from dstack._internal.utils.logging import get_logger
 
@@ -49,7 +51,9 @@ def placement_group_model_to_placement_group_optional(
 def get_placement_group_configuration(
     placement_group_model: PlacementGroupModel,
 ) -> PlacementGroupConfiguration:
-    return PlacementGroupConfiguration.__response__.parse_raw(placement_group_model.configuration)
+    return validate_json_extra_ignore(
+        PlacementGroupConfiguration, placement_group_model.configuration
+    )
 
 
 def get_placement_group_provisioning_data(
@@ -57,15 +61,15 @@ def get_placement_group_provisioning_data(
 ) -> Optional[PlacementGroupProvisioningData]:
     if placement_group_model.provisioning_data is None:
         return None
-    return PlacementGroupProvisioningData.__response__.parse_raw(
-        placement_group_model.provisioning_data
+    return validate_json_extra_ignore(
+        PlacementGroupProvisioningData, placement_group_model.provisioning_data
     )
 
 
 async def get_fleet_placement_group_models(
     session: AsyncSession,
     fleet_id: Optional[UUID],
-) -> List[PlacementGroupModel]:
+) -> list[PlacementGroupModel]:
     if fleet_id is None:
         return []
     res = await session.execute(
@@ -95,28 +99,6 @@ async def schedule_fleet_placement_groups_deletion(
     )
 
 
-def get_placement_group_model_for_instance(
-    placement_group_models: list[PlacementGroupModel],
-    instance_model: InstanceModel,
-    master_instance_model: InstanceModel,
-) -> Optional[PlacementGroupModel]:
-    placement_group_model = None
-    if instance_model.id != master_instance_model.id:
-        if placement_group_models:
-            placement_group_model = placement_group_models[0]
-        if len(placement_group_models) > 1:
-            logger.error(
-                (
-                    "Expected 0 or 1 placement groups associated with fleet %s, found %s."
-                    " An incorrect placement group might have been selected for instance %s"
-                ),
-                instance_model.fleet_id,
-                len(placement_group_models),
-                instance_model.name,
-            )
-    return placement_group_model
-
-
 def get_placement_group_model_for_job(
     placement_group_models: list[PlacementGroupModel],
     fleet_model: Optional[FleetModel],
@@ -125,19 +107,37 @@ def get_placement_group_model_for_job(
     Returns any fleet placement group for jobs that provision
     in non-empty fleets and `None` for empty fleets.
     This is so that only the first job creates placement groups.
+    Placeholder reservations are excluded: a placeholder-only fleet is treated
+    as empty here so offer selection is not pinned to a stale PG's region.
     """
     placement_group_model = None
     active_instances = []
     if fleet_model is not None:
-        active_instances = [i for i in fleet_model.instances if not i.deleted]
+        active_instances = [
+            i for i in fleet_model.instances if not i.deleted and not is_placeholder_instance(i)
+        ]
     if len(active_instances) > 0 and len(placement_group_models) > 0:
         placement_group_model = placement_group_models[0]
     return placement_group_model
 
 
+async def can_use_placement_groups(
+    compute: ComputeWithPlacementGroupSupport,
+    instance_offer: InstanceOffer,
+    reservation: Optional[str],
+) -> bool:
+    if reservation is None:
+        return True
+    return await run_async(
+        compute.are_placement_groups_compatible_with_reservation,
+        instance_offer,
+        reservation,
+    )
+
+
 async def find_or_create_suitable_placement_group(
     fleet_model: FleetModel,
-    placement_groups: List[PlacementGroupModel],
+    placement_groups: list[PlacementGroupModel],
     instance_offer: InstanceOffer,
     compute: ComputeWithPlacementGroupSupport,
 ) -> Optional[PlacementGroupModel]:
@@ -156,7 +156,7 @@ async def find_or_create_suitable_placement_group(
 
 
 def find_suitable_placement_group(
-    placement_groups: List[PlacementGroupModel],
+    placement_groups: list[PlacementGroupModel],
     instance_offer: InstanceOffer,
     compute: ComputeWithPlacementGroupSupport,
 ) -> Optional[PlacementGroupModel]:
@@ -174,6 +174,7 @@ async def create_placement_group(
     compute: ComputeWithPlacementGroupSupport,
 ) -> Optional[PlacementGroupModel]:
     placement_group_model = PlacementGroupModel(
+        id=uuid.uuid4(),
         # TODO: generate the name in Compute.create_placement_group to allow
         # backend-specific name length limits
         name=generate_unique_placement_group_name(
@@ -186,7 +187,7 @@ async def create_placement_group(
             backend=master_instance_offer.backend,
             region=master_instance_offer.region,
             placement_strategy=PlacementStrategy.CLUSTER,
-        ).json(),
+        ).model_dump_json(),
     )
     placement_group = placement_group_model_to_placement_group(placement_group_model)
     logger.debug(
@@ -230,5 +231,5 @@ async def create_placement_group(
         placement_group.configuration.backend.value,
         placement_group.configuration.region,
     )
-    placement_group_model.provisioning_data = pgpd.json()
+    placement_group_model.provisioning_data = pgpd.model_dump_json()
     return placement_group_model

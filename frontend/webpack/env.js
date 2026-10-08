@@ -1,4 +1,5 @@
 const { join } = require('path');
+const { getProductConfig } = require('../product.config.cjs');
 
 const apiURLs = '/api';
 
@@ -15,9 +16,10 @@ const buildDir = join(__dirname, '../build');
 const publicDir = join(__dirname, '../public');
 const apiUrl = process.env.API_URL || apiURLs;
 const publicUrl = process.env.PUBLIC_URL || publicURLs;
-const uiVersion = process.env.UI_VERSION === 'sky' ? 'sky' : 'enterprise';
-
-const title = uiVersion === 'enterprise' ? 'dstack' : 'dstack Sky';
+const gaMeasurementId = process.env.GA_MEASUREMENT_ID || '';
+const product = getProductConfig(process.env.UI_VERSION);
+const uiVersion = product.id;
+const title = product.name;
 const description =
     'Get GPUs at the best prices and availability from a wide range of providers. No cloud ' +
     'account of your own is required.\n';
@@ -34,6 +36,7 @@ module.exports = {
     publicDir,
     apiUrl,
     publicUrl,
+    gaMeasurementId,
     title,
     description,
     uiVersion,

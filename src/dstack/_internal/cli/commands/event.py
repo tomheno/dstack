@@ -2,10 +2,16 @@ import argparse
 from dataclasses import asdict
 
 from dstack._internal.cli.commands import APIBaseCommand
-from dstack._internal.cli.services.events import EventListFilters, EventPaginator, print_event
+from dstack._internal.cli.services.events import (
+    EventListFilters,
+    EventPaginator,
+    EventTracker,
+    print_event,
+)
 from dstack._internal.cli.utils.common import (
     get_start_time,
 )
+from dstack._internal.core.models.common import EntityReference
 from dstack._internal.core.models.events import EventTargetType
 from dstack._internal.server.schemas.events import LIST_EVENTS_DEFAULT_LIMIT
 from dstack.api import Client
@@ -29,6 +35,12 @@ class EventCommand(APIBaseCommand):
 
         for parser in [self._parser, list_parser]:
             parser.add_argument(
+                "-w",
+                "--watch",
+                help="Watch events in realtime",
+                action="store_true",
+            )
+            parser.add_argument(
                 "--since",
                 help=(
                     "Only show events newer than the specified date."
@@ -43,6 +55,7 @@ class EventCommand(APIBaseCommand):
                 action="append",
                 metavar="NAME",
                 dest="target_fleets",
+                type=EntityReference.parse,
                 help="Only show events that target the specified fleets",
             )
             target_filters_group.add_argument(
@@ -52,12 +65,34 @@ class EventCommand(APIBaseCommand):
                 dest="target_runs",
                 help="Only show events that target the specified runs",
             )
+            target_filters_group.add_argument(
+                "--target-volume",
+                action="append",
+                metavar="NAME",
+                dest="target_volumes",
+                help="Only show events that target the specified volumes",
+            )
+            target_filters_group.add_argument(
+                "--target-gateway",
+                action="append",
+                metavar="NAME",
+                dest="target_gateways",
+                help="Only show events that target the specified gateways",
+            )
+            target_filters_group.add_argument(
+                "--target-secret",
+                action="append",
+                metavar="NAME",
+                dest="target_secrets",
+                help="Only show events that target the specified secrets",
+            )
             within_filters_group = parser.add_mutually_exclusive_group()
             within_filters_group.add_argument(
                 "--within-fleet",
                 action="append",
                 metavar="NAME",
                 dest="within_fleets",
+                type=EntityReference.parse,
                 help="Only show events that target the specified fleets or instances within those fleets",
             )
             within_filters_group.add_argument(
@@ -66,6 +101,14 @@ class EventCommand(APIBaseCommand):
                 metavar="NAME",
                 dest="within_runs",
                 help="Only show events that target the specified runs or jobs within those runs",
+            )
+            within_filters_group.add_argument(
+                "--within-gateway",
+                action="append",
+                metavar="NAME",
+                dest="within_gateways",
+                type=EntityReference.parse,
+                help="Only show events that target the specified gateways or replicas within those gateways",
             )
             parser.add_argument(
                 "--include-target-type",
@@ -84,7 +127,11 @@ class EventCommand(APIBaseCommand):
         since = get_start_time(args.since)
         filters = _build_filters(args, self.api)
 
-        if since is not None:
+        if args.watch:
+            events = EventTracker(
+                client=self.api.client.events, filters=filters, since=since
+            ).stream_forever()
+        elif since is not None:
             events = EventPaginator(self.api.client.events).list(
                 filters=filters, since=since, ascending=True
             )
@@ -92,7 +139,7 @@ class EventCommand(APIBaseCommand):
             events = reversed(self.api.client.events.list(ascending=False, **asdict(filters)))
         try:
             for event in events:
-                print_event(event)
+                print_event(current_project=self.api.project, event=event)
         except KeyboardInterrupt:
             pass
 
@@ -100,24 +147,50 @@ class EventCommand(APIBaseCommand):
 def _build_filters(args: argparse.Namespace, api: Client) -> EventListFilters:
     filters = EventListFilters()
 
+    has_target_filters = True
     if args.target_fleets:
         filters.target_fleets = [
-            api.client.fleets.get(api.project, name).id for name in args.target_fleets
+            api.client.fleets.get(ref.project or api.project, ref.name).id
+            for ref in args.target_fleets
         ]
     elif args.target_runs:
         filters.target_runs = [
             api.client.runs.get(api.project, name).id for name in args.target_runs
         ]
+    elif args.target_volumes:
+        filters.target_volumes = [
+            api.client.volumes.get(project_name=api.project, name=name).id
+            for name in args.target_volumes
+        ]
+    elif args.target_gateways:
+        filters.target_gateways = []
+        for name in args.target_gateways:
+            id = api.client.gateways.get(api.project, name).id
+            filters.target_gateways.append(id)
+    elif args.target_secrets:
+        filters.target_secrets = [
+            api.client.secrets.get(api.project, name=name).id for name in args.target_secrets
+        ]
+    else:
+        has_target_filters = False
 
     if args.within_fleets:
         filters.within_fleets = [
-            api.client.fleets.get(api.project, name).id for name in args.within_fleets
+            api.client.fleets.get(ref.project or api.project, ref.name).id
+            for ref in args.within_fleets
         ]
     elif args.within_runs:
         filters.within_runs = [
             api.client.runs.get(api.project, name).id for name in args.within_runs
         ]
-    else:
+    elif args.within_gateways:
+        filters.within_gateways = [
+            api.client.gateways.get(ref.project or api.project, ref.name).id
+            for ref in args.within_gateways
+        ]
+    elif not has_target_filters:
+        # default - limit to current project,
+        # unless there are more specific filters (e.g., for imported entities)
         filters.within_projects = [api.client.projects.get(api.project).project_id]
 
     if args.include_target_types:

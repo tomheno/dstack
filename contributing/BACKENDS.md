@@ -31,14 +31,23 @@ git clone https://github.com/dstackai/gpuhunt.git
 - **Online providers** offer dynamic machine configurations that are available at the very moment
   when you fetch configurations (e.g., GPU marketplaces).
   `gpuhunt` collects online providers' instance offers each time a `dstack` user provisions a new instance.
-  Examples: `tensordock`, `vastai`, etc.
+  Examples: `vastai`, `hotaisle`, etc.
 
 ### 1.3. Create the provider class
 
 Create the provider class file under `src/gpuhunt/providers`.
 
-Make sure your class extends the [`AbstractProvider`](https://github.com/dstackai/gpuhunt/blob/main/src/gpuhunt/providers/__init__.py)
-base class. See its docstrings for descriptions of the methods that your class should implement.
+Make sure your class extends either `OnlineProvider` or `OfflineProvider` from
+[base.py](https://github.com/dstackai/gpuhunt/blob/main/src/gpuhunt/providers/base.py),
+matching the choice you made above.
+
+Both kinds implement `get`, returning `CatalogItem`s with `provider` set to your provider's `NAME`.
+Additionally:
+
+- Online providers implement the `from_env` classmethod, which reads credentials from the
+  environment with `get_creds_env` and raises `MissingCredsError` if one is missing. Providers that
+  raise it are skipped by `default_catalog()` rather than failing the whole catalog.
+- Offline providers may override `filter` to omit some offers from the published catalog.
 
 Refer to examples:
 - Offline providers:
@@ -47,8 +56,8 @@ Refer to examples:
   [azure.py](https://github.com/dstackai/gpuhunt/blob/main/src/gpuhunt/providers/azure.py),
   [lambdalabs.py](https://github.com/dstackai/gpuhunt/blob/main/src/gpuhunt/providers/lambdalabs.py).
 - Online providers:
-  [vultr.py](https://github.com/dstackai/gpuhunt/blob/main/src/gpuhunt/providers/vultr.py)
-  [tensordock.py](https://github.com/dstackai/gpuhunt/blob/main/src/gpuhunt/providers/tensordock.py),
+  [vultr.py](https://github.com/dstackai/gpuhunt/blob/main/src/gpuhunt/providers/vultr.py),
+  [hotaisle.py](https://github.com/dstackai/gpuhunt/blob/main/src/gpuhunt/providers/hotaisle.py),
   [vastai.py](https://github.com/dstackai/gpuhunt/blob/main/src/gpuhunt/providers/vastai.py).
 
 ### 1.4. Register the provider with the catalog
@@ -57,7 +66,8 @@ Add your provider in the following places:
 - Either `OFFLINE_PROVIDERS` or `ONLINE_PROVIDERS` in `src/gpuhunt/_internal/catalog.py`.
 - The `python -m gpuhunt` command in `src/gpuhunt/__main__.py`.
 - (offline providers) The CI workflow in `.github/workflows/catalogs.yml`.
-- (online providers) The default catalog in `src/gpuhunt/_internal/default.py`.
+- (online providers) `ONLINE_PROVIDER_MODULES` in `src/gpuhunt/_internal/default.py`, which is what
+  `default_catalog()` loads.
 
 ### 1.5. Add data quality tests
 
@@ -160,8 +170,8 @@ If instances in the backend take more than 10 minutes to start, override the def
 
 ### 2.10. Document the backend
 
-Add the backend to the [Concepts->Backends](https://github.com/dstackai/dstack/blob/master/docs/docs/concepts/backends.md
-) page and the [server/comfig.yml](https://github.com/dstackai/dstack/blob/master/docs/docs/reference/server/config.yml.md) reference.
+Add the backend to the [Concepts->Backends](https://github.com/dstackai/dstack/blob/master/mkdocs/docs/concepts/backends.md
+) page and the [server/comfig.yml](https://github.com/dstackai/dstack/blob/master/mkdocs/docs/reference/server/config.yml.md) reference.
 
 ## 3. Appendix
 
@@ -181,8 +191,9 @@ The agent controls the VM and starts Docker containers for users' jobs.
 Since `dstack` controls the entire VM, VM-based backends can support more features,
 such as blocks, instance volumes, privileged containers, and reusable instances.
 
-Note, all VM-based backend `Compute`s should sublass the `ComputeWithPrivilegedSupport` mixin,
-as the `dstack-shim` agent provides this functionality OOTB.
+Note, all VM-based backend `Compute`s should sublass the `ComputeWithPrivilegedSupport`
+and `ComputeWithInstanceVolumesSupport` mixins, as the `dstack-shim` agent
+provides these functionalities OOTB.
 
 To support a VM-based backend, `dstack` expects the following:
 

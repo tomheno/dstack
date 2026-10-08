@@ -1,8 +1,9 @@
+import asyncio
 import uuid
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
 
@@ -13,11 +14,15 @@ from dstack._internal.core.errors import (
     ResourceExistsError,
     ServerClientError,
 )
+from dstack._internal.core.models.common import validate_json_extra_ignore
+from dstack._internal.core.models.duration import parse_duration
 from dstack._internal.core.models.volumes import (
+    AnyVolumeConfiguration,
     Volume,
     VolumeAttachment,
     VolumeAttachmentData,
     VolumeConfiguration,
+    VolumeConfigurationWithSize,
     VolumeInstance,
     VolumeProvisioningData,
     VolumeSpec,
@@ -33,17 +38,69 @@ from dstack._internal.server.models import (
     VolumeModel,
 )
 from dstack._internal.server.services import backends as backends_services
+from dstack._internal.server.services import events
 from dstack._internal.server.services.instances import get_instance_provisioning_data
 from dstack._internal.server.services.locking import (
     get_locker,
     string_to_lock_id,
 )
+from dstack._internal.server.services.pipelines import PipelineHinterProtocol
 from dstack._internal.server.services.plugins import apply_plugin_policies
 from dstack._internal.server.services.projects import list_user_project_models
 from dstack._internal.utils import common, random_names
 from dstack._internal.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def switch_volume_status(
+    session: AsyncSession,
+    volume_model: VolumeModel,
+    new_status: VolumeStatus,
+    actor: events.AnyActor = events.SystemActor(),
+):
+    old_status = volume_model.status
+    if old_status == new_status:
+        return
+
+    volume_model.status = new_status
+    emit_volume_status_change_event(
+        session=session,
+        volume_model=volume_model,
+        old_status=old_status,
+        new_status=new_status,
+        status_message=volume_model.status_message,
+        actor=actor,
+    )
+
+
+def emit_volume_status_change_event(
+    session: AsyncSession,
+    volume_model: VolumeModel,
+    old_status: VolumeStatus,
+    new_status: VolumeStatus,
+    status_message: Optional[str],
+    actor: events.AnyActor = events.SystemActor(),
+) -> None:
+    if old_status == new_status:
+        return
+    msg = get_volume_status_change_message(
+        old_status=old_status,
+        new_status=new_status,
+        status_message=status_message,
+    )
+    events.emit(session, msg, actor=actor, targets=[events.Target.from_model(volume_model)])
+
+
+def get_volume_status_change_message(
+    old_status: VolumeStatus,
+    new_status: VolumeStatus,
+    status_message: Optional[str],
+) -> str:
+    msg = f"Volume status changed {old_status.upper()} -> {new_status.upper()}"
+    if status_message is not None:
+        msg += f" ({status_message})"
+    return msg
 
 
 async def list_volumes(
@@ -154,6 +211,7 @@ async def list_project_volume_models(
         select(VolumeModel)
         .where(*filters)
         .options(joinedload(VolumeModel.user))
+        .options(joinedload(VolumeModel.project))
         .options(
             joinedload(VolumeModel.attachments)
             .joinedload(VolumeAttachmentModel.instance)
@@ -190,6 +248,7 @@ async def get_project_volume_model_by_name(
         select(VolumeModel)
         .where(*filters)
         .options(joinedload(VolumeModel.user))
+        .options(joinedload(VolumeModel.project))
         .options(
             joinedload(VolumeModel.attachments)
             .joinedload(VolumeAttachmentModel.instance)
@@ -203,7 +262,8 @@ async def create_volume(
     session: AsyncSession,
     project: ProjectModel,
     user: UserModel,
-    configuration: VolumeConfiguration,
+    configuration: AnyVolumeConfiguration,
+    pipeline_hinter: PipelineHinterProtocol,
 ) -> Volume:
     spec = await apply_plugin_policies(
         user=user.name,
@@ -235,21 +295,34 @@ async def create_volume(
         else:
             configuration.name = await generate_volume_name(session=session, project=project)
 
+        now = common.get_current_datetime()
         volume_model = VolumeModel(
             id=uuid.uuid4(),
             name=configuration.name,
             user_id=user.id,
             project=project,
             status=VolumeStatus.SUBMITTED,
-            configuration=configuration.json(),
+            configuration=configuration.model_dump_json(),
+            auto_cleanup_enabled=_get_autocleanup_enabled(configuration),
             attachments=[],
+            created_at=now,
+            last_processed_at=now,
         )
         session.add(volume_model)
+        events.emit(
+            session,
+            message=f"Volume created. Status: {volume_model.status.upper()}",
+            actor=events.UserActor.from_user(user),
+            targets=[events.Target.from_model(volume_model)],
+        )
         await session.commit()
+        pipeline_hinter.hint_fetch(VolumeModel.__name__)
         return volume_model_to_volume(volume_model)
 
 
-async def delete_volumes(session: AsyncSession, project: ProjectModel, names: List[str]):
+async def delete_volumes(
+    session: AsyncSession, project: ProjectModel, names: List[str], user: UserModel
+):
     res = await session.execute(
         select(VolumeModel).where(
             VolumeModel.project_id == project.id,
@@ -262,42 +335,46 @@ async def delete_volumes(session: AsyncSession, project: ProjectModel, names: Li
     await session.commit()
     logger.info("Deleting volumes: %s", [v.name for v in volume_models])
     async with get_locker(get_db().dialect_name).lock_ctx(VolumeModel.__tablename__, volumes_ids):
-        # Refetch after lock
-        res = await session.execute(
-            select(VolumeModel)
-            .where(
-                VolumeModel.project_id == project.id,
-                VolumeModel.name.in_(names),
-                VolumeModel.deleted == False,
+        # Retry locking volumes to increase lock acquisition chances.
+        # This hack is needed until requests are queued.
+        volume_models = []
+        for i in range(10):
+            res = await session.execute(
+                select(VolumeModel)
+                .where(
+                    VolumeModel.project_id == project.id,
+                    VolumeModel.id.in_(volumes_ids),
+                    VolumeModel.deleted == False,
+                    VolumeModel.lock_expires_at.is_(None),
+                )
+                .options(selectinload(VolumeModel.attachments))
+                .order_by(VolumeModel.id)  # take locks in order
+                .with_for_update(key_share=True, of=VolumeModel)
+                .execution_options(populate_existing=True)
             )
-            .options(selectinload(VolumeModel.user))
-            .options(selectinload(VolumeModel.attachments))
-            .execution_options(populate_existing=True)
-            .order_by(VolumeModel.id)  # take locks in order
-            .with_for_update(key_share=True)
-        )
-        volume_models = res.scalars().unique().all()
+            volume_models = res.scalars().unique().all()
+            if len(volume_models) == len(volumes_ids):
+                break
+            await asyncio.sleep(0.5)
+        if len(volume_models) != len(volumes_ids):
+            # TODO: Make the endpoint fully async so we don't need to lock and error.
+            raise ServerClientError(
+                "Failed to delete volumes: volumes are being processed currently. Try again later."
+            )
         for volume_model in volume_models:
             if len(volume_model.attachments) > 0:
                 raise ServerClientError(
                     f"Failed to delete volume {volume_model.name}. Volume is in use."
                 )
         for volume_model in volume_models:
-            try:
-                await _delete_volume(session=session, project=project, volume_model=volume_model)
-            except Exception:
-                logger.exception("Error when deleting volume %s", volume_model.name)
-        await session.execute(
-            update(VolumeModel)
-            .where(
-                VolumeModel.project_id == project.id,
-                VolumeModel.id.in_(volumes_ids),
-            )
-            .values(
-                deleted=True,
-                deleted_at=common.get_current_datetime(),
-            )
-        )
+            if not volume_model.to_be_deleted:
+                volume_model.to_be_deleted = True
+                events.emit(
+                    session,
+                    message="Volume marked for deletion",
+                    actor=events.UserActor.from_user(user),
+                    targets=[events.Target.from_model(volume_model)],
+                )
         await session.commit()
 
 
@@ -325,7 +402,7 @@ def volume_model_to_volume(volume_model: VolumeModel) -> Volume:
         project_name=volume_model.project.name,
         user=volume_model.user.name,
         configuration=configuration,
-        external=configuration.volume_id is not None,
+        external=configuration.is_external,
         created_at=volume_model.created_at,
         last_processed_at=volume_model.last_processed_at,
         status=volume_model.status,
@@ -342,20 +419,22 @@ def volume_model_to_volume(volume_model: VolumeModel) -> Volume:
     return volume
 
 
-def get_volume_configuration(volume_model: VolumeModel) -> VolumeConfiguration:
-    return VolumeConfiguration.__response__.parse_raw(volume_model.configuration)
+def get_volume_configuration(volume_model: VolumeModel) -> AnyVolumeConfiguration:
+    return validate_json_extra_ignore(VolumeConfiguration, volume_model.configuration).root
 
 
 def get_volume_provisioning_data(volume_model: VolumeModel) -> Optional[VolumeProvisioningData]:
     if volume_model.volume_provisioning_data is None:
         return None
-    return VolumeProvisioningData.__response__.parse_raw(volume_model.volume_provisioning_data)
+    return validate_json_extra_ignore(
+        VolumeProvisioningData, volume_model.volume_provisioning_data
+    )
 
 
 def get_volume_attachment_data(volume_model: VolumeModel) -> Optional[VolumeAttachmentData]:
     if volume_model.volume_attachment_data is None:
         return None
-    return VolumeAttachmentData.__response__.parse_raw(volume_model.volume_attachment_data)
+    return validate_json_extra_ignore(VolumeAttachmentData, volume_model.volume_attachment_data)
 
 
 def get_attachment_data(
@@ -363,7 +442,9 @@ def get_attachment_data(
 ) -> Optional[VolumeAttachmentData]:
     if volume_attachment_model.attachment_data is None:
         return None
-    return VolumeAttachmentData.__response__.parse_raw(volume_attachment_model.attachment_data)
+    return validate_json_extra_ignore(
+        VolumeAttachmentData, volume_attachment_model.attachment_data
+    )
 
 
 def instance_model_to_volume_instance(instance_model: InstanceModel) -> VolumeInstance:
@@ -380,17 +461,26 @@ def instance_model_to_volume_instance(instance_model: InstanceModel) -> VolumeIn
 
 
 async def generate_volume_name(session: AsyncSession, project: ProjectModel) -> str:
-    volume_models = await list_project_volume_models(session=session, project=project)
-    names = {v.name for v in volume_models}
+    res = await session.execute(
+        select(VolumeModel.name).where(
+            VolumeModel.project_id == project.id,
+            VolumeModel.deleted == False,
+        )
+    )
+    names = set(res.scalars().all())
     while True:
         name = random_names.generate_name()
         if name not in names:
             return name
 
 
-def _validate_volume_configuration(configuration: VolumeConfiguration):
-    if configuration.volume_id is None and configuration.size is None:
-        raise ServerClientError("Volume must specify either volume_id or size")
+def _validate_volume_configuration(configuration: AnyVolumeConfiguration):
+    if (
+        isinstance(configuration, VolumeConfigurationWithSize)
+        and configuration.external_volume_id is None
+        and configuration.size is None
+    ):
+        raise ServerClientError("Volume must specify either existing identifier or size")
     backends_services.check_backend_type_available(configuration.backend)
     if configuration.backend not in BACKENDS_WITH_VOLUMES_SUPPORT:
         raise ServerClientError(
@@ -400,7 +490,7 @@ def _validate_volume_configuration(configuration: VolumeConfiguration):
     if configuration.name is not None:
         validate_dstack_resource_name(configuration.name)
 
-    if configuration.volume_id is not None and configuration.auto_cleanup_duration is not None:
+    if configuration.is_external and configuration.auto_cleanup_duration is not None:
         if (
             isinstance(configuration.auto_cleanup_duration, int)
             and configuration.auto_cleanup_duration > 0
@@ -409,7 +499,7 @@ def _validate_volume_configuration(configuration: VolumeConfiguration):
             and configuration.auto_cleanup_duration not in ("off", "-1")
         ):
             raise ServerClientError(
-                "External volumes (with volume_id) do not support auto_cleanup_duration. "
+                "External volumes do not support auto_cleanup_duration. "
                 "Auto-cleanup only works for volumes created and managed by dstack."
             )
 
@@ -465,3 +555,8 @@ def _get_volume_cost(volume: Volume) -> float:
         * volume.provisioning_data.price
         / _VOLUME_PRICING_PERIOD.total_seconds()
     )
+
+
+def _get_autocleanup_enabled(configuration: AnyVolumeConfiguration) -> bool:
+    auto_cleanup_duration = parse_duration(configuration.auto_cleanup_duration)
+    return auto_cleanup_duration is not None and auto_cleanup_duration > 0

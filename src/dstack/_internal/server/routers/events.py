@@ -8,7 +8,7 @@ from dstack._internal.server.models import UserModel
 from dstack._internal.server.schemas.events import ListEventsRequest
 from dstack._internal.server.security.permissions import Authenticated
 from dstack._internal.server.utils.routers import (
-    CustomORJSONResponse,
+    CustomJSONResponse,
     get_base_api_additional_responses,
 )
 
@@ -19,7 +19,7 @@ root_router = APIRouter(
 )
 
 
-@root_router.post("/list", response_model=list[Event])
+@root_router.post("/list", summary="List events", response_model=list[Event])
 async def list_events(
     body: ListEventsRequest,
     session: AsyncSession = Depends(get_session),
@@ -33,8 +33,12 @@ async def list_events(
 
     The results are paginated. To get the next page, pass `recorded_at` and `id` of
     the last event from the previous page as `prev_recorded_at` and `prev_id`.
+
+    NOTE: Some events may become available in the API with a delay after their `recorded_at`.
+    This should be taken into account when using the API to monitor recent events,
+    so that delayed events are not missed during pagination.
     """
-    return CustomORJSONResponse(
+    return CustomJSONResponse(
         await events_services.list_events(
             session=session,
             user=user,
@@ -44,9 +48,15 @@ async def list_events(
             target_instances=body.target_instances,
             target_runs=body.target_runs,
             target_jobs=body.target_jobs,
+            target_volumes=body.target_volumes,
+            target_gateways=body.target_gateways,
+            target_gateway_replicas=body.target_gateway_replicas,
+            target_secrets=body.target_secrets,
+            target_presets=body.target_presets,
             within_projects=body.within_projects,
             within_fleets=body.within_fleets,
             within_runs=body.within_runs,
+            within_gateways=body.within_gateways,
             include_target_types=body.include_target_types,
             actors=body.actors,
             prev_recorded_at=body.prev_recorded_at,

@@ -1,7 +1,6 @@
 import concurrent.futures
 import json
 import re
-import threading
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -9,19 +8,24 @@ from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 import google.api_core.exceptions
 import google.cloud.compute_v1 as compute_v1
+import gpuhunt
 from cachetools import TTLCache, cachedmethod
 from google.cloud import tpu_v2
 from google.cloud.compute_v1.types.compute import Instance
 from gpuhunt import KNOWN_TPUS
+from pydantic import ValidationError
 
 import dstack._internal.core.backends.gcp.auth as auth
 import dstack._internal.core.backends.gcp.resources as gcp_resources
-from dstack import version
+from dstack._internal import settings
 from dstack._internal.core.backends.base.compute import (
     Compute,
+    ComputeTTLCache,
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
+    ComputeWithGatewayLoadBalancerSupport,
     ComputeWithGatewaySupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     ComputeWithPlacementGroupSupport,
     ComputeWithPrivateGatewaySupport,
@@ -30,6 +34,7 @@ from dstack._internal.core.backends.base.compute import (
     ComputeWithVolumeSupport,
     generate_unique_gateway_instance_name,
     generate_unique_instance_name,
+    generate_unique_short_backend_name,
     generate_unique_volume_name,
     get_gateway_user_data,
     get_shim_commands,
@@ -53,23 +58,29 @@ from dstack._internal.core.errors import (
     ProvisioningError,
 )
 from dstack._internal.core.models.backends.base import BackendType
-from dstack._internal.core.models.common import CoreModel
+from dstack._internal.core.models.common import (
+    CoreModel,
+    validate_extra_ignore,
+    validate_json_extra_ignore,
+)
 from dstack._internal.core.models.gateways import (
-    GatewayComputeConfiguration,
-    GatewayProvisioningData,
+    GatewayLoadBalancerConfiguration,
+    GatewayLoadBalancerData,
+    GatewayReplicaConfiguration,
+    GatewayReplicaProvisioningData,
 )
 from dstack._internal.core.models.instances import (
     InstanceAvailability,
     InstanceConfiguration,
     InstanceOffer,
     InstanceOfferWithAvailability,
-    InstanceType,
     Resources,
 )
 from dstack._internal.core.models.placement import PlacementGroup, PlacementGroupProvisioningData
 from dstack._internal.core.models.resources import Memory, Range
 from dstack._internal.core.models.runs import JobProvisioningData, Requirements
 from dstack._internal.core.models.volumes import (
+    GCPVolumeConfiguration,
     Volume,
     VolumeAttachmentData,
     VolumeProvisioningData,
@@ -100,15 +111,28 @@ class GCPVolumeDiskBackendData(CoreModel):
     disk_type: str
 
 
+class GCPGatewayBackendData(CoreModel):
+    zone: str
+    instance_group_name: str
+    health_check_name: str
+    backend_service_name: str
+    url_map_name: str
+    target_http_proxy_name: Optional[str] = None
+    target_https_proxy_name: Optional[str] = None
+    forwarding_rule_name: str
+
+
 class GCPCompute(
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
     ComputeWithPrivilegedSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     ComputeWithReservationSupport,
     ComputeWithPlacementGroupSupport,
     ComputeWithGatewaySupport,
     ComputeWithPrivateGatewaySupport,
+    ComputeWithGatewayLoadBalancerSupport,
     ComputeWithVolumeSupport,
     Compute,
 ):
@@ -127,46 +151,66 @@ class GCPCompute(
             credentials=self.credentials
         )
         self.reservations_client = compute_v1.ReservationsClient(credentials=self.credentials)
-        self._usable_subnets_cache_lock = threading.Lock()
-        self._usable_subnets_cache = TTLCache(maxsize=1, ttl=120)
-        self._find_reservation_cache_lock = threading.Lock()
-        # smaller TTL, since we check the reservation's in_use_count, which can change often
-        self._find_reservation_cache = TTLCache(maxsize=8, ttl=20)
+        self.instance_groups_client = compute_v1.InstanceGroupsClient(credentials=self.credentials)
+        self.region_health_checks_client = compute_v1.RegionHealthChecksClient(
+            credentials=self.credentials
+        )
+        self.region_backend_services_client = compute_v1.RegionBackendServicesClient(
+            credentials=self.credentials
+        )
+        self.region_url_maps_client = compute_v1.RegionUrlMapsClient(credentials=self.credentials)
+        self.region_target_https_proxies_client = compute_v1.RegionTargetHttpsProxiesClient(
+            credentials=self.credentials
+        )
+        self.region_target_http_proxies_client = compute_v1.RegionTargetHttpProxiesClient(
+            credentials=self.credentials
+        )
+        self.forwarding_rules_client = compute_v1.ForwardingRulesClient(
+            credentials=self.credentials
+        )
+        self._usable_subnets_cache = ComputeTTLCache(cache=TTLCache(maxsize=1, ttl=120))
+        # Smaller TTL since we check the reservation's in_use_count, which can change often
+        self._reservation_cache = ComputeTTLCache(cache=TTLCache(maxsize=8, ttl=20))
 
-    def get_all_offers_with_availability(self) -> List[InstanceOfferWithAvailability]:
+    def get_all_offers_with_availability(
+        self, unallocated_resources: bool
+    ) -> List[InstanceOfferWithAvailability]:
         regions = get_or_error(self.config.regions)
+        zones_by_key: Dict[Tuple, List[str]] = {}
+        catalog_item_filter = _make_catalog_item_filter(regions, zones_by_key)
         offers = get_catalog_offers(
             backend=BackendType.GCP,
-            extra_filter=_supported_instances_and_zones(regions),
+            catalog_item_filter=catalog_item_filter,
         )
         quotas: Dict[str, Dict[str, float]] = defaultdict(dict)
         for region in self.regions_client.list(project=self.config.project_id):
             for quota in region.quotas:
                 quotas[region.name][quota.metric] = quota.limit - quota.usage
 
-        offer_keys_to_offers = {}
         offers_with_availability = []
         for offer in offers:
             region = offer.region[:-2]  # strip zone
-            key = (_unique_instance_name(offer.instance), region)
-            if key in offer_keys_to_offers:
-                offer_keys_to_offers[key].availability_zones.append(offer.region)
-                continue
+            gpu_name = (
+                offer.instance.resources.gpus[0].name if offer.instance.resources.gpus else None
+            )
+            key = _offer_dedup_key(
+                offer.instance.name, offer.instance.resources.spot, gpu_name, region
+            )
             availability = InstanceAvailability.NO_QUOTA
             if _has_gpu_quota(quotas[region], offer.instance.resources):
                 availability = InstanceAvailability.UNKNOWN
             # todo quotas: cpu, memory, global gpu, tpu
-            offer_with_availability = InstanceOfferWithAvailability(
-                **offer.dict(),
+            offer_with_availability = offer.with_availability(
                 availability=availability,
-                availability_zones=[offer.region],
+                availability_zones=zones_by_key.get(key, []),
             )
-            offer_keys_to_offers[key] = offer_with_availability
             offers_with_availability.append(offer_with_availability)
-            offers_with_availability[-1].region = region
+            offer_with_availability.region = region
         return offers_with_availability
 
-    def get_offers_modifiers(self, requirements: Requirements) -> Iterable[OfferModifier]:
+    def get_offers_modifiers(
+        self, requirements: Requirements, full_offers: bool
+    ) -> Iterable[OfferModifier]:
         modifiers = []
 
         if requirements.reservation:
@@ -188,7 +232,7 @@ class GCPCompute(
                             zones_with_capacity.append(zone)
                 if not matching_zones:
                     return None
-                offer = offer.copy(deep=True)
+                offer = offer.model_copy(deep=True)
                 if zones_with_capacity:
                     offer.availability_zones = zones_with_capacity
                 else:
@@ -208,8 +252,8 @@ class GCPCompute(
 
             def reserved_offers_filter(offer: InstanceOfferWithAvailability) -> bool:
                 """Remove reserved-only offers"""
-                if GCPOfferBackendData.__response__.parse_obj(
-                    offer.backend_data
+                if validate_extra_ignore(
+                    GCPOfferBackendData, offer.backend_data
                 ).is_dws_calendar_mode:
                     return False
                 return True
@@ -267,8 +311,8 @@ class GCPCompute(
                 network=self.config.vpc_resource_name,
             )
         disk_size = round(instance_offer.instance.resources.disk.size_mib / 1024)
-        # Choose any usable subnet in a VPC.
-        # Configuring a specific subnet per region is not supported yet.
+        # Use the subnet configured in `subnetworks` for the region if any,
+        # otherwise choose any usable subnet in the VPC.
         subnetwork = self._get_vpc_subnet(instance_offer.region)
         extra_subnets = self._get_extra_subnets(
             region=instance_offer.region,
@@ -550,33 +594,36 @@ class GCPCompute(
     ) -> bool:
         return placement_group.configuration.region == instance_offer.region
 
-    def are_placement_groups_compatible_with_reservations(self, backend_type: BackendType) -> bool:
+    def are_placement_groups_compatible_with_reservation(
+        self,
+        instance_offer: InstanceOffer,
+        reservation: str,
+    ) -> bool:
         # Cannot use our own placement policies when provisioning in a reservation.
         # Instead, we use the placement policy defined in reservation settings.
         return False
 
-    def create_gateway(
+    def create_gateway_replica(
         self,
-        configuration: GatewayComputeConfiguration,
-    ) -> GatewayProvisioningData:
+        configuration: GatewayReplicaConfiguration,
+        gateway_backend_data: Optional[str] = None,
+    ) -> GatewayReplicaProvisioningData:
         if self.config.vpc_project_id is None:
             gcp_resources.create_gateway_firewall_rules(
                 firewalls_client=self.firewalls_client,
                 project_id=self.config.project_id,
                 network=self.config.vpc_resource_name,
             )
-        for i in self.regions_client.list(project=self.config.project_id):
-            if i.name == configuration.region:
-                zone = i.zones[0].split("/")[-1]
-                break
+        if gateway_backend_data is not None:
+            zone = validate_json_extra_ignore(GCPGatewayBackendData, gateway_backend_data).zone
         else:
-            raise ComputeResourceNotFoundError()
+            zone = self._get_gateway_zone(configuration.region)
 
         instance_name = generate_unique_gateway_instance_name(
             configuration, max_length=gcp_resources.MAX_RESOURCE_NAME_LEN
         )
-        # Choose any usable subnet in a VPC.
-        # Configuring a specific subnet per region is not supported yet.
+        # Use the subnet configured in `subnetworks` for the region if any,
+        # otherwise choose any usable subnet in the VPC.
         subnetwork = self._get_vpc_subnet(configuration.region)
 
         labels = {
@@ -600,9 +647,7 @@ class GCPCompute(
             machine_type=configuration.instance_type or DEFAULT_GATEWAY_INSTANCE_TYPE,
             accelerators=[],
             spot=False,
-            user_data=get_gateway_user_data(
-                configuration.ssh_key_pub, router=configuration.router
-            ),
+            user_data=get_gateway_user_data(configuration.ssh_key_pub),
             authorized_keys=[configuration.ssh_key_pub],
             labels=labels,
             tags=[gcp_resources.DSTACK_GATEWAY_TAG],
@@ -624,7 +669,7 @@ class GCPCompute(
         instance = self.instances_client.get(
             project=self.config.project_id, zone=zone, instance=instance_name
         )
-        return GatewayProvisioningData(
+        return GatewayReplicaProvisioningData(
             instance_id=instance_name,
             region=configuration.region,  # used for instance termination
             availability_zone=zone,
@@ -632,10 +677,10 @@ class GCPCompute(
             backend_data=json.dumps({"zone": zone}),
         )
 
-    def terminate_gateway(
+    def terminate_gateway_replica(
         self,
         instance_id: str,
-        configuration: GatewayComputeConfiguration,
+        configuration: GatewayReplicaConfiguration,
         backend_data: Optional[str] = None,
     ):
         self.terminate_instance(
@@ -644,7 +689,419 @@ class GCPCompute(
             backend_data=backend_data,
         )
 
+    def _get_gateway_zone(self, region: str) -> str:
+        for i in self.regions_client.list(project=self.config.project_id):
+            if i.name == region:
+                return i.zones[0].split("/")[-1]
+        raise ComputeResourceNotFoundError()
+
+    def create_gateway_load_balancer(
+        self,
+        configuration: GatewayLoadBalancerConfiguration,
+    ) -> GatewayLoadBalancerData:
+        assert configuration.certificate is None or configuration.certificate.type == "gcp-cm"
+
+        zone = self._get_gateway_zone(configuration.region)
+
+        proxy_subnet_cidr = gcp_resources.get_proxy_only_subnet_cidr_or_error(
+            subnetworks_client=self.subnetworks_client,
+            project_id=self.config.vpc_project_id or self.config.project_id,
+            region=configuration.region,
+            network=self.config.vpc_resource_name,
+        )
+        subnetwork = None
+        if not configuration.public_ip:
+            subnetwork = gcp_resources.get_vpc_subnet_or_error(
+                vpc_name=self.config.vpc_name or "default",
+                region=configuration.region,
+                usable_subnets=self._list_usable_subnets(),
+                subnetwork_name=(
+                    self.config.subnetworks.get(configuration.region)
+                    if self.config.subnetworks
+                    else None
+                ),
+            )
+        if self.config.vpc_project_id is None:
+            gcp_resources.create_gateway_lb_healthcheck_firewall_rule(
+                firewalls_client=self.firewalls_client,
+                project_id=self.config.project_id,
+                network=self.config.vpc_resource_name,
+            )
+            gcp_resources.create_gateway_lb_proxy_firewall_rule(
+                firewalls_client=self.firewalls_client,
+                project_id=self.config.project_id,
+                region=configuration.region,
+                proxy_subnet_cidr=proxy_subnet_cidr,
+                network=self.config.vpc_resource_name,
+            )
+
+        name = generate_unique_short_backend_name()
+        instance_group_name = f"{name}-ig"
+        health_check_name = f"{name}-hc"
+        backend_service_name = f"{name}-bs"
+        url_map_name = f"{name}-um"
+        target_proxy_name = f"{name}-proxy"
+        forwarding_rule_name = f"{name}-fr"
+
+        instance_group_resource_name = (
+            f"projects/{self.config.project_id}/zones/{zone}/instanceGroups/{instance_group_name}"
+        )
+        health_check_resource_name = (
+            f"projects/{self.config.project_id}/regions/{configuration.region}"
+            f"/healthChecks/{health_check_name}"
+        )
+        backend_service_resource_name = (
+            f"projects/{self.config.project_id}/regions/{configuration.region}"
+            f"/backendServices/{backend_service_name}"
+        )
+        url_map_resource_name = (
+            f"projects/{self.config.project_id}/regions/{configuration.region}"
+            f"/urlMaps/{url_map_name}"
+        )
+        target_proxy_kind = (
+            "targetHttpProxies" if configuration.certificate is None else "targetHttpsProxies"
+        )
+        target_proxy_resource_name = (
+            f"projects/{self.config.project_id}/regions/{configuration.region}"
+            f"/{target_proxy_kind}/{target_proxy_name}"
+        )
+
+        logger.debug("Creating instance group for gateway %s...", configuration.gateway_name)
+        instance_group = compute_v1.InstanceGroup()
+        instance_group.name = instance_group_name
+        instance_group.named_ports = [compute_v1.NamedPort(name="http", port=80)]
+        operation = self.instance_groups_client.insert(
+            project=self.config.project_id, zone=zone, instance_group_resource=instance_group
+        )
+        gcp_resources.wait_for_extended_operation(operation, "instance group creation")
+        logger.debug("Created instance group for gateway %s.", configuration.gateway_name)
+
+        logger.debug("Creating health check for gateway %s...", configuration.gateway_name)
+        health_check = compute_v1.HealthCheck()
+        health_check.name = health_check_name
+        health_check.type_ = compute_v1.HealthCheck.Type.HTTP.name
+        health_check.http_health_check = compute_v1.HTTPHealthCheck(port=80)
+        operation = self.region_health_checks_client.insert(
+            project=self.config.project_id,
+            region=configuration.region,
+            health_check_resource=health_check,
+        )
+        gcp_resources.wait_for_extended_operation(operation, "health check creation")
+        logger.debug("Created health check for gateway %s.", configuration.gateway_name)
+
+        logger.debug("Creating backend service for gateway %s...", configuration.gateway_name)
+        load_balancing_scheme = (
+            compute_v1.BackendService.LoadBalancingScheme.EXTERNAL_MANAGED.name
+            if configuration.public_ip
+            else compute_v1.BackendService.LoadBalancingScheme.INTERNAL_MANAGED.name
+        )
+        backend_service = compute_v1.BackendService()
+        backend_service.name = backend_service_name
+        backend_service.load_balancing_scheme = load_balancing_scheme
+        backend_service.protocol = compute_v1.BackendService.Protocol.HTTP.name
+        backend_service.port_name = "http"
+        backend_service.health_checks = [health_check_resource_name]
+        backend_service.backends = [
+            compute_v1.Backend(
+                group=instance_group_resource_name,
+                balancing_mode=compute_v1.Backend.BalancingMode.UTILIZATION.name,
+                capacity_scaler=1.0,
+            )
+        ]
+        operation = self.region_backend_services_client.insert(
+            project=self.config.project_id,
+            region=configuration.region,
+            backend_service_resource=backend_service,
+        )
+        gcp_resources.wait_for_extended_operation(operation, "backend service creation")
+        logger.debug("Created backend service for gateway %s.", configuration.gateway_name)
+
+        logger.debug("Creating URL map for gateway %s...", configuration.gateway_name)
+        url_map = compute_v1.UrlMap()
+        url_map.name = url_map_name
+        url_map.default_service = backend_service_resource_name
+        operation = self.region_url_maps_client.insert(
+            project=self.config.project_id,
+            region=configuration.region,
+            url_map_resource=url_map,
+        )
+        gcp_resources.wait_for_extended_operation(operation, "URL map creation")
+        logger.debug("Created URL map for gateway %s.", configuration.gateway_name)
+
+        if configuration.certificate is None:
+            logger.debug(
+                "Creating target HTTP proxy for gateway %s...", configuration.gateway_name
+            )
+            target_http_proxy = compute_v1.TargetHttpProxy()
+            target_http_proxy.name = target_proxy_name
+            target_http_proxy.url_map = url_map_resource_name
+            operation = self.region_target_http_proxies_client.insert(
+                project=self.config.project_id,
+                region=configuration.region,
+                target_http_proxy_resource=target_http_proxy,
+            )
+            gcp_resources.wait_for_extended_operation(operation, "target HTTP proxy creation")
+            logger.debug("Created target HTTP proxy for gateway %s.", configuration.gateway_name)
+        else:
+            logger.debug(
+                "Creating target HTTPS proxy for gateway %s...", configuration.gateway_name
+            )
+            target_https_proxy = compute_v1.TargetHttpsProxy()
+            target_https_proxy.name = target_proxy_name
+            target_https_proxy.url_map = url_map_resource_name
+            target_https_proxy.ssl_certificates = [
+                gcp_resources.get_certificate_manager_certificate_url(
+                    configuration.certificate.name
+                )
+            ]
+            operation = self.region_target_https_proxies_client.insert(
+                project=self.config.project_id,
+                region=configuration.region,
+                target_https_proxy_resource=target_https_proxy,
+            )
+            gcp_resources.wait_for_extended_operation(operation, "target HTTPS proxy creation")
+            logger.debug("Created target HTTPS proxy for gateway %s.", configuration.gateway_name)
+            # TODO: HTTP->HTTPS redirect?
+
+        logger.debug("Creating forwarding rule for gateway %s...", configuration.gateway_name)
+        forwarding_rule = compute_v1.ForwardingRule()
+        forwarding_rule.name = forwarding_rule_name
+        forwarding_rule.load_balancing_scheme = load_balancing_scheme
+        forwarding_rule.I_p_protocol = compute_v1.ForwardingRule.IPProtocolEnum.TCP.name
+        forwarding_rule.port_range = "80" if configuration.certificate is None else "443"
+        forwarding_rule.target = target_proxy_resource_name
+        forwarding_rule.network = self.config.vpc_resource_name
+        if subnetwork is not None:
+            forwarding_rule.subnetwork = subnetwork
+        operation = self.forwarding_rules_client.insert(
+            project=self.config.project_id,
+            region=configuration.region,
+            forwarding_rule_resource=forwarding_rule,
+        )
+        gcp_resources.wait_for_extended_operation(operation, "forwarding rule creation")
+        forwarding_rule = self.forwarding_rules_client.get(
+            project=self.config.project_id,
+            region=configuration.region,
+            forwarding_rule=forwarding_rule_name,
+        )
+        logger.debug("Created forwarding rule for gateway %s.", configuration.gateway_name)
+
+        return GatewayLoadBalancerData(
+            hostname=forwarding_rule.I_p_address,
+            backend_data=GCPGatewayBackendData(
+                zone=zone,
+                instance_group_name=instance_group_name,
+                health_check_name=health_check_name,
+                backend_service_name=backend_service_name,
+                url_map_name=url_map_name,
+                target_http_proxy_name=(
+                    target_proxy_name if configuration.certificate is None else None
+                ),
+                target_https_proxy_name=(
+                    target_proxy_name if configuration.certificate is not None else None
+                ),
+                forwarding_rule_name=forwarding_rule_name,
+            ).model_dump_json(),
+        )
+
+    def terminate_gateway_load_balancer(
+        self,
+        configuration: GatewayLoadBalancerConfiguration,
+        backend_data: Optional[str],
+    ) -> None:
+        if backend_data is None:
+            logger.error(
+                "Failed to terminate load balancer for gateway %s: backend_data is None.",
+                configuration.gateway_name,
+            )
+            return
+        try:
+            backend_data_parsed = validate_json_extra_ignore(GCPGatewayBackendData, backend_data)
+        except ValidationError:
+            logger.exception(
+                "Failed to terminate load balancer for gateway %s: backend_data parsing error.",
+                configuration.gateway_name,
+            )
+            return
+
+        logger.debug(
+            "Deleting load balancer resources for gateway %s...", configuration.gateway_name
+        )
+        delete_calls = [
+            (
+                lambda: self.forwarding_rules_client.delete(
+                    project=self.config.project_id,
+                    region=configuration.region,
+                    forwarding_rule=backend_data_parsed.forwarding_rule_name,
+                ),
+                "forwarding rule deletion",
+            ),
+        ]
+        if backend_data_parsed.target_http_proxy_name is not None:
+            delete_calls.append(
+                (
+                    lambda: self.region_target_http_proxies_client.delete(
+                        project=self.config.project_id,
+                        region=configuration.region,
+                        target_http_proxy=backend_data_parsed.target_http_proxy_name,
+                    ),
+                    "target HTTP proxy deletion",
+                )
+            )
+        if backend_data_parsed.target_https_proxy_name is not None:
+            delete_calls.append(
+                (
+                    lambda: self.region_target_https_proxies_client.delete(
+                        project=self.config.project_id,
+                        region=configuration.region,
+                        target_https_proxy=backend_data_parsed.target_https_proxy_name,
+                    ),
+                    "target HTTPS proxy deletion",
+                )
+            )
+        delete_calls += [
+            (
+                lambda: self.region_url_maps_client.delete(
+                    project=self.config.project_id,
+                    region=configuration.region,
+                    url_map=backend_data_parsed.url_map_name,
+                ),
+                "URL map deletion",
+            ),
+            (
+                lambda: self.region_backend_services_client.delete(
+                    project=self.config.project_id,
+                    region=configuration.region,
+                    backend_service=backend_data_parsed.backend_service_name,
+                ),
+                "backend service deletion",
+            ),
+            (
+                lambda: self.region_health_checks_client.delete(
+                    project=self.config.project_id,
+                    region=configuration.region,
+                    health_check=backend_data_parsed.health_check_name,
+                ),
+                "health check deletion",
+            ),
+            (
+                lambda: self.instance_groups_client.delete(
+                    project=self.config.project_id,
+                    zone=backend_data_parsed.zone,
+                    instance_group=backend_data_parsed.instance_group_name,
+                ),
+                "instance group deletion",
+            ),
+        ]
+        for delete_call, verbose_name in delete_calls:
+            try:
+                operation = delete_call()
+                gcp_resources.wait_for_extended_operation(operation, verbose_name)
+            except google.api_core.exceptions.NotFound:
+                pass
+        logger.debug("Deleted load balancer resources for gateway %s.", configuration.gateway_name)
+
+    def register_gateway_replica_with_load_balancer(
+        self,
+        instance_id: str,
+        configuration: GatewayLoadBalancerConfiguration,
+        gateway_backend_data: Optional[str],
+    ) -> None:
+        if gateway_backend_data is None:
+            raise ComputeError(
+                f"Cannot register gateway {configuration.gateway_name} replica with load balancer:"
+                " gateway_backend_data is None"
+            )
+        try:
+            gateway_backend_data_parsed = validate_json_extra_ignore(
+                GCPGatewayBackendData, gateway_backend_data
+            )
+        except ValidationError as e:
+            raise ComputeError(
+                f"Cannot register gateway {configuration.gateway_name} replica with load balancer:"
+                " gateway_backend_data parsing error"
+            ) from e
+
+        instance_self_link = (
+            "https://www.googleapis.com/compute/v1/projects/"
+            f"{self.config.project_id}/zones/{gateway_backend_data_parsed.zone}/instances/{instance_id}"
+        )
+        logger.debug(
+            "Registering gateway %s replica %s with instance group %s...",
+            configuration.gateway_name,
+            instance_id,
+            gateway_backend_data_parsed.instance_group_name,
+        )
+        operation = self.instance_groups_client.add_instances(
+            project=self.config.project_id,
+            zone=gateway_backend_data_parsed.zone,
+            instance_group=gateway_backend_data_parsed.instance_group_name,
+            instance_groups_add_instances_request_resource=compute_v1.InstanceGroupsAddInstancesRequest(
+                instances=[compute_v1.InstanceReference(instance=instance_self_link)]
+            ),
+        )
+        gcp_resources.wait_for_extended_operation(operation, "instance group registration")
+        logger.debug(
+            "Registered gateway %s replica %s with instance group.",
+            configuration.gateway_name,
+            instance_id,
+        )
+
+    def deregister_gateway_replica_from_load_balancer(
+        self,
+        instance_id: str,
+        configuration: GatewayLoadBalancerConfiguration,
+        gateway_backend_data: Optional[str],
+    ) -> None:
+        if gateway_backend_data is None:
+            raise ComputeError(
+                f"Cannot deregister gateway {configuration.gateway_name} replica from load"
+                " balancer: gateway_backend_data is None"
+            )
+        try:
+            gateway_backend_data_parsed = validate_json_extra_ignore(
+                GCPGatewayBackendData, gateway_backend_data
+            )
+        except ValidationError as e:
+            raise ComputeError(
+                f"Cannot deregister gateway {configuration.gateway_name} replica from load"
+                " balancer: gateway_backend_data parsing error",
+            ) from e
+
+        instance_self_link = (
+            "https://www.googleapis.com/compute/v1/projects/"
+            f"{self.config.project_id}/zones/{gateway_backend_data_parsed.zone}/instances/{instance_id}"
+        )
+        logger.debug(
+            "Deregistering gateway %s replica %s from instance group %s...",
+            configuration.gateway_name,
+            instance_id,
+            gateway_backend_data_parsed.instance_group_name,
+        )
+        try:
+            operation = self.instance_groups_client.remove_instances(
+                project=self.config.project_id,
+                zone=gateway_backend_data_parsed.zone,
+                instance_group=gateway_backend_data_parsed.instance_group_name,
+                instance_groups_remove_instances_request_resource=compute_v1.InstanceGroupsRemoveInstancesRequest(
+                    instances=[compute_v1.InstanceReference(instance=instance_self_link)]
+                ),
+            )
+            gcp_resources.wait_for_extended_operation(operation, "instance group deregistration")
+        except google.api_core.exceptions.NotFound:
+            pass
+        except google.api_core.exceptions.BadRequest as e:
+            # The instance was never added to the group or was already removed
+            if "is not a member of" not in e.message:
+                raise
+        logger.debug(
+            "Deregistered gateway %s replica %s from instance group.",
+            configuration.gateway_name,
+            instance_id,
+        )
+
     def register_volume(self, volume: Volume) -> VolumeProvisioningData:
+        assert isinstance(volume.configuration, GCPVolumeConfiguration)
         logger.debug("Requesting persistent disk %s", volume.configuration.volume_id)
         zones = gcp_resources.get_availability_zones(
             regions_client=self.regions_client,
@@ -671,11 +1128,12 @@ class GCPCompute(
                     detachable=True,
                     backend_data=GCPVolumeDiskBackendData(
                         disk_type=gcp_resources.full_resource_name_to_name(disk.type_),
-                    ).json(),
+                    ).model_dump_json(),
                 )
         raise ComputeError(f"Persistent disk {volume.configuration.volume_id} not found")
 
     def create_volume(self, volume: Volume) -> VolumeProvisioningData:
+        assert isinstance(volume.configuration, GCPVolumeConfiguration)
         zones = gcp_resources.get_availability_zones(
             regions_client=self.regions_client,
             project_id=self.config.project_id,
@@ -738,7 +1196,7 @@ class GCPCompute(
             detachable=True,
             backend_data=GCPVolumeDiskBackendData(
                 disk_type=gcp_resources.full_resource_name_to_name(disk.type_),
-            ).json(),
+            ).model_dump_json(),
         )
 
     def delete_volume(self, volume: Volume):
@@ -948,8 +1406,8 @@ class GCPCompute(
         return nic_subnets
 
     @cachedmethod(
-        cache=lambda self: self._usable_subnets_cache,
-        lock=lambda self: self._usable_subnets_cache_lock,
+        cache=lambda self: self._usable_subnets_cache.cache,
+        lock=lambda self: self._usable_subnets_cache.lock,
     )
     def _list_usable_subnets(self) -> list[compute_v1.UsableSubnetwork]:
         # To avoid hitting the `ListUsable requests per minute` system limit, we fetch all subnets
@@ -962,15 +1420,17 @@ class GCPCompute(
     def _get_vpc_subnet(self, region: str) -> Optional[str]:
         if self.config.vpc_name is None:
             return None
+        subnetworks = self.config.subnetworks
         return gcp_resources.get_vpc_subnet_or_error(
             vpc_name=self.config.vpc_name,
             region=region,
             usable_subnets=self._list_usable_subnets(),
+            subnetwork_name=subnetworks.get(region) if subnetworks else None,
         )
 
     @cachedmethod(
-        cache=lambda self: self._find_reservation_cache,
-        lock=lambda self: self._find_reservation_cache_lock,
+        cache=lambda self: self._reservation_cache.cache,
+        lock=lambda self: self._reservation_cache.lock,
     )
     def _find_reservation(self, configured_name: str) -> dict[str, compute_v1.Reservation]:
         if match := RESERVATION_PATTERN.fullmatch(configured_name):
@@ -989,37 +1449,62 @@ class GCPCompute(
         )
 
 
-def _supported_instances_and_zones(
-    regions: List[str],
-) -> Optional[Callable[[InstanceOffer], bool]]:
-    def _filter(offer: InstanceOffer) -> bool:
-        # strip zone
-        if offer.region[:-2] not in regions:
-            return False
-        # remove multi-host TPUs for initial release
-        if _is_tpu(offer.instance.name) and not _is_single_host_tpu(offer.instance.name):
-            return False
-        for family in [
-            "m4-",
-            "c4-",
-            "n4-",
-            "h3-",
-            "n2-",
-            "e2-medium",
-            "e2-standard-",
-            "e2-highmem-",
-            "e2-highcpu-",
-            "m1-",
-            "a2-",
-            "a3-",
-            "g2-",
-        ]:
-            if offer.instance.name.startswith(family):
-                return True
-        if offer.instance.resources.gpus:
-            if offer.instance.resources.gpus[0].name not in {"K80", "P4"}:
-                return True
+def _is_supported_gcp_instance(instance_name: str, gpu_name: Optional[str]) -> bool:
+    """Check if the instance is supported by dstack."""
+    if _is_tpu(instance_name) and not _is_single_host_tpu(instance_name):
         return False
+    for family in [
+        "m4-",
+        "c4-",
+        "n4-",
+        "h3-",
+        "n2-",
+        "e2-medium",
+        "e2-standard-",
+        "e2-highmem-",
+        "e2-highcpu-",
+        "m1-",
+        "a2-",
+        "a3-",
+        "g2-",
+    ]:
+        if instance_name.startswith(family):
+            return True
+    if gpu_name is not None and gpu_name not in {"K80", "P4", "P100"}:
+        return True
+    return False
+
+
+def _offer_dedup_key(
+    instance_name: str, spot: bool, gpu_name: Optional[str], region: str
+) -> Tuple[str, bool, Optional[str], str]:
+    """Key for deduplicating GCP per-zone items into per-region offers."""
+    return (instance_name, spot, gpu_name, region)
+
+
+def _make_catalog_item_filter(
+    regions: List[str],
+    zones_by_key: Dict[Tuple, List[str]],
+) -> Callable[[gpuhunt.CatalogItem], bool]:
+    """
+    Returns a filter that checks region, instance support, and deduplicates
+    per-zone items into per-region offers. Zones are collected in `zones_by_key`
+    so the caller can attach them to offers later.
+    """
+    seen: set = set()
+
+    def _filter(item: gpuhunt.CatalogItem) -> bool:
+        region = item.location[:-2]
+        if region not in regions:
+            return False
+        if not _is_supported_gcp_instance(item.instance_name, item.gpu_name):
+            return False
+        key = _offer_dedup_key(item.instance_name, item.spot, item.gpu_name, region)
+        zones_by_key.setdefault(key, []).append(item.location)
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
 
     return _filter
 
@@ -1087,17 +1572,6 @@ def _reservation_has_capacity(reservation: compute_v1.Reservation) -> bool:
     )
 
 
-def _unique_instance_name(instance: InstanceType) -> str:
-    if instance.resources.spot:
-        name = f"{instance.name}-spot"
-    else:
-        name = instance.name
-    if not instance.resources.gpus:
-        return name
-    gpu = instance.resources.gpus[0]
-    return f"{name}-{gpu.name}-{gpu.memory_mib}"
-
-
 @dataclass
 class GCPImage:
     id: str
@@ -1110,17 +1584,22 @@ def _get_image(instance_type_name: str, gpu_name: Optional[str]) -> GCPImage:
         is_ufw_installed = False
     elif instance_type_name in ["a3-edgegpu-8g", "a3-highgpu-8g"]:
         return GCPImage(
-            id="projects/cos-cloud/global/images/cos-105-17412-535-78",
+            id="projects/cos-cloud/global/images/family/cos-121-lts",
             is_ufw_installed=False,
         )
     elif gpu_name is not None:
         if not requires_nvidia_proprietary_kernel_modules(gpu_name):
-            image_name = f"dstack-cuda-{version.base_image}"
+            image_name = (
+                f"{settings.DSTACK_VM_BASE_IMAGE_PREFIX}"
+                f"dstack-cuda-{settings.DSTACK_VM_BASE_IMAGE_VERSION}"
+            )
         else:
             image_name = f"dstack-cuda-{DSTACK_OS_IMAGE_WITH_PROPRIETARY_NVIDIA_KERNEL_MODULES}"
         is_ufw_installed = True
     else:
-        image_name = f"dstack-{version.base_image}"
+        image_name = (
+            f"{settings.DSTACK_VM_BASE_IMAGE_PREFIX}dstack-{settings.DSTACK_VM_BASE_IMAGE_VERSION}"
+        )
         is_ufw_installed = True
     image_name = image_name.replace(".", "-")
     return GCPImage(

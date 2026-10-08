@@ -1,6 +1,6 @@
 from typing import Annotated, Dict, List, Literal, Optional, Union
 
-from pydantic import Field
+from pydantic import Field, RootModel
 
 from dstack._internal.core.models.common import CoreModel
 
@@ -10,7 +10,7 @@ class AzureClientCreds(CoreModel):
     client_id: Annotated[str, Field(description="The client ID")]
     client_secret: Annotated[str, Field(description="The client secret")]
     # if tenant_id is missing, it will be populated from config info
-    tenant_id: Optional[str]
+    tenant_id: Optional[str] = None
 
 
 class AzureDefaultCreds(CoreModel):
@@ -20,8 +20,8 @@ class AzureDefaultCreds(CoreModel):
 AnyAzureCreds = Union[AzureClientCreds, AzureDefaultCreds]
 
 
-class AzureCreds(CoreModel):
-    __root__: AnyAzureCreds = Field(..., discriminator="type")
+class AzureCreds(RootModel[Annotated[AnyAzureCreds, Field(discriminator="type")]]):
+    pass
 
 
 class AzureBackendConfig(CoreModel):
@@ -51,13 +51,23 @@ class AzureBackendConfig(CoreModel):
             )
         ),
     ] = None
+    subnet_ids: Annotated[
+        Optional[Dict[str, str]],
+        Field(
+            description=(
+                "The mapping from configured Azure locations to subnet IDs."
+                " A subnet ID must have a format `networkResourceGroup/networkName/subnetName`."
+                " Cannot be configured for the same region as `vpc_ids`"
+            )
+        ),
+    ] = None
     public_ips: Annotated[
         Optional[bool],
         Field(
             description=(
                 "A flag to enable/disable public IP assigning on instances."
-                " `public_ips: false` requires `vpc_ids` that specifies custom networks with outbound internet connectivity"
-                " provided by NAT Gateway or other mechanism."
+                " `public_ips: false` requires `vpc_ids` or `subnet_ids` that specifies custom networks"
+                " with outbound internet connectivity provided by NAT Gateway or other mechanism."
                 " Defaults to `true`"
             )
         ),
@@ -89,7 +99,7 @@ class AzureStoredConfig(AzureBackendConfig):
 
 
 class AzureConfig(AzureStoredConfig):
-    creds: AnyAzureCreds
+    creds: Annotated[AnyAzureCreds, Field(discriminator="type")]
 
     @property
     def allocate_public_ips(self) -> bool:

@@ -1,0 +1,163 @@
+/*
+  Cloudscape internal overrides — the deliberate, isolated exception.
+
+  Everything Cloudscape exposes as a themeable design token lives in cloudscape-theme.ts
+  (the supported `applyTheme` API). This file covers only the few visual details that
+  Cloudscape does NOT expose as tokens, so they have to be set against its generated CSS
+  variables / scoped class names directly.
+
+  MAINTENANCE
+  - The hashed suffixes below (…-uwo8my, …-gudemr, awsui_…_sne0l) are pinned to the
+    installed @cloudscape-design/components version.
+  - After upgrading Cloudscape, re-verify each name. If one drifts, the rule simply stops
+    matching and the component falls back to its Cloudscape default (graceful degradation,
+    not a breakage). Re-derive with:
+      grep -roE '\-\-border-divider-section-width-[a-z0-9]+' node_modules/@cloudscape-design/components/container
+      grep -roE '\-\-color-border-tabs-[a-z-]+-[a-z0-9]+'    node_modules/@cloudscape-design/components/tabs
+*/
+
+/* NB: Cloudscape defines these tokens on `body` inside `@layer awsui-base-theme`. Our
+   redeclarations are unlayered, so they win over Cloudscape's layered ones. The COLOR
+   tokens inherit, so `body` is enough. The border-WIDTH token does NOT inherit, so it
+   has to be declared on the elements that read it — hence the universal selector. */
+
+/* 1) Hairline (0.5px) borders on Container / Tabs / Table rows (and anything else using
+      these divider widths). Border color + radius are themeable (cloudscape-theme.ts); the
+      widths are not, and they don't inherit — so set them on every element via `*`.
+      (section-width: containers/tabs; list-width: table rows + list dividers.) */
+* {
+  --border-divider-section-width-uwo8my: 1px; /* 1px outer border on containers / tabs / tables */
+  --border-divider-list-width-tdfx1x: 0.5px; /* table rows + list dividers stay hairline (exception) */
+}
+
+/* 2) Tabs: the bottom divider and the active-tab underline use the text color.
+      Tabs use tab-specific border-color tokens that the theming API doesn't expose. */
+body {
+  --color-border-tabs-divider-f5t9va: color-mix(in srgb, var(--cs-text) 14%, transparent);
+  --color-border-tabs-underline-gudemr: var(--cs-text);
+  --color-border-dropdown-group-ylcnh8: transparent; /* no divider between dropdown groups */
+  --color-text-expandable-section-hover-ojzwhd: var(--cs-text); /* FAQ: don't turn the question blue on hover */
+}
+
+/* 4) Content tabs.
+   a) Drop the vertical separators Cloudscape draws between tabs. Selection is shown by the
+      active tab's pill background (section 9), so the dividers just add noise — the tabs read
+      as a row of pills separated by the cells' own padding (matching the landing's tab design). */
+[class*='awsui_tabs-tab_'] > [class*='awsui_tabs-tab-header-container']::before {
+  display: none !important;
+}
+/* b) Drop the gray border + shadow that Cloudscape shows on the scroll arrows when the
+      tab strip overflows (the box-shadow renders both; border-inline is the divider). */
+[class*='awsui_pagination-button-left-scrollable'],
+[class*='awsui_pagination-button-right-scrollable'] {
+  box-shadow: none !important;
+}
+[class*='awsui_pagination-button-left'],
+[class*='awsui_pagination-button-right'] {
+  border-inline: 0 !important;
+}
+/* c) The scroll-arrow buttons carry 12px block margins, so they are taller than the tab row and
+      stretch the whole strip (and its tabs) ~10px taller than a chevron-free strip. Zero the block
+      margin so the arrows no longer inflate the tab height — the strip matches the others. */
+[class*='awsui_pagination-button'] {
+  margin-block: 0 !important;
+}
+
+/* 6) FAQ accordion (ExpandableSection): faint background tint on hover that covers the
+      whole block (question + answer) uniformly. Tint the section root, then neutralize
+      every inner background (header + content both carry their own white bg) so only the
+      single root tint shows — otherwise an opaque child paints over it and the question
+      ends up with an extra highlight vs the answer. FAQ items are plain text, so blanking
+      inner backgrounds is safe. */
+.faq-list [class*='awsui_root']:hover {
+  background: var(--cs-hover) !important;
+}
+.faq-list [class*='awsui_root']:hover * {
+  background: transparent !important;
+}
+
+/* 7) Testimonial quote cards. solid 0.5px (was dotted 0.25px); radius comes from
+      the container token (12px). */
+.testimonial-grid [class*='awsui_fit-height'] {
+  border-style: solid !important;
+  border-width: 0.5px !important;
+}
+
+/* 8) Mobile slide-out navigation (SideNavigation): render the expandable section headers
+      ("Resources" / "Get started") in the same weight and size as their sub-links, instead
+      of bold, for a flatter menu. Scoped to the mobile drawer; `awsui_header-text` is a
+      stable, hash-independent prefix. */
+.site-mobile-navigation [class*='awsui_header-text'] {
+  font-weight: 400 !important;
+  font-size: 16px !important;
+}
+
+/* All text buttons → 16px label (header GitHub/Get started, hero CTAs, and the buttons further
+   down the landing), matching the menu links + docs. Icon buttons keep their own glyph sizing. */
+[class*='awsui_button']:not([class*='awsui_variant-icon']),
+[class*='awsui_trigger-button'] {
+  font-size: 16px !important;
+}
+
+/* Primary (filled) buttons use 500 weight per design — outline/normal buttons keep their weight. */
+[class*='awsui_variant-primary'] {
+  font-weight: 500 !important;
+}
+
+/* 9) Content tabs — "pill" selection, matching the landing's own tab design: the active tab is a
+      panel-grey rounded-top pill (a hovered tab gets the faint --cs-hover tint), inactive labels
+      are muted, and there are no separators (section 4a). The pill is painted on the inner link
+      so each cell's inline padding becomes the gap between pills; a little top padding on the
+      strip lets the pills float above the softened (section 2) under-tab divider. */
+/* a) Drop the per-tab active underline indicator — selection is shown by the pill background. */
+[class*='awsui_tabs-tab-header-container']::after {
+  display: none !important;
+}
+/* b) Float the pills: top padding above the strip, and tighter cell padding so neighbouring
+      pills sit close (the cell's inline padding is the inter-pill gap). */
+[class*='awsui_tabs-header-list'] {
+  padding: 6px 4px 0 !important;
+}
+[class*='awsui_tabs-tab-header-container'] {
+  padding-inline: 3px !important;
+}
+/* c) The pill: muted label at rest, body color + faint tint on hover, panel-grey when selected.
+      Rounded top only — the flat bottom sits on the under-tab divider. aria-selected lives on
+      the inner link. */
+[class*='awsui_tabs-tab-link'] {
+  color: var(--cs-muted) !important;
+  padding-block: 13px !important; /* with the label padding zeroed (d), this matches .gs-tab's 15px/14px content-tab height */
+  padding-inline: 14px !important;
+  border-radius: 8px 8px 0 0 !important;
+}
+[class*='awsui_tabs-tab-link']:hover {
+  color: var(--cs-text) !important;
+  background: var(--cs-hover) !important;
+}
+[class*='awsui_tabs-tab-link'][aria-selected='true'] {
+  color: var(--cs-text) !important;
+  background: var(--cs-panel) !important;
+}
+/* d) The label span carries its own inner padding (4px 8px) on top of the link's padding, which
+      makes the Cloudscape pill ~12px taller than the landing's own tabs. Zero it so the pill height
+      is just link-padding + text — matching .gs-tab / .gs-skytab exactly. */
+[class*='awsui_tabs-tab-label'] {
+  padding: 0 !important;
+}
+
+/* 11) The FAQ wrapper owns the outer frame. Remove each stacked container's frame
+       and shadow, then draw only the separators between questions. */
+.faq-list > .faq-item {
+  border: 0 !important;
+  border-radius: 0 !important;
+}
+.faq-list > .faq-item::before,
+.faq-list > .faq-item::after {
+  display: none !important;
+}
+.faq-list > .faq-item + .faq-item {
+  border-block-start: 0.5px solid var(--cs-border) !important;
+}
+.faq-list * {
+  --border-divider-section-width-uwo8my: 0.5px;
+}

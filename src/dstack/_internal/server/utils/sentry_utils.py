@@ -1,18 +1,22 @@
 import asyncio
-import functools
 from typing import Optional
 
-import sentry_sdk
-from sentry_sdk.types import Event, Hint
+from sentry_sdk.types import Event, Hint, SamplingContext
+
+from dstack._internal.server import settings
+from dstack._internal.server.utils.common import is_background_task_name
 
 
-def instrument_background_task(f):
-    @functools.wraps(f)
-    async def wrapper(*args, **kwargs):
-        with sentry_sdk.start_transaction(name=f"background.{f.__name__}"):
-            return await f(*args, **kwargs)
-
-    return wrapper
+def sentry_traces_sampler(sampling_context: SamplingContext) -> float:
+    parent_sampling_decision = sampling_context["parent_sampled"]
+    if parent_sampling_decision is not None:
+        return float(parent_sampling_decision)
+    transaction_context = sampling_context["transaction_context"]
+    name = transaction_context.get("name")
+    if name is not None:
+        if is_background_task_name(name):
+            return settings.SENTRY_TRACES_BACKGROUND_SAMPLE_RATE
+    return settings.SENTRY_TRACES_SAMPLE_RATE
 
 
 class AsyncioCancelledErrorFilterEventProcessor:

@@ -5,8 +5,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
-	common "github.com/dstackai/dstack/runner/internal/api"
+	commonapi "github.com/dstackai/dstack/runner/internal/common/api"
+	"github.com/dstackai/dstack/runner/internal/common/gpu"
+	"github.com/dstackai/dstack/runner/internal/shim/host"
 )
 
 func TestHealthcheck(t *testing.T) {
@@ -15,7 +18,7 @@ func TestHealthcheck(t *testing.T) {
 
 	server := NewShimServer(context.Background(), ":12345", "0.0.1.dev2", NewDummyRunner(), nil, nil, nil, nil)
 
-	f := common.JSONResponseHandler(server.HealthcheckHandler)
+	f := commonapi.JSONResponseHandler(server.HealthcheckHandler)
 	f(responseRecorder, request)
 
 	if responseRecorder.Code != 200 {
@@ -23,6 +26,50 @@ func TestHealthcheck(t *testing.T) {
 	}
 
 	expected := "{\"service\":\"dstack-shim\",\"version\":\"0.0.1.dev2\"}"
+
+	if strings.TrimSpace(responseRecorder.Body.String()) != expected {
+		t.Errorf("Want '%s', got '%s'", expected, responseRecorder.Body.String())
+	}
+}
+
+// TestInstanceInfo goes through the router to also cover the endpoint registration
+func TestInstanceInfo(t *testing.T) {
+	request := httptest.NewRequest("GET", "/api/instance/info", nil)
+	responseRecorder := httptest.NewRecorder()
+
+	runner := NewDummyRunner()
+	runner.gpus = []host.GpuInfo{
+		{Vendor: gpu.GpuVendorNvidia, Name: "T4", Vram: 16384, DriverVersion: "570.86.15"},
+	}
+	server := NewShimServer(context.Background(), ":12346", "0.0.1.dev2", runner, nil, nil, nil, nil)
+
+	server.httpServer.Handler.ServeHTTP(responseRecorder, request)
+
+	if responseRecorder.Code != 200 {
+		t.Errorf("Want status '%d', got '%d'", 200, responseRecorder.Code)
+	}
+
+	expected := `{"gpu_vendor":"nvidia","gpu_driver_version":"570.86.15"}`
+
+	if strings.TrimSpace(responseRecorder.Body.String()) != expected {
+		t.Errorf("Want '%s', got '%s'", expected, responseRecorder.Body.String())
+	}
+}
+
+func TestInstanceInfoWithoutGpus(t *testing.T) {
+	request := httptest.NewRequest("GET", "/api/instance/info", nil)
+	responseRecorder := httptest.NewRecorder()
+
+	server := NewShimServer(context.Background(), ":12347", "0.0.1.dev2", NewDummyRunner(), nil, nil, nil, nil)
+
+	f := commonapi.JSONResponseHandler(server.InstanceInfoHandler)
+	f(responseRecorder, request)
+
+	if responseRecorder.Code != 200 {
+		t.Errorf("Want status '%d', got '%d'", 200, responseRecorder.Code)
+	}
+
+	expected := "{}"
 
 	if strings.TrimSpace(responseRecorder.Body.String()) != expected {
 		t.Errorf("Want '%s', got '%s'", expected, responseRecorder.Body.String())
@@ -39,7 +86,7 @@ func TestTaskSubmit(t *testing.T) {
 
 	request := httptest.NewRequest("POST", "/api/tasks", strings.NewReader(requestBody))
 	responseRecorder := httptest.NewRecorder()
-	firstSubmitPost := common.JSONResponseHandler(server.TaskSubmitHandler)
+	firstSubmitPost := commonapi.JSONResponseHandler(server.TaskSubmitHandler)
 	firstSubmitPost(responseRecorder, request)
 	if responseRecorder.Code != 200 {
 		t.Errorf("Want status '%d', got '%d'", 200, responseRecorder.Code)
@@ -47,9 +94,39 @@ func TestTaskSubmit(t *testing.T) {
 
 	request = httptest.NewRequest("POST", "/api/tasks", strings.NewReader(requestBody))
 	responseRecorder = httptest.NewRecorder()
-	secondSubmitPost := common.JSONResponseHandler(server.TaskSubmitHandler)
+	secondSubmitPost := commonapi.JSONResponseHandler(server.TaskSubmitHandler)
 	secondSubmitPost(responseRecorder, request)
 	if responseRecorder.Code != 409 {
 		t.Errorf("Want status '%d', got '%d'", 409, responseRecorder.Code)
+	}
+}
+
+// TestServeProcessesTasks covers the background job that processes tasks
+func TestServeProcessesTasks(t *testing.T) {
+	runner := NewDummyRunner()
+	server := NewShimServer(context.Background(), "localhost:12348", "0.0.1.dev2", runner, nil, nil, nil, nil)
+	go func() { _ = server.Serve() }()
+
+	// Tasks are processed immediately, without waiting for the first tick
+	deadline := time.After(5 * time.Second)
+	for runner.processed.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("Tasks have not been processed")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// Shutdown waits for the background job to stop, therefore it hangs if the job
+	// ignores the cancelled context
+	shutdown := make(chan error, 1)
+	go func() { shutdown <- server.Shutdown(context.Background(), false) }()
+	select {
+	case err := <-shutdown:
+		if err != nil {
+			t.Errorf("Shutdown: %s", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown has not stopped the task processing job")
 	}
 }

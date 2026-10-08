@@ -1,6 +1,6 @@
-from collections.abc import Iterable
+from collections.abc import Container, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from functools import cached_property
+from functools import cached_property, partial
 from typing import List, Optional
 
 import oci
@@ -9,6 +9,7 @@ from dstack._internal.core.backends.base.compute import (
     Compute,
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     ComputeWithPrivilegedSupport,
     generate_unique_instance_name,
@@ -42,8 +43,6 @@ SUPPORTED_SHAPE_FAMILIES = [
     "BM.Standard.E4.",
     "BM.Standard.E5.",
     "BM.Optimized3.",
-    "VM.GPU2.",
-    "BM.GPU2.",
     "VM.GPU3.",
     "BM.GPU3.",
     "BM.GPU4.",
@@ -57,6 +56,7 @@ class OCICompute(
     ComputeWithAllOffersCached,
     ComputeWithCreateInstanceSupport,
     ComputeWithPrivilegedSupport,
+    ComputeWithInstanceVolumesSupport,
     ComputeWithMultinodeSupport,
     Compute,
 ):
@@ -64,16 +64,22 @@ class OCICompute(
         super().__init__()
         self.config = config
         self.regions = make_region_clients_map(config.regions or [], config.creds)
+        self._supported_instances = partial(
+            _supported_instances,
+            experimental_instance_types=set(self.config.experimental_instance_types or []),
+        )
 
     @cached_property
     def shapes_quota(self) -> resources.ShapesQuota:
         return resources.ShapesQuota.load(self.regions, self.config.compartment_id)
 
-    def get_all_offers_with_availability(self) -> List[InstanceOfferWithAvailability]:
+    def get_all_offers_with_availability(
+        self, unallocated_resources: bool
+    ) -> List[InstanceOfferWithAvailability]:
         offers = get_catalog_offers(
             backend=BackendType.OCI,
             locations=self.config.regions,
-            extra_filter=_supported_instances,
+            extra_filter=self._supported_instances,
         )
 
         with ThreadPoolExecutor(max_workers=8) as executor:
@@ -90,8 +96,7 @@ class OCICompute(
             else:
                 availability = InstanceAvailability.NO_QUOTA
             offers_with_availability.append(
-                InstanceOfferWithAvailability(
-                    **offer.dict(),
+                offer.with_availability(
                     availability=availability,
                     availability_zones=shapes_availability[offer.region].get(
                         offer.instance.name, []
@@ -101,7 +106,9 @@ class OCICompute(
 
         return offers_with_availability
 
-    def get_offers_modifiers(self, requirements: Requirements) -> Iterable[OfferModifier]:
+    def get_offers_modifiers(
+        self, requirements: Requirements, full_offers: bool
+    ) -> Iterable[OfferModifier]:
         return [get_offers_disk_modifier(CONFIGURABLE_DISK_SIZE, requirements)]
 
     def terminate_instance(
@@ -203,7 +210,11 @@ class OCICompute(
             provisioning_data.internal_ip = vnic.private_ip
 
 
-def _supported_instances(offer: InstanceOffer) -> bool:
+def _supported_instances(
+    offer: InstanceOffer, experimental_instance_types: Container[str]
+) -> bool:
+    if offer.instance.name in experimental_instance_types:
+        return True
     if "Flex" in offer.instance.name:
         return False
     return any(map(offer.instance.name.startswith, SUPPORTED_SHAPE_FAMILIES))

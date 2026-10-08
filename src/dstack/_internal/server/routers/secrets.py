@@ -12,9 +12,9 @@ from dstack._internal.server.schemas.secrets import (
     DeleteSecretsRequest,
     GetSecretRequest,
 )
-from dstack._internal.server.security.permissions import ProjectAdmin
+from dstack._internal.server.security.permissions import ProjectManager
 from dstack._internal.server.services import secrets as secrets_services
-from dstack._internal.server.utils.routers import CustomORJSONResponse
+from dstack._internal.server.utils.routers import CustomJSONResponse
 
 router = APIRouter(
     prefix="/api/project/{project_name}/secrets",
@@ -22,63 +22,67 @@ router = APIRouter(
 )
 
 
-@router.post("/list", response_model=List[Secret])
+@router.post("/list", summary="List secrets", response_model=List[Secret])
 async def list_secrets(
     session: AsyncSession = Depends(get_session),
-    user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectAdmin()),
+    user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectManager()),
 ):
-    _, project = user_project
-    return CustomORJSONResponse(
+    user, project = user_project
+    return CustomJSONResponse(
         await secrets_services.list_secrets(
             session=session,
             project=project,
+            user=user,
         )
     )
 
 
-@router.post("/get", response_model=Secret)
+@router.post("/get", summary="Get secret", response_model=Secret)
 async def get_secret(
     body: GetSecretRequest,
     session: AsyncSession = Depends(get_session),
-    user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectAdmin()),
+    user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectManager()),
 ):
-    _, project = user_project
+    user, project = user_project
     secret = await secrets_services.get_secret(
         session=session,
         project=project,
         name=body.name,
+        user=user,
     )
     if secret is None:
         raise ResourceNotExistsError()
-    return CustomORJSONResponse(secret)
+    return CustomJSONResponse(secret)
 
 
-@router.post("/create_or_update", response_model=Secret)
+@router.post("/create_or_update", summary="Create or update secret", response_model=Secret)
 async def create_or_update_secret(
     body: CreateOrUpdateSecretRequest,
     session: AsyncSession = Depends(get_session),
-    user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectAdmin()),
+    user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectManager()),
 ):
-    _, project = user_project
-    return CustomORJSONResponse(
+    user, project = user_project
+    return CustomJSONResponse(
         await secrets_services.create_or_update_secret(
             session=session,
             project=project,
             name=body.name,
             value=body.value,
+            user=user,
         )
     )
 
 
-@router.post("/delete")
+@router.post("/delete", summary="Delete secrets")
 async def delete_secrets(
     body: DeleteSecretsRequest,
     session: AsyncSession = Depends(get_session),
-    user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectAdmin()),
+    user_project: Tuple[UserModel, ProjectModel] = Depends(ProjectManager()),
 ):
-    _, project = user_project
+    user, project = user_project
     await secrets_services.delete_secrets(
         session=session,
         project=project,
         names=body.secrets_names,
+        user=user,
     )

@@ -1,0 +1,730 @@
+import logging
+import uuid
+from collections.abc import Mapping
+from datetime import timedelta
+from typing import Optional
+
+import gpuhunt
+import packaging.version
+import requests
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
+
+from dstack._internal import settings
+from dstack._internal.core.backends.base.backend import Backend
+from dstack._internal.core.backends.base.compute import (
+    get_dstack_runner_download_url,
+    get_dstack_runner_version,
+    get_dstack_shim_download_url,
+    get_dstack_shim_version,
+)
+from dstack._internal.core.consts import DSTACK_SHIM_HTTP_PORT
+from dstack._internal.core.errors import ProvisioningError
+from dstack._internal.core.models.backends.base import BackendType
+from dstack._internal.core.models.health import HealthStatus
+from dstack._internal.core.models.instances import (
+    GpuDriverInfo,
+    InstanceStatus,
+    InstanceTerminationReason,
+)
+from dstack._internal.core.models.profiles import TerminationPolicy
+from dstack._internal.core.models.runs import JobProvisioningData
+from dstack._internal.server import settings as server_settings
+from dstack._internal.server.background.pipeline_tasks.instances.common import (
+    TERMINATION_DEADLINE_OFFSET,
+    HealthCheckCreate,
+    ProcessResult,
+    can_terminate_fleet_instances_on_idle_duration,
+    get_instance_idle_duration,
+    get_provisioning_deadline,
+    set_gpu_driver_update,
+    set_health_update,
+    set_status_update,
+    set_unreachable_update,
+)
+from dstack._internal.server.db import get_session_ctx
+from dstack._internal.server.models import InstanceHealthCheckModel, InstanceModel, ProjectModel
+from dstack._internal.server.schemas.instances import InstanceCheck
+from dstack._internal.server.schemas.runner import (
+    ComponentInfo,
+    ComponentName,
+    ComponentStatus,
+    InstanceHealthResponse,
+)
+from dstack._internal.server.services import backends as backends_services
+from dstack._internal.server.services.instances import (
+    get_instance_provisioning_data,
+    get_instance_ssh_private_keys,
+    is_ssh_instance,
+    remove_dangling_tasks_from_instance,
+)
+from dstack._internal.server.services.logging import fmt
+from dstack._internal.server.services.runner import client as runner_client
+from dstack._internal.server.services.runner.ssh import runner_ssh_tunnel
+from dstack._internal.utils.common import get_current_datetime, get_or_error, run_async
+from dstack._internal.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+async def process_idle_timeout(
+    session: AsyncSession,
+    instance_model: InstanceModel,
+) -> Optional[ProcessResult]:
+    if not (
+        instance_model.status == InstanceStatus.IDLE
+        and instance_model.termination_policy == TerminationPolicy.DESTROY_AFTER_IDLE
+        and not instance_model.jobs
+    ):
+        return None
+    # Do not terminate instances on idle duration if fleet is already at `nodes.min`.
+    # This is an optimization to avoid terminate-create loop.
+    # There may be race conditions since we don't take the fleet lock.
+    # That's ok: in the worst case we go below `nodes.min`, but
+    # the fleet consolidation logic will provision new nodes.
+    if (
+        instance_model.fleet is not None
+        and not await can_terminate_fleet_instances_on_idle_duration(
+            session=session,
+            fleet_model=instance_model.fleet,
+        )
+    ):
+        return None
+
+    idle_duration = get_instance_idle_duration(instance_model)
+    if idle_duration <= timedelta(seconds=instance_model.termination_idle_time):
+        return None
+
+    result = ProcessResult()
+    set_status_update(
+        update_map=result.instance_update_map,
+        instance_model=instance_model,
+        new_status=InstanceStatus.TERMINATING,
+        termination_reason=InstanceTerminationReason.IDLE_TIMEOUT,
+        termination_reason_message=f"Instance idle for {idle_duration.seconds}s",
+    )
+    return result
+
+
+async def check_instance(instance_model: InstanceModel) -> ProcessResult:
+    result = ProcessResult()
+    if (
+        instance_model.status == InstanceStatus.BUSY
+        and instance_model.jobs
+        and all(job.status.is_finished() for job in instance_model.jobs)
+    ):
+        # A busy instance could have no active jobs due to this bug:
+        # https://github.com/dstackai/dstack/issues/2068
+        set_status_update(
+            update_map=result.instance_update_map,
+            instance_model=instance_model,
+            new_status=InstanceStatus.TERMINATING,
+            termination_reason=InstanceTerminationReason.JOB_FINISHED,
+        )
+        logger.warning(
+            "Detected busy instance %s with finished job. Marked as TERMINATING",
+            instance_model.name,
+            extra={
+                "instance_name": instance_model.name,
+                "instance_status": instance_model.status.value,
+            },
+        )
+        return result
+
+    job_provisioning_data = get_or_error(get_instance_provisioning_data(instance_model))
+    if job_provisioning_data.hostname is None:
+        return await _process_wait_for_instance_provisioning_data(
+            instance_model=instance_model,
+            job_provisioning_data=job_provisioning_data,
+        )
+
+    if not job_provisioning_data.dockerized:
+        if instance_model.status == InstanceStatus.PROVISIONING:
+            set_status_update(
+                update_map=result.instance_update_map,
+                instance_model=instance_model,
+                new_status=InstanceStatus.BUSY,
+            )
+        return result
+
+    check_instance_health = await _should_check_instance_health(instance_model.id)
+    instance_check = await _run_instance_check(
+        instance_model=instance_model,
+        job_provisioning_data=job_provisioning_data,
+        check_instance_health=check_instance_health,
+        check_instance_info=_should_check_instance_info(job_provisioning_data),
+    )
+    health_status = _get_health_status_for_instance_check(
+        instance_model=instance_model,
+        instance_check=instance_check,
+        check_instance_health=check_instance_health,
+    )
+    _log_instance_check_result(
+        instance_model=instance_model,
+        instance_check=instance_check,
+        health_status=health_status,
+        check_instance_health=check_instance_health,
+    )
+
+    if instance_check.has_health_checks():
+        # ensured by has_health_checks()
+        assert instance_check.health_response is not None
+        result.health_check_create = HealthCheckCreate(
+            instance_id=instance_model.id,
+            collected_at=get_current_datetime(),
+            status=health_status,
+            response=instance_check.health_response.model_dump_json(),
+        )
+
+    set_health_update(
+        update_map=result.instance_update_map,
+        instance_model=instance_model,
+        health=health_status,
+    )
+    set_unreachable_update(
+        update_map=result.instance_update_map,
+        instance_model=instance_model,
+        unreachable=not instance_check.reachable,
+    )
+
+    if instance_check.reachable:
+        result.instance_update_map["termination_deadline"] = None
+        set_gpu_driver_update(
+            update_map=result.instance_update_map,
+            job_provisioning_data=job_provisioning_data,
+            gpu_driver=instance_check.gpu_driver,
+        )
+        if instance_model.status == InstanceStatus.PROVISIONING:
+            set_status_update(
+                update_map=result.instance_update_map,
+                instance_model=instance_model,
+                new_status=InstanceStatus.IDLE if not instance_model.jobs else InstanceStatus.BUSY,
+            )
+        return result
+
+    now = get_current_datetime()
+    if not is_ssh_instance(instance_model) and instance_model.termination_deadline is None:
+        result.instance_update_map["termination_deadline"] = now + TERMINATION_DEADLINE_OFFSET
+
+    if (
+        instance_model.status == InstanceStatus.PROVISIONING
+        and instance_model.started_at is not None
+    ):
+        provisioning_deadline = get_provisioning_deadline(
+            instance_model=instance_model,
+            job_provisioning_data=job_provisioning_data,
+        )
+        if now > provisioning_deadline:
+            set_status_update(
+                update_map=result.instance_update_map,
+                instance_model=instance_model,
+                new_status=InstanceStatus.TERMINATING,
+                termination_reason=InstanceTerminationReason.PROVISIONING_TIMEOUT,
+                termination_reason_message="Instance did not become reachable in time",
+            )
+    elif instance_model.status.is_available():
+        deadline = instance_model.termination_deadline
+        if deadline is not None and now > deadline:
+            set_status_update(
+                update_map=result.instance_update_map,
+                instance_model=instance_model,
+                new_status=InstanceStatus.TERMINATING,
+                termination_reason=InstanceTerminationReason.UNREACHABLE,
+            )
+    return result
+
+
+async def _should_check_instance_health(instance_id) -> bool:
+    health_check_cutoff = get_current_datetime() - timedelta(
+        seconds=server_settings.SERVER_INSTANCE_HEALTH_MIN_COLLECT_INTERVAL_SECONDS
+    )
+    async with get_session_ctx() as session:
+        res = await session.execute(
+            select(func.count(1)).where(
+                InstanceHealthCheckModel.instance_id == instance_id,
+                InstanceHealthCheckModel.collected_at > health_check_cutoff,
+            )
+        )
+    return res.scalar_one() == 0
+
+
+def _should_check_instance_info(job_provisioning_data: JobProvisioningData) -> bool:
+    """
+    Instance info reports host facts that shim detects on start, e.g., the GPU driver
+    version, so they change after shim is restarted, which is required if the host GPUs
+    or their driver change. Such a restart is not necessarily observed by the server,
+    hence the facts are requested on every check, and only stored if they changed.
+    Hosts without GPUs report nothing, hence are never asked.
+    """
+    return bool(job_provisioning_data.instance_type.resources.gpus)
+
+
+async def _run_instance_check(
+    instance_model: InstanceModel,
+    job_provisioning_data: JobProvisioningData,
+    check_instance_health: bool,
+    check_instance_info: bool,
+) -> InstanceCheck:
+    ssh_private_keys = get_instance_ssh_private_keys(instance_model)
+    try:
+        return await run_async(
+            _check_instance_inner,
+            ssh_private_keys,
+            job_provisioning_data,
+            None,
+            instance=instance_model,
+            check_instance_health=check_instance_health,
+            check_instance_info=check_instance_info,
+        )
+    except runner_client.PeerConnectionError as e:
+        return InstanceCheck(reachable=False, message=f"SSH or tunnel error: {e}")
+
+
+def _get_health_status_for_instance_check(
+    instance_model: InstanceModel,
+    instance_check: InstanceCheck,
+    check_instance_health: bool,
+) -> HealthStatus:
+    if instance_check.reachable and check_instance_health:
+        return instance_check.get_health_status()
+    # Keep previous health status.
+    return instance_model.health
+
+
+def _log_instance_check_result(
+    instance_model: InstanceModel,
+    instance_check: InstanceCheck,
+    health_status: HealthStatus,
+    check_instance_health: bool,
+) -> None:
+    loglevel = logging.DEBUG
+    if not instance_check.reachable and instance_model.status.is_available():
+        loglevel = logging.WARNING
+    elif check_instance_health and not health_status.is_healthy():
+        loglevel = logging.WARNING
+    logger.log(
+        loglevel,
+        "Instance %s check: reachable=%s health_status=%s message=%r",
+        instance_model.name,
+        instance_check.reachable,
+        health_status.name,
+        instance_check.message,
+        extra={"instance_name": instance_model.name, "health_status": health_status},
+    )
+
+
+async def _process_wait_for_instance_provisioning_data(
+    instance_model: InstanceModel,
+    job_provisioning_data: JobProvisioningData,
+) -> ProcessResult:
+    result = ProcessResult()
+    logger.debug("Waiting for instance %s to become running", instance_model.name)
+    provisioning_deadline = get_provisioning_deadline(
+        instance_model=instance_model,
+        job_provisioning_data=job_provisioning_data,
+    )
+    if get_current_datetime() > provisioning_deadline:
+        set_status_update(
+            update_map=result.instance_update_map,
+            instance_model=instance_model,
+            new_status=InstanceStatus.TERMINATING,
+            termination_reason=InstanceTerminationReason.PROVISIONING_TIMEOUT,
+            termination_reason_message="Backend did not complete provisioning in time",
+        )
+        return result
+
+    backend = await _get_backend_for_provisioning_wait(
+        project_id=instance_model.project_id,
+        backend_type=job_provisioning_data.backend,
+    )
+    if backend is None:
+        logger.warning(
+            "Instance %s failed because instance's backend is not available",
+            instance_model.name,
+        )
+        set_status_update(
+            update_map=result.instance_update_map,
+            instance_model=instance_model,
+            new_status=InstanceStatus.TERMINATING,
+            termination_reason=InstanceTerminationReason.ERROR,
+            termination_reason_message="Backend not available",
+        )
+        return result
+
+    try:
+        await run_async(
+            backend.compute().update_provisioning_data,
+            job_provisioning_data,
+            instance_model.project.ssh_public_key,
+            instance_model.project.ssh_private_key,
+        )
+        result.instance_update_map["job_provisioning_data"] = (
+            job_provisioning_data.model_dump_json()
+        )
+    except ProvisioningError as exc:
+        logger.warning(
+            "Error while waiting for instance %s to become running: %s",
+            instance_model.name,
+            repr(exc),
+        )
+        set_status_update(
+            update_map=result.instance_update_map,
+            instance_model=instance_model,
+            new_status=InstanceStatus.TERMINATING,
+            termination_reason=InstanceTerminationReason.ERROR,
+            termination_reason_message="Error while waiting for instance to become running",
+        )
+    except Exception:
+        logger.exception(
+            "Got exception when updating instance %s provisioning data",
+            instance_model.name,
+        )
+    return result
+
+
+async def _get_backend_for_provisioning_wait(
+    project_id: uuid.UUID,
+    backend_type: BackendType,
+) -> Optional[Backend]:
+    async with get_session_ctx() as session:
+        res = await session.execute(
+            select(ProjectModel)
+            .where(ProjectModel.id == project_id)
+            .options(joinedload(ProjectModel.backends))
+        )
+        project_model = res.unique().scalar_one_or_none()
+    if project_model is None:
+        return None
+    return await backends_services.get_project_backend_by_type(
+        project=project_model,
+        backend_type=backend_type,
+    )
+
+
+@runner_ssh_tunnel
+def _check_instance_inner(
+    addresses: Mapping[int, runner_client.LocalAddress],
+    *,
+    instance: InstanceModel,
+    check_instance_health: bool = False,
+    check_instance_info: bool = False,
+) -> InstanceCheck:
+    instance_health_response: Optional[InstanceHealthResponse] = None
+    shim_client = runner_client.ShimClient.from_address(addresses[DSTACK_SHIM_HTTP_PORT])
+    method = shim_client.healthcheck
+    try:
+        healthcheck_response = method(unmask_exceptions=True)
+        if check_instance_health:
+            method = shim_client.get_instance_health
+            instance_health_response = method()
+    except requests.RequestException as exc:
+        template = "shim.%s(): request error: %s"
+        args = (method.__func__.__name__, exc)
+        logger.debug(template, *args)
+        return InstanceCheck(reachable=False, message=template % args)
+    except Exception as exc:
+        template = "shim.%s(): unexpected exception %s: %s"
+        args = (method.__func__.__name__, exc.__class__.__name__, exc)
+        logger.exception(template, *args)
+        return InstanceCheck(reachable=False, message=template % args)
+
+    gpu_driver = _get_gpu_driver(instance, shim_client) if check_instance_info else None
+
+    try:
+        remove_dangling_tasks_from_instance(shim_client, instance)
+    except Exception as exc:
+        logger.warning("%s: error removing dangling tasks: %s", fmt(instance), exc)
+
+    # There should be no shim API calls after this function call since it can request shim restart.
+    try:
+        _maybe_install_components(instance, shim_client)
+    except Exception as exc:
+        logger.warning("%s: error installing components: %s", fmt(instance), exc)
+    return runner_client.healthcheck_response_to_instance_check(
+        healthcheck_response,
+        instance_health_response,
+        gpu_driver,
+    )
+
+
+def _get_gpu_driver(
+    instance_model: InstanceModel,
+    shim_client: runner_client.ShimClient,
+) -> Optional[GpuDriverInfo]:
+    """
+    Returns the host GPU driver reported by shim, or `None` if it cannot be retrieved.
+    The driver is optional metadata, so errors are not propagated to the instance check.
+    """
+    try:
+        instance_info = shim_client.get_instance_info()
+        return runner_client.instance_info_response_to_gpu_driver(instance_info)
+    except (requests.RequestException, runner_client.ShimError) as exc:
+        logger.warning(
+            "Instance %s: shim.get_instance_info(): request error: %s", instance_model.name, exc
+        )
+    except ValueError as exc:
+        logger.warning("Instance %s: unexpected instance info: %s", instance_model.name, exc)
+    except Exception:
+        logger.exception(
+            "Instance %s: unexpected error retrieving the GPU driver", instance_model.name
+        )
+    return None
+
+
+def _maybe_install_components(
+    instance_model: InstanceModel,
+    shim_client: runner_client.ShimClient,
+) -> None:
+    components = shim_client.get_components()
+    if components is None:
+        logger.debug("Instance %s: no components info", instance_model.name)
+        return
+
+    installed_shim_version: Optional[str] = None
+    installation_requested = False
+
+    if (runner_info := components.runner) is not None:
+        installation_requested |= _maybe_install_runner(
+            instance_model=instance_model,
+            shim_client=shim_client,
+            runner_info=runner_info,
+            allow_downgrade=settings.DSTACK_RUNNER_ALLOW_DOWNGRADE,
+        )
+    else:
+        logger.debug(
+            "Instance %s: %s: no component info", instance_model.name, ComponentName.RUNNER.value
+        )
+
+    if (shim_info := components.shim) is not None:
+        if shim_info.status == ComponentStatus.INSTALLED:
+            installed_shim_version = shim_info.version
+        installation_requested |= _maybe_install_shim(
+            instance_model=instance_model,
+            shim_client=shim_client,
+            shim_info=shim_info,
+            allow_downgrade=settings.DSTACK_SHIM_ALLOW_DOWNGRADE,
+        )
+    else:
+        logger.debug(
+            "Instance %s: %s: no component info", instance_model.name, ComponentName.SHIM.value
+        )
+
+    running_shim_version = shim_client.get_version_string()
+    # skip the restart if:
+    if (
+        # old shim without `dstack-shim` component and `/api/shutdown` support
+        installed_shim_version is None
+        # the same version is already running -- a string comparison on purpose: both sides come
+        # from the same `Version` build-time variable, one read off the on-disk binary, the other
+        # reported by the running process, so the question is whether it's the same build, not
+        # which version is newer
+        or installed_shim_version == running_shim_version
+        # we just requested installation of at least one component
+        or installation_requested
+        # at least one component is already being installed
+        or any(component.status == ComponentStatus.INSTALLING for component in components)
+        # at least one shim task won't survive restart
+        or not shim_client.is_safe_to_restart()
+    ):
+        return
+
+    if shim_client.shutdown(force=False):
+        logger.debug(
+            "Instance %s: %s: restarting %r -> %r",
+            instance_model.name,
+            ComponentName.SHIM.value,
+            running_shim_version,
+            installed_shim_version,
+        )
+    else:
+        logger.debug(
+            "Instance %s: %s: cannot restart", instance_model.name, ComponentName.SHIM.value
+        )
+
+
+def _maybe_install_runner(
+    instance_model: InstanceModel,
+    shim_client: runner_client.ShimClient,
+    runner_info: ComponentInfo,
+    allow_downgrade: bool,
+) -> bool:
+    # For developers:
+    # * To install the latest dev build for the current branch from the CI,
+    #   set DSTACK_USE_LATEST_FROM_BRANCH=1.
+    # * To provide your own build, set DSTACK_RUNNER_VERSION_URL and DSTACK_RUNNER_DOWNLOAD_URL.
+    name = runner_info.name
+    installed_version = runner_info.version
+    expected_version = get_dstack_runner_version()
+    logger.debug(
+        "Instance %s: %s: status=%s installed_version=%r expected_version=%r",
+        instance_model.name,
+        name,
+        runner_info.status.value,
+        installed_version,
+        expected_version,
+    )
+
+    if not expected_version:
+        return False
+
+    if not _should_install_component(
+        instance_model=instance_model,
+        component_info=runner_info,
+        expected_version=expected_version,
+        allow_downgrade=allow_downgrade,
+    ):
+        return False
+
+    download_url = get_dstack_runner_download_url(
+        arch=_get_instance_cpu_arch(instance_model),
+        version=expected_version,
+    )
+    logger.debug(
+        "Instance %s: %s: installing %r -> %r from %s",
+        instance_model.name,
+        name,
+        installed_version,
+        expected_version,
+        download_url,
+    )
+    try:
+        shim_client.install_runner(download_url)
+        return True
+    except requests.RequestException as e:
+        logger.warning("Instance %s: %s: failed to install: %s", instance_model.name, name, e)
+    return False
+
+
+def _maybe_install_shim(
+    instance_model: InstanceModel,
+    shim_client: runner_client.ShimClient,
+    shim_info: ComponentInfo,
+    allow_downgrade: bool,
+) -> bool:
+    # For developers:
+    # * To install the latest dev build for the current branch from the CI,
+    #   set DSTACK_USE_LATEST_FROM_BRANCH=1.
+    # * To provide your own build, set DSTACK_SHIM_VERSION_URL and DSTACK_SHIM_DOWNLOAD_URL.
+    name = shim_info.name
+    installed_version = shim_info.version
+    expected_version = get_dstack_shim_version()
+    logger.debug(
+        "Instance %s: %s: status=%s installed_version=%r expected_version=%r running_version=%r",
+        instance_model.name,
+        name,
+        shim_info.status.value,
+        installed_version,
+        expected_version,
+        shim_client.get_version_string(),
+    )
+
+    if not expected_version:
+        return False
+
+    if not _should_install_component(
+        instance_model=instance_model,
+        component_info=shim_info,
+        expected_version=expected_version,
+        allow_downgrade=allow_downgrade,
+    ):
+        return False
+
+    download_url = get_dstack_shim_download_url(
+        arch=_get_instance_cpu_arch(instance_model),
+        version=expected_version,
+    )
+    logger.debug(
+        "Instance %s: %s: installing %r -> %r from %s",
+        instance_model.name,
+        name,
+        installed_version,
+        expected_version,
+        download_url,
+    )
+    try:
+        shim_client.install_shim(download_url)
+        return True
+    except requests.RequestException as e:
+        logger.warning("Instance %s: %s: failed to install: %s", instance_model.name, name, e)
+    return False
+
+
+def _should_install_component(
+    instance_model: InstanceModel,
+    component_info: ComponentInfo,
+    expected_version: str,
+    allow_downgrade: bool,
+) -> bool:
+    """
+    Decides whether the component should be installed, comparing the installed and the expected
+    versions. Logs the reason if the installation is skipped.
+
+    Unless `allow_downgrade` is set, the component is not installed if the installed version is
+    newer than the expected one. This keeps server replicas running different versions from
+    reinstalling the component over each other during a rolling deployment.
+    """
+    name = component_info.name
+
+    if component_info.status == ComponentStatus.INSTALLING:
+        logger.debug("Instance %s: %s: already being installed", instance_model.name, name)
+        return False
+
+    expected_version_parsed = _parse_pypa_version(expected_version)
+    if expected_version_parsed is None:
+        logger.warning(
+            "Instance %s: %s: failed to parse expected_version: %r",
+            instance_model.name,
+            name,
+            expected_version,
+        )
+        return False
+
+    installed_version = component_info.version
+    if not installed_version:
+        return True
+
+    installed_version_parsed = _parse_pypa_version(installed_version)
+    if installed_version_parsed is None:
+        # Dev builds report `latest`; treat any unparseable version as the newest one
+        if not allow_downgrade:
+            logger.debug(
+                "Instance %s: %s: cannot parse installed_version, skipping the install",
+                instance_model.name,
+                name,
+            )
+            return False
+    elif installed_version_parsed == expected_version_parsed:
+        logger.debug(
+            "Instance %s: %s: expected version already installed", instance_model.name, name
+        )
+        return False
+    elif installed_version_parsed > expected_version_parsed and not allow_downgrade:
+        logger.debug("Instance %s: %s: newer version already installed", instance_model.name, name)
+        return False
+
+    return True
+
+
+def _parse_pypa_version(version_string: str) -> Optional[packaging.version.Version]:
+    """
+    Parses the version for comparing component versions, keeping the pre-release, dev, post-release,
+    and local segments, that is, `0.20.1rc1` is older than `0.20.1`.
+    Returns `None` if the version is not PyPA-conformant, e.g., `latest` reported by dev builds.
+
+    Not to be confused with `ShimClient.get_version_tuple()`, which is based on
+    `dstack._internal.server.services.runner.client._parse_version` -- it truncates the version to
+    `(major, minor, micro)` and treats unparseable versions as the latest, suiting feature gating
+    but not version comparison.
+    """
+    try:
+        return packaging.version.parse(version_string)
+    except packaging.version.InvalidVersion:
+        return None
+
+
+def _get_instance_cpu_arch(instance_model: InstanceModel) -> Optional[gpuhunt.CPUArchitecture]:
+    job_provisioning_data = get_instance_provisioning_data(instance_model)
+    if job_provisioning_data is None:
+        return None
+    return job_provisioning_data.instance_type.resources.cpu_arch

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, Generic, List, Optional, TypeVar
+from typing import Any, ClassVar, Generic, List, NoReturn, Optional, TypeVar
 from uuid import UUID
 
 from dstack._internal.core.backends.base.backend import Backend
@@ -26,11 +26,13 @@ class BackendRecord(CoreModel):
     This model includes backend parameters to store in the DB.
     """
 
-    # `config` stores text-encoded non-sensitive backend config parameters (e.g. json)
     config: str
-    # `auth` stores text-encoded sensitive backend config parameters (e.g. json).
-    # Configurator should not encrypt/decrypt it. This is done by the caller.
+    """`config` stores text-encoded non-sensitive backend config parameters (e.g. json)
+    """
     auth: str
+    """`auth` stores text-encoded sensitive backend config parameters (e.g. json).
+    `Configurator` should not encrypt/decrypt it. This is done by the caller.
+    """
 
 
 class StoredBackendRecord(BackendRecord):
@@ -53,8 +55,8 @@ class Configurator(ABC, Generic[BackendConfigWithoutCredsT, BackendConfigWithCre
     """
 
     TYPE: ClassVar[BackendType]
-    # `BACKEND_CLASS` is used to introspect backend features without initializing it.
     BACKEND_CLASS: ClassVar[type[Backend]]
+    """`BACKEND_CLASS` is used to introspect backend features without initializing it."""
 
     @abstractmethod
     def validate_config(self, config: BackendConfigWithCredsT, default_creds_enabled: bool):
@@ -110,7 +112,7 @@ class Configurator(ABC, Generic[BackendConfigWithoutCredsT, BackendConfigWithCre
 
 def raise_invalid_credentials_error(
     fields: Optional[List[List[str]]] = None, details: Optional[Any] = None
-):
+) -> NoReturn:
     msg = BackendInvalidCredentialsError.msg
     if details:
         msg += f": {details}"

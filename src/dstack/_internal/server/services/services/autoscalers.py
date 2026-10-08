@@ -3,22 +3,10 @@ import math
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from pydantic import BaseModel
-
 import dstack._internal.utils.common as common_utils
-from dstack._internal.core.models.configurations import ServiceConfiguration
+from dstack._internal.core.models.configurations import DEFAULT_SCALING_WINDOW, ScalingSpec
+from dstack._internal.core.models.resources import Range
 from dstack._internal.proxy.gateway.schemas.stats import PerWindowStats
-
-
-class ReplicaInfo(BaseModel):
-    """
-    Attributes:
-        active (bool): starting/running/retrying or downscaled
-        timestamp (datetime.datetime): `submitted_at` for active, `last_processed_at` for inactive
-    """
-
-    active: bool
-    timestamp: datetime.datetime
 
 
 class BaseServiceScaler(ABC):
@@ -71,12 +59,14 @@ class RPSAutoscaler(BaseServiceScaler):
         min_replicas: int,
         max_replicas: int,
         target: float,
+        window: int,
         scale_up_delay: int,
         scale_down_delay: int,
     ):
         self.min_replicas = min_replicas
         self.max_replicas = max_replicas
         self.target = target
+        self.window = window
         self.scale_up_delay = scale_up_delay
         self.scale_down_delay = scale_down_delay
 
@@ -91,8 +81,7 @@ class RPSAutoscaler(BaseServiceScaler):
 
         now = common_utils.get_current_datetime()
 
-        # calculate the average RPS over the last minute
-        rps = stats[60].requests / 60
+        rps = stats[self.window].requests / self.window
         new_desired_count = math.ceil(rps / self.target)
         # clip the desired count to the min and max values
         new_desired_count = min(max(new_desired_count, self.min_replicas), self.max_replicas)
@@ -119,21 +108,22 @@ class RPSAutoscaler(BaseServiceScaler):
         return new_desired_count
 
 
-def get_service_scaler(conf: ServiceConfiguration) -> BaseServiceScaler:
-    assert conf.replicas.min is not None
-    assert conf.replicas.max is not None
-    if conf.scaling is None:
+def get_service_scaler(count: Range[int], scaling: Optional[ScalingSpec]) -> BaseServiceScaler:
+    assert count.min is not None
+    assert count.max is not None
+    if scaling is None:
         return ManualScaler(
-            min_replicas=conf.replicas.min,
-            max_replicas=conf.replicas.max,
+            min_replicas=count.min,
+            max_replicas=count.max,
         )
-    if conf.scaling.metric == "rps":
+    if scaling.metric == "rps":
         return RPSAutoscaler(
             # replicas count validated by configuration model
-            min_replicas=conf.replicas.min,
-            max_replicas=conf.replicas.max,
-            target=conf.scaling.target,
-            scale_up_delay=conf.scaling.scale_up_delay,
-            scale_down_delay=conf.scaling.scale_down_delay,
+            min_replicas=count.min,
+            max_replicas=count.max,
+            target=scaling.target,
+            window=scaling.window if scaling.window is not None else DEFAULT_SCALING_WINDOW,
+            scale_up_delay=scaling.scale_up_delay,
+            scale_down_delay=scaling.scale_down_delay,
         )
-    raise ValueError(f"No scaler found for scaling parameters {conf.scaling}")
+    raise ValueError(f"No scaler found for scaling parameters {scaling}")

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/dstackai/dstack/runner/internal/log"
+	"github.com/dstackai/dstack/runner/internal/common/log"
 )
 
 type TaskStatus string
@@ -40,18 +40,42 @@ type Task struct {
 	cancelPull    context.CancelFunc
 	gpuIDs        []string
 	ports         []PortMapping
-	runnerDir     string // path on host mapped to consts.RunnerDir in container
+	// taskDir is the path on the host to the dir holding shim's files related to the
+	// task, e.g., the task state file. Its runner subdir, and only it, is mounted into
+	// the container as consts.RunnerTempDir
+	taskDir string
+	// startInFlight is true while Start() is working on the task. Start() owns the
+	// task resources until it returns, therefore ProcessTasks() skips such tasks.
+	// Tasks restored from containers are never in flight.
+	startInFlight bool
+	// cleanedUp is true once the resources acquired for the task (host SSH keys,
+	// volumes, GPUs) are released. Resources are released only after the container
+	// is not running anymore.
+	cleanedUp bool
+
+	pullTracker *PullTracker
 
 	mu *sync.Mutex
 }
 
 // Lock is used for exclusive operations, e.g, stopping a container,
-// removing task data, etc.
+// removing task data, etc. It blocks until the lock is acquired, since
+// contention is expected, e.g., the server may terminate a task while it is
+// being processed in the background.
 func (t *Task) Lock(ctx context.Context) {
+	t.mu.Lock()
+	log.Trace(ctx, "locked", "task", t.ID)
+}
+
+// TryLock is a non-blocking version of Lock. It reports whether the lock has
+// been acquired, so that the caller can retry later instead of waiting.
+func (t *Task) TryLock(ctx context.Context) bool {
 	if !t.mu.TryLock() {
-		log.Fatal(ctx, "already locked!", "task", t.ID)
+		log.Trace(ctx, "already locked", "task", t.ID)
+		return false
 	}
-	log.Debug(ctx, "locked", "task", t.ID)
+	log.Trace(ctx, "locked", "task", t.ID)
+	return true
 }
 
 // Release should be called Unlock, but this name triggers govet copylocks check,
@@ -59,18 +83,18 @@ func (t *Task) Lock(ctx context.Context) {
 // looks like lock: https://github.com/golang/go/issues/18451
 func (t *Task) Release(ctx context.Context) {
 	t.mu.Unlock()
-	log.Debug(ctx, "unlocked", "task", t.ID)
+	log.Trace(ctx, "unlocked", "task", t.ID)
 }
 
 func (t *Task) IsTransitionAllowed(toStatus TaskStatus) bool {
 	// same-state transitions are not allowed unless stated otherwise, meaning that
-	// task.Update(); task.Update() is not allowed is most cases.
-	// This is mainly done to avoid erroneous/concurrent updates, though this limits
-	// our ability to commit internal state more often.
-	// If this becomes a problem, consider allowing sameState->sameState transitions in general.
+	// two consecutive updates to the same status are not allowed in most cases.
+	// This is mainly done to avoid erroneous/concurrent updates.
+	// Note that TaskStorage.Modify() checks the transition only if the status changes,
+	// therefore committing internal state without changing the status is always allowed.
 	switch toStatus {
 	case TaskStatusPending:
-		// initial status, task should be Add()ed with it, not Update()d
+		// initial status, task should be Add()ed with it, not Modify()ed
 		return false
 	case TaskStatusPreparing:
 		return t.Status == TaskStatusPending
@@ -79,12 +103,11 @@ func (t *Task) IsTransitionAllowed(toStatus TaskStatus) bool {
 	case TaskStatusCreating:
 		return t.Status == TaskStatusPulling
 	case TaskStatusRunning:
-		// allow running->running transition to update internal state, e.g., ports
-		return t.Status == TaskStatusCreating || t.Status == TaskStatusRunning
+		return t.Status == TaskStatusCreating
 	case TaskStatusTerminated:
 		// terminated -> terminated is also allowed since server _always_ tries to
 		// terminate the task, even if it is already terminated, but this is a special case,
-		// see TaskStorage.Update() for details
+		// see TaskStorage.Modify() for details
 		return true
 	}
 	return false
@@ -119,16 +142,14 @@ func (t *Task) SetStatusTerminated(reason string, message string) {
 	t.cancelPull = nil
 }
 
-func NewTask(id string, status TaskStatus, containerName string, containerID string, gpuIDs []string, ports []PortMapping, runnerDir string) Task {
+// NewTask returns a task with the given identity and status. The state fields are
+// assigned by the caller, e.g., by restoreStateFromContainers()
+func NewTask(id string, status TaskStatus) Task {
 	return Task{
-		ID:            id,
-		Status:        status,
-		containerName: containerName,
-		containerID:   containerID,
-		runnerDir:     runnerDir,
-		gpuIDs:        gpuIDs,
-		ports:         ports,
-		mu:            &sync.Mutex{},
+		ID:          id,
+		Status:      status,
+		pullTracker: newPullTracker(),
+		mu:          &sync.Mutex{},
 	}
 }
 
@@ -138,6 +159,7 @@ func NewTaskFromConfig(cfg TaskConfig) Task {
 		Status:        TaskStatusPending,
 		config:        cfg,
 		containerName: generateUniqueName(cfg.Name, cfg.ID),
+		pullTracker:   newPullTracker(),
 		mu:            &sync.Mutex{},
 	}
 }
@@ -148,7 +170,7 @@ type TaskStorage struct {
 	mu    sync.RWMutex
 }
 
-// Get a _copy_ of all tasks. To "commit" changes, use Update()
+// Get a _copy_ of all tasks. To "commit" changes, use Modify()
 func (ts *TaskStorage) List() []Task {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
@@ -159,7 +181,7 @@ func (ts *TaskStorage) List() []Task {
 	return tasks
 }
 
-// Get a _copy_ of the task. To "commit" changes, use Update()
+// Get a _copy_ of the task. To "commit" changes, use Modify()
 func (ts *TaskStorage) Get(id string) (Task, bool) {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
@@ -178,29 +200,38 @@ func (ts *TaskStorage) Add(task Task) bool {
 	return true
 }
 
-// Update the _existing_ task. If the task is not in the storage, do nothing and return false
-// If the current status is terminated, do nothing and return false
-func (ts *TaskStorage) Update(task Task) error {
+// Modify applies fn to a _copy_ of the _existing_ task and commits the copy,
+// returning it on success. If the task is not in the storage, do nothing and
+// return ErrNotFound.
+// If fn returns an error, or if the resulting status transition is not allowed,
+// the copy is discarded, that is, a partially applied fn never reaches the storage.
+// The transition is checked only if fn changes the status, therefore fn is free to
+// update the internal state of the task without changing its status.
+// fn is called with the storage lock held, so it must be fast and must not block,
+// in particular, it must not call the Docker API or touch the file system.
+func (ts *TaskStorage) Modify(id string, fn func(*Task) error) (Task, error) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	currentTask, ok := ts.tasks[task.ID]
+	currentTask, ok := ts.tasks[id]
 	if !ok {
-		return ErrNotFound
+		return Task{}, ErrNotFound
 	}
-	if !currentTask.IsTransitionAllowed(task.Status) {
-		return fmt.Errorf("%w: %s -> %s transition not allowed", ErrRequest, currentTask.Status, task.Status)
+	task := currentTask
+	if err := fn(&task); err != nil {
+		return Task{}, err
 	}
-	if currentTask.Status == TaskStatusTerminated {
+	if task.Status != currentTask.Status && !currentTask.IsTransitionAllowed(task.Status) {
+		return Task{}, fmt.Errorf("%w: %s -> %s transition not allowed", ErrRequest, currentTask.Status, task.Status)
+	}
+	if currentTask.Status == TaskStatusTerminated && currentTask.TerminationReason != "" {
 		// We ignore reason/message fields if they are already set to avoid
 		// overriding these fields by the server, which _always_ tries to terminate the task,
 		// even if it is not running
-		if currentTask.TerminationReason != "" {
-			task.TerminationReason = currentTask.TerminationReason
-			task.TerminationMessage = currentTask.TerminationMessage
-		}
+		task.TerminationReason = currentTask.TerminationReason
+		task.TerminationMessage = currentTask.TerminationMessage
 	}
-	ts.tasks[task.ID] = task
-	return nil
+	ts.tasks[id] = task
+	return task, nil
 }
 
 func (ts *TaskStorage) Delete(id string) {

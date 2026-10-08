@@ -1,13 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { Cards, CardsProps, MultiselectCSD, PropertyFilter, StatusIndicator } from 'components';
+import { Alert, Cards, CardsProps, MultiselectCSD, Popover, PropertyFilter } from 'components';
 
 import { useCollection } from 'hooks';
 import { useGetGpusListQuery } from 'services/gpu';
 
 import { useEmptyMessages } from './hooks/useEmptyMessages';
-import { useFilters } from './hooks/useFilters';
+import { useFilters, UseFiltersArgs } from './hooks/useFilters';
 import { convertMiBToGB, rangeToObject, renderRange, renderRangeJSX, round } from './helpers';
 
 import styles from './styles.module.scss';
@@ -16,6 +16,7 @@ const getRequestParams = ({
     project_name,
     gpu_name,
     backend,
+    fleet,
     gpu_count,
     gpu_memory,
     spot_policy,
@@ -24,13 +25,14 @@ const getRequestParams = ({
     project_name: string;
     gpu_name?: string[];
     backend?: string[];
+    fleet?: string[];
     gpu_count?: string;
     gpu_memory?: string;
     spot_policy?: TSpot;
     group_by?: TGpuGroupBy[];
 }): TGpusListQueryParams => {
     const gpuCountMinMax = rangeToObject(gpu_count ?? '');
-    const gpuMemoryMinMax = rangeToObject(gpu_memory ?? '');
+    const gpuMemoryMinMax = rangeToObject(gpu_memory ?? '', { requireUnit: true });
 
     return {
         project_name,
@@ -45,41 +47,61 @@ const getRequestParams = ({
                 home_dir: '/root',
                 env: {},
                 resources: {
-                    // cpu: { min: 2 },
-                    // memory: { min: 8.0 },
-                    // disk: { size: { min: 100.0 } },
+                    // cpu/memory/disk should match ResourcesSpec.unconstrained() used by `dstack offer` CLI command
+                    cpu: { count: { min: 1 } },
+                    memory: { min: 0.0 },
+                    disk: null,
                     gpu: {
                         ...(gpu_name?.length ? { name: gpu_name } : {}),
-                        ...(gpuCountMinMax ? { count: gpuCountMinMax } : {}),
-                        ...(gpuMemoryMinMax ? { memory: gpuMemoryMinMax } : {}),
+                        ...(gpuCountMinMax ? { count: gpuCountMinMax as unknown as TRange } : {}),
+                        ...(gpuMemoryMinMax ? { memory: gpuMemoryMinMax as unknown as TRange } : {}),
                     },
                 },
                 spot_policy,
                 volumes: [],
                 files: [],
                 setup: [],
-                ...(backend?.length ? { backends: backend } : {}),
+                ...(backend?.length ? { backends: backend as TBackendType[] } : {}),
+                ...(fleet?.length ? { fleets: fleet } : {}),
             },
             profile: { name: 'default', default: false },
             ssh_key_pub: '(dummy)',
         },
+        full_offers: true,
     };
 };
 
 type OfferListProps = Pick<CardsProps, 'variant' | 'header' | 'onSelectionChange' | 'selectedItems' | 'selectionType'> & {
+    permanentFilters?: UseFiltersArgs['permanentFilters'];
+    defaultFilters?: UseFiltersArgs['defaultFilters'];
     withSearchParams?: boolean;
+    showFleetFilter?: boolean;
+    disabled?: boolean;
     onChangeProjectName?: (value: string) => void;
+    onChangeBackendFilter?: (backends: string[]) => void;
+    onChangeFleetFilter?: (fleets: string[]) => void;
 };
 
-export const OfferList: React.FC<OfferListProps> = ({ withSearchParams, onChangeProjectName, ...props }) => {
+export const OfferList: React.FC<OfferListProps> = ({
+    withSearchParams,
+    showFleetFilter,
+    disabled,
+    onChangeProjectName,
+    onChangeBackendFilter,
+    onChangeFleetFilter,
+    permanentFilters,
+    defaultFilters,
+    ...props
+}) => {
     const { t } = useTranslation();
     const [requestParams, setRequestParams] = useState<TGpusListQueryParams | undefined>();
-    const { data, isLoading, isFetching } = useGetGpusListQuery(
+
+    const { data, error, isError, isLoading, isFetching } = useGetGpusListQuery(
         // eslint-disable-next-line @typescript-eslint/ban-ts-comment
         // @ts-expect-error
         requestParams,
         {
-            skip: !requestParams || !requestParams['project_name'] || !requestParams['group_by']?.length,
+            skip: disabled || !requestParams || !requestParams['project_name'] || !requestParams['group_by']?.length,
         },
     );
 
@@ -93,7 +115,9 @@ export const OfferList: React.FC<OfferListProps> = ({ withSearchParams, onChange
         groupBy,
         groupByOptions,
         onChangeGroupBy,
-    } = useFilters({ gpus: data?.gpus ?? [], withSearchParams });
+        filteringStatusType,
+        handleLoadItems,
+    } = useFilters({ gpus: data?.gpus ?? [], withSearchParams, showFleetFilter, permanentFilters, defaultFilters });
 
     useEffect(() => {
         setRequestParams(
@@ -107,8 +131,25 @@ export const OfferList: React.FC<OfferListProps> = ({ withSearchParams, onChange
     }, [JSON.stringify(filteringRequestParams), groupBy]);
 
     useEffect(() => {
-        onChangeProjectName?.(filteringRequestParams.project_name ?? '');
+        const projectName = typeof filteringRequestParams.project_name === 'string' ? filteringRequestParams.project_name : '';
+        onChangeProjectName?.(projectName);
     }, [filteringRequestParams.project_name]);
+
+    useEffect(() => {
+        const backend = filteringRequestParams.backend;
+        const backendValues = backend
+            ? (Array.isArray(backend) ? backend : [backend]).filter((value): value is string => typeof value === 'string')
+            : [];
+        onChangeBackendFilter?.(backendValues);
+    }, [filteringRequestParams.backend]);
+
+    useEffect(() => {
+        const fleet = filteringRequestParams.fleet;
+        const fleetValues = fleet
+            ? (Array.isArray(fleet) ? fleet : [fleet]).filter((value): value is string => typeof value === 'string')
+            : [];
+        onChangeFleetFilter?.(fleetValues);
+    }, [filteringRequestParams.fleet]);
 
     const { renderEmptyMessage, renderNoMatchMessage } = useEmptyMessages({
         clearFilter,
@@ -181,65 +222,94 @@ export const OfferList: React.FC<OfferListProps> = ({ withSearchParams, onChange
         {
             id: 'availability',
             content: (gpu: IGpu) => {
-                // FIXME: array to string comparison never passes.
-                // Additionally, there are more availability statuses that are worth displaying,
-                // and several of them may be present at once.
+                const availabilityIssues =
+                    gpu.availability.length > 0 &&
+                    gpu.availability.every((a) => a === 'not_available' || a === 'no_quota' || a === 'no_balance');
 
-                // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-                // @ts-expect-error
-                if (gpu.availability === 'not_available') {
-                    return <StatusIndicator type="warning">Not Available</StatusIndicator>;
+                if (!availabilityIssues) {
+                    return null;
                 }
+
+                if (gpu.availability.length === 1) {
+                    return <span className={styles.greyText}>{t(`offer.availability_${gpu.availability[0]}`)}</span>;
+                }
+
+                return (
+                    <Popover
+                        dismissButton={false}
+                        position="top"
+                        size="small"
+                        content={gpu.availability.map((a) => t(`offer.availability_${a}`)).join(', ')}
+                    >
+                        <span className={styles.greyText}>{t('offer.availability_not_available')}</span>
+                    </Popover>
+                );
             },
             width: 50,
         },
     ].filter(Boolean) as CardsProps.CardDefinition<IGpu>['sections'];
 
     return (
-        <Cards
-            {...collectionProps}
-            {...props}
-            entireCardClickable
-            items={items}
-            cardDefinition={{
-                header: (gpu) => gpu.name,
-                sections,
-            }}
-            loading={isLoading || isFetching}
-            loadingText={t('common.loading')}
-            stickyHeader={true}
-            filter={
-                <div className={styles.selectFilters}>
-                    <div className={styles.propertyFilter}>
-                        <PropertyFilter
-                            disabled={isLoading || isFetching}
-                            query={propertyFilterQuery}
-                            onChange={onChangePropertyFilter}
-                            expandToViewport
-                            hideOperations
-                            i18nStrings={{
-                                clearFiltersText: t('common.clearFilter'),
-                                filteringAriaLabel: t('offer.filter_property_placeholder'),
-                                filteringPlaceholder: t('offer.filter_property_placeholder'),
-                                operationAndText: 'and',
-                            }}
-                            filteringOptions={filteringOptions}
-                            filteringProperties={filteringProperties}
-                        />
-                    </div>
+        <>
+            {!disabled && isError && (
+                <Alert type="error" header="Error">
+                    {'data' in (error as object) && (error as { data?: { detail?: { msg?: string }[] } }).data?.detail?.[0]?.msg
+                        ? (error as { data?: { detail?: { msg?: string }[] } }).data?.detail?.[0]?.msg
+                        : t('common.server_error', { error: 'Unknown error' })}
+                </Alert>
+            )}
 
-                    <div className={styles.filterField}>
-                        <MultiselectCSD
-                            placeholder={t('offer.groupBy')}
-                            onChange={onChangeGroupBy}
-                            options={groupByOptions}
-                            selectedOptions={groupBy}
-                            expandToViewport={true}
-                            disabled={isLoading || isFetching}
-                        />
-                    </div>
-                </div>
-            }
-        />
+            <Cards
+                {...collectionProps}
+                {...props}
+                entireCardClickable
+                items={disabled ? [] : items}
+                empty={disabled ? ' ' : undefined}
+                cardDefinition={{
+                    header: (gpu) => gpu.name,
+                    sections,
+                }}
+                loading={!disabled && (isLoading || isFetching)}
+                loadingText={t('common.loading')}
+                stickyHeader={true}
+                filter={
+                    disabled ? undefined : (
+                        <div className={styles.selectFilters}>
+                            <div className={styles.propertyFilter}>
+                                <PropertyFilter
+                                    disabled={isLoading || isFetching}
+                                    query={propertyFilterQuery}
+                                    onChange={onChangePropertyFilter}
+                                    expandToViewport
+                                    hideOperations
+                                    i18nStrings={{
+                                        clearFiltersText: t('common.clearFilter'),
+                                        filteringAriaLabel: t('offer.filter_property_placeholder'),
+                                        filteringPlaceholder: t('offer.filter_property_placeholder'),
+                                        operationAndText: 'and',
+                                        enteredTextLabel: (value) => `Use: ${value}`,
+                                    }}
+                                    filteringOptions={filteringOptions}
+                                    filteringProperties={filteringProperties}
+                                    filteringStatusType={filteringStatusType}
+                                    onLoadItems={handleLoadItems}
+                                />
+                            </div>
+
+                            <div className={styles.filterField}>
+                                <MultiselectCSD
+                                    placeholder={t('offer.groupBy')}
+                                    onChange={onChangeGroupBy}
+                                    options={groupByOptions}
+                                    selectedOptions={groupBy}
+                                    expandToViewport={true}
+                                    disabled={isLoading || isFetching}
+                                />
+                            </div>
+                        </div>
+                    )
+                }
+            />
+        </>
     );
 };

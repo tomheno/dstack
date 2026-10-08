@@ -11,6 +11,9 @@ from dstack._internal.cli.utils.common import (
     console,
 )
 from dstack._internal.core.errors import CLIError
+from dstack._internal.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class PsCommand(APIBaseCommand):
@@ -63,6 +66,7 @@ class PsCommand(APIBaseCommand):
         if args.watch and args.format == "json":
             raise CLIError("JSON output is not supported together with --watch")
 
+        # TODO: Add a `ps --json` option to control how many job submissions are returned.
         runs = self.api.runs.list(all=args.all, limit=args.last)
         if not args.watch:
             if args.format == "json":

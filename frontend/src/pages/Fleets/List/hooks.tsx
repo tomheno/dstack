@@ -8,10 +8,25 @@ import type { PropertyFilterProps } from 'components';
 import { Button, ListEmptyMessage, NavigateLink, StatusIndicator, TableProps } from 'components';
 
 import { DATE_TIME_FORMAT } from 'consts';
-import { useProjectFilter } from 'hooks/useProjectFilter';
-import { EMPTY_QUERY, requestParamsToTokens, tokensToRequestParams, tokensToSearchParams } from 'libs/filters';
-import { getFleetInstancesLinkText, getFleetPrice, getFleetStatusIconType } from 'libs/fleet';
+import { useLocalStorageState } from 'hooks';
+import {
+    EMPTY_QUERY,
+    getNamePatternFilterRequestParams,
+    requestParamsToTokens,
+    tokensToRequestParams,
+    tokensToSearchParams,
+} from 'libs/filters';
+import {
+    formatFleetBackend,
+    formatFleetResources,
+    getFleetInstancesLinkText,
+    getFleetPrice,
+    getFleetStatusIconType,
+} from 'libs/fleet';
 import { ROUTES } from 'routes';
+import { useLazyGetProjectsQuery } from 'services/project';
+
+const limit = 100;
 
 export const useEmptyMessages = ({
     clearFilter,
@@ -51,7 +66,7 @@ export const useColumnsDefinitions = () => {
     const columns: TableProps.ColumnDefinition<IFleet>[] = [
         {
             id: 'fleet_name',
-            header: t('fleets.fleet'),
+            header: t('fleets.fleet_column_name'),
             cell: (item) => (
                 <NavigateLink href={ROUTES.FLEETS.DETAILS.FORMAT(item.project_name, item.id)}>{item.name}</NavigateLink>
             ),
@@ -73,6 +88,17 @@ export const useColumnsDefinitions = () => {
             ),
         },
         {
+            id: 'backend',
+            header: t('fleets.instances.backend'),
+            cell: (item) => formatFleetBackend(item.spec.configuration),
+        },
+        {
+            id: 'resources',
+            header: t('fleets.instances.resources'),
+            cell: (item) =>
+                item.spec.configuration.ssh_config ? '-' : formatFleetResources(item.spec.configuration.resources),
+        },
+        {
             id: 'instances',
             header: t('fleets.instances.title'),
             cell: (item) => (
@@ -82,8 +108,8 @@ export const useColumnsDefinitions = () => {
             ),
         },
         {
-            id: 'started',
-            header: t('fleets.instances.started'),
+            id: 'created',
+            header: t('fleets.instances.created'),
             cell: (item) => format(new Date(item.created_at), DATE_TIME_FORMAT),
         },
         {
@@ -91,10 +117,7 @@ export const useColumnsDefinitions = () => {
             header: t('fleets.instances.price'),
             cell: (item) => {
                 const price = getFleetPrice(item);
-
-                if (typeof price === 'number') return `$${price}`;
-
-                return '-';
+                return typeof price === 'number' ? `$${price}` : '-';
             },
         },
     ];
@@ -108,10 +131,12 @@ const filterKeys: Record<string, RequestParamsKeys> = {
     PROJECT_NAME: 'project_name',
 };
 
-export const useFilters = (localStorePrefix = 'fleet-list-page') => {
+export const useFilters = () => {
     const [searchParams, setSearchParams] = useSearchParams();
-    const [onlyActive, setOnlyActive] = useState(() => searchParams.get('only_active') === 'true');
-    const { projectOptions } = useProjectFilter({ localStorePrefix });
+    const [onlyActive, setOnlyActive] = useLocalStorageState('fleet-list-filter-only-active', true);
+    const [dynamicFilteringOptions, setDynamicFilteringOptions] = useState<PropertyFilterProps.FilteringOption[]>([]);
+    const [filteringStatusType, setFilteringStatusType] = useState<PropertyFilterProps.StatusType | undefined>();
+    const [getProjects] = useLazyGetProjectsQuery();
 
     const [propertyFilterQuery, setPropertyFilterQuery] = useState<PropertyFilterProps.Query>(() =>
         requestParamsToTokens<RequestParamsKeys>({ searchParams, filterKeys }),
@@ -119,23 +144,12 @@ export const useFilters = (localStorePrefix = 'fleet-list-page') => {
 
     const clearFilter = () => {
         setSearchParams({});
-        setOnlyActive(false);
         setPropertyFilterQuery(EMPTY_QUERY);
     };
 
     const filteringOptions = useMemo(() => {
-        const options: PropertyFilterProps.FilteringOption[] = [];
-
-        projectOptions.forEach(({ value }) => {
-            if (value)
-                options.push({
-                    propertyKey: filterKeys.PROJECT_NAME,
-                    value,
-                });
-        });
-
-        return options;
-    }, [projectOptions]);
+        return [...dynamicFilteringOptions];
+    }, [dynamicFilteringOptions]);
 
     const filteringProperties = [
         {
@@ -163,8 +177,6 @@ export const useFilters = (localStorePrefix = 'fleet-list-page') => {
 
     const onChangeOnlyActive: ToggleProps['onChange'] = ({ detail }) => {
         setOnlyActive(detail.checked);
-
-        setSearchParams(tokensToSearchParams<RequestParamsKeys>(propertyFilterQuery.tokens, detail.checked));
     };
 
     const filteringRequestParams = useMemo(() => {
@@ -175,10 +187,31 @@ export const useFilters = (localStorePrefix = 'fleet-list-page') => {
         return {
             ...params,
             only_active: onlyActive,
+            include_imported: true,
         } as Partial<TFleetListRequestParams>;
     }, [propertyFilterQuery, onlyActive]);
 
     const isDisabledClearFilter = !propertyFilterQuery.tokens.length && !onlyActive;
+
+    const handleLoadItems: PropertyFilterProps['onLoadItems'] = async ({ detail: { filteringProperty, filteringText } }) => {
+        setDynamicFilteringOptions([]);
+
+        setFilteringStatusType('loading');
+
+        if (filteringProperty?.key === filterKeys.PROJECT_NAME) {
+            await getProjects(getNamePatternFilterRequestParams(filteringText, limit))
+                .unwrap()
+                .then(({ data }) =>
+                    data.map(({ project_name }) => ({
+                        propertyKey: filterKeys.PROJECT_NAME,
+                        value: project_name,
+                    })),
+                )
+                .then(setDynamicFilteringOptions);
+        }
+
+        setFilteringStatusType(undefined);
+    };
 
     return {
         filteringRequestParams,
@@ -190,5 +223,7 @@ export const useFilters = (localStorePrefix = 'fleet-list-page') => {
         onlyActive,
         onChangeOnlyActive,
         isDisabledClearFilter,
+        filteringStatusType,
+        handleLoadItems,
     } as const;
 };

@@ -3,7 +3,7 @@ from typing import Annotated, Literal, Optional, Union
 from pydantic import BaseModel, Field
 
 from dstack._internal.core.models.instances import SSHConnectionParams
-from dstack._internal.core.models.routers import AnyRouterConfig
+from dstack._internal.proxy.lib.const import DEFAULT_SERVICE_READ_TIMEOUT
 from dstack._internal.proxy.lib.models import RateLimit
 
 
@@ -37,6 +37,8 @@ class Options(BaseModel):
 
 
 class RegisterServiceRequest(BaseModel):
+    id: Optional[str] = None
+    """Only optional for compatibility with pre-0.21.0 callers"""
     run_name: str
     domain: str
     https: bool
@@ -45,7 +47,12 @@ class RegisterServiceRequest(BaseModel):
     options: Options
     ssh_private_key: str
     rate_limits: tuple[RateLimit, ...] = ()
-    router: Optional[AnyRouterConfig] = None
+    has_router_replica: bool = False
+    read_timeout: int = DEFAULT_SERVICE_READ_TIMEOUT
+
+
+class SetServiceIdRequest(BaseModel):
+    id: str
 
 
 class RegisterReplicaRequest(BaseModel):
@@ -53,11 +60,14 @@ class RegisterReplicaRequest(BaseModel):
     app_port: int
     ssh_host: str
     ssh_port: int
-    ssh_proxy: Optional[SSHConnectionParams]
-    ssh_head_proxy: Optional[SSHConnectionParams]
-    ssh_head_proxy_private_key: Optional[str]
+    ssh_proxy: Optional[SSHConnectionParams] = None
+    ssh_proxy_private_key: Optional[str] = None
+    ssh_head_proxy: Optional[SSHConnectionParams] = None
+    ssh_head_proxy_private_key: Optional[str] = None
+    internal_ip: Optional[str] = None
 
 
 class RegisterEntrypointRequest(BaseModel):
     domain: str
     https: bool
+    read_timeout: int = DEFAULT_SERVICE_READ_TIMEOUT

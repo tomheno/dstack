@@ -1,25 +1,58 @@
 import asyncio
+import contextvars
 import enum
 import itertools
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, TypeVar
+from typing import Any, Final, Iterable, List, Optional, TypeVar, Union
 from urllib.parse import urlparse
+from uuid import UUID
 
+from pydantic import TypeAdapter
 from typing_extensions import ParamSpec
 
-from dstack._internal.core.models.common import Duration
+from dstack._internal.core.models.duration import Duration
+from dstack._internal.utils.interpolator import InterpolatorError, VariablesInterpolator
+
+
+class Unset:
+    pass
+
+
+UNSET: Final = Unset()
+"""
+Use `UNSET` as kwargs default value to distinguish between
+specified and non-specified `Optional` values.
+"""
+
+
+@dataclass
+class EntityName:
+    name: str
+
+
+@dataclass
+class EntityID:
+    id: UUID
+
+
+EntityNameOrID = Union[EntityName, EntityID]
+
 
 P = ParamSpec("P")
 R = TypeVar("R")
 
 
 async def run_async(func: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
-    func_with_args = partial(func, *args, **kwargs)
+    # Copy the context so that context-dependent features such as tracing
+    # work in the executor thread, same as asyncio.to_thread()
+    ctx = contextvars.copy_context()
+    func_with_args = partial(ctx.run, func, *args, **kwargs)
     return await asyncio.get_running_loop().run_in_executor(None, func_with_args)
 
 
@@ -33,6 +66,23 @@ def get_current_datetime() -> datetime:
 
 def get_milliseconds_since_epoch() -> int:
     return int(round(time.time() * 1000))
+
+
+_DATETIME_ADAPTER = TypeAdapter(datetime)
+
+
+def render_datetime_as_api(value: datetime) -> str:
+    """
+    Render a datetime the way the API serializes one.
+
+    Delegates to pydantic rather than post-processing `isoformat()`, so the result cannot drift
+    from what the models emit. The two differ: pydantic v2 spells a zero UTC offset `Z`, while
+    `isoformat()` spells it `+00:00`.
+
+    Only needed where a datetime is formatted by hand. Anything handed to pydantic or to
+    `pydantic_core.to_json` is already rendered this way.
+    """
+    return _DATETIME_ADAPTER.dump_python(value, mode="json")
 
 
 DateFormatter = Callable[[datetime], str]
@@ -85,34 +135,25 @@ def pretty_date(time: datetime) -> str:
     return str(years) + " years ago"
 
 
+def format_mib_as_gb(mib: int) -> str:
+    """Format a MiB value as a human-readable GB string, e.g. 512 → '0.5GB', 8192 → '8GB'."""
+    return f"{round(mib / 1024, 1):g}GB"
+
+
 def pretty_resources(
     *,
     cpu_arch: Optional[Any] = None,
     cpus: Optional[Any] = None,
     memory: Optional[Any] = None,
     gpu_count: Optional[Any] = None,
+    gpu_vendor: Optional[Any] = None,
     gpu_name: Optional[Any] = None,
     gpu_memory: Optional[Any] = None,
     total_gpu_memory: Optional[Any] = None,
     compute_capability: Optional[Any] = None,
     disk_size: Optional[Any] = None,
 ) -> str:
-    """
-    >>> pretty_resources(cpus=4, memory="16GB")
-    '4xCPU, 16GB'
-    >>> pretty_resources(cpus=4, memory="16GB", gpu_count=1)
-    '4xCPU, 16GB, 1xGPU'
-    >>> pretty_resources(cpus=4, memory="16GB", gpu_count=1, gpu_name='A100')
-    '4xCPU, 16GB, 1xA100'
-    >>> pretty_resources(cpus=4, memory="16GB", gpu_count=1, gpu_name='A100', gpu_memory="40GB")
-    '4xCPU, 16GB, 1xA100 (40GB)'
-    >>> pretty_resources(cpus=4, memory="16GB", gpu_count=1, total_gpu_memory="80GB")
-    '4xCPU, 16GB, 1xGPU (total 80GB)'
-    >>> pretty_resources(cpus=4, memory="16GB", gpu_count=2, gpu_name='A100', gpu_memory="40GB", total_gpu_memory="80GB")
-    '4xCPU, 16GB, 2xA100 (40GB, total 80GB)'
-    >>> pretty_resources(gpu_count=1, compute_capability="8.0")
-    '1xGPU (8.0)'
-    """
+    """Format resource requirements as a human-readable string."""
     parts = []
     if cpus is not None:
         cpu_arch_lower: Optional[str] = None
@@ -120,8 +161,8 @@ def pretty_resources(
             cpu_arch_lower = str(cpu_arch.value).lower()
         elif isinstance(cpu_arch, str):
             cpu_arch_lower = cpu_arch.lower()
-        if cpu_arch_lower == "arm":
-            cpu_arch_prefix = "arm:"
+        if cpu_arch_lower is not None:
+            cpu_arch_prefix = f"{cpu_arch_lower}:"
         else:
             cpu_arch_prefix = ""
         parts.append(f"cpu={cpu_arch_prefix}{cpus}")
@@ -131,7 +172,6 @@ def pretty_resources(
         parts.append(f"disk={disk_size}")
     if gpu_count:
         gpu_parts = []
-        gpu_parts.append(f"{gpu_name or 'gpu'}")
         if gpu_memory is not None:
             gpu_parts.append(f"{gpu_memory}")
         if gpu_count is not None:
@@ -141,8 +181,13 @@ def pretty_resources(
         if compute_capability is not None:
             gpu_parts.append(f"{compute_capability}")
 
-        gpu = ":".join(gpu_parts)
-        parts.append(gpu)
+        if gpu_name:
+            parts.append("gpu=" + ":".join([f"{gpu_name}"] + gpu_parts))
+        elif gpu_vendor:
+            vendor_str = gpu_vendor.value if isinstance(gpu_vendor, enum.Enum) else str(gpu_vendor)
+            parts.append("gpu=" + ":".join([vendor_str] + gpu_parts))
+        else:
+            parts.append("gpu=" + ":".join(gpu_parts))
     return " ".join(parts)
 
 
@@ -286,6 +331,12 @@ def batched(seq: Iterable[T], n: int) -> Iterable[List[T]]:
     return iter(lambda: list(itertools.islice(it, n)), [])
 
 
+def get_lowest_unused_nums(used_nums: set[int]) -> Iterator[int]:
+    for num in itertools.count():
+        if num not in used_nums:
+            yield num
+
+
 StrT = TypeVar("StrT", str, bytes)
 
 
@@ -312,6 +363,18 @@ def make_proxy_url(server_url: str, proxy_url: str) -> str:
         path=concat_url_path(server.path, proxy.path),
     )
     return proxy.geturl()
+
+
+def interpolate_gateway_domain(
+    domain: str, run_project_name: str, exception_type: Optional[type[Exception]]
+) -> str:
+    interpolator = VariablesInterpolator({"run": {"project_name": run_project_name}})
+    try:
+        return interpolator.interpolate_or_error(domain)
+    except InterpolatorError as e:
+        if exception_type is None:
+            return domain
+        raise exception_type(f"Cannot interpolate gateway domain name: {e.args[0]}") from e
 
 
 def list_enum_values_for_annotation(enum_class: type[enum.Enum]) -> str:

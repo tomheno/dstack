@@ -3,13 +3,17 @@ package api
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/dstackai/dstack/runner/internal/shim"
+	"github.com/dstackai/dstack/runner/internal/shim/host"
 )
 
 type DummyRunner struct {
-	tasks map[string]bool
-	mu    sync.Mutex
+	tasks     map[string]bool
+	gpus      []host.GpuInfo
+	processed atomic.Int64
+	mu        sync.Mutex
 }
 
 func (ds *DummyRunner) Submit(ctx context.Context, cfg shim.TaskConfig) error {
@@ -22,8 +26,12 @@ func (ds *DummyRunner) Submit(ctx context.Context, cfg shim.TaskConfig) error {
 	return nil
 }
 
-func (ds *DummyRunner) Run(context.Context, string) error {
+func (ds *DummyRunner) Start(context.Context, string) error {
 	return nil
+}
+
+func (ds *DummyRunner) ProcessTasks(context.Context) {
+	ds.processed.Add(1)
 }
 
 func (ds *DummyRunner) Terminate(context.Context, string, uint, string, string) error {
@@ -44,6 +52,10 @@ func (ds *DummyRunner) TaskInfo(taskID string) shim.TaskInfo {
 
 func (ds *DummyRunner) Resources(context.Context) shim.Resources {
 	return shim.Resources{}
+}
+
+func (ds *DummyRunner) Gpus(context.Context) []host.GpuInfo {
+	return ds.gpus
 }
 
 func NewDummyRunner() *DummyRunner {

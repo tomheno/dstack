@@ -1,10 +1,14 @@
 import { format } from 'date-fns';
+import type { StatusIndicatorProps } from '@cloudscape-design/components/status-indicator';
 
 import { DATE_TIME_FORMAT } from 'consts';
 import { capitalize } from 'libs';
+import { formatBackend } from 'libs/fleet';
+import { formatResources } from 'libs/resources';
 
 export const getJobListItemResources = (job: IJob) => {
-    return job.job_submissions?.[job.job_submissions.length - 1]?.job_provisioning_data?.instance_type?.resources?.description;
+    const resources = job.job_submissions?.[job.job_submissions.length - 1]?.job_provisioning_data?.instance_type?.resources;
+    return resources ? formatResources(resources) : '-';
 };
 
 export const getJobListItemSpot = (job: IJob) => {
@@ -30,7 +34,7 @@ export const getJobListItemRegion = (job: IJob) => {
 };
 
 export const getJobListItemBackend = (job: IJob) => {
-    return job.job_submissions?.[job.job_submissions.length - 1]?.job_provisioning_data?.backend ?? '-';
+    return formatBackend(job.job_submissions?.[job.job_submissions.length - 1]?.job_provisioning_data?.backend);
 };
 
 export const getJobSubmittedAt = (job: IJob) => {
@@ -46,6 +50,28 @@ export const getJobFinishedAt = (job: IJob) => {
 
 export const getJobStatus = (job: IJob) => {
     return job.job_submissions?.[job.job_submissions.length - 1].status;
+};
+
+export const getJobSubmissionProbes = (job: IJob) => {
+    return job.job_submissions?.[job.job_submissions.length - 1].probes;
+};
+
+export const getJobProbesStatuses = (job: IJob): StatusIndicatorProps.Type[] => {
+    const status = getJobStatus(job);
+    const probes = getJobSubmissionProbes(job);
+
+    if (!probes?.length || status !== 'running') {
+        return [];
+    }
+
+    return probes.map((probe, index) => {
+        if (job.job_spec?.probes?.[index] && probe.success_streak >= job.job_spec.probes[index].ready_after) {
+            return 'success';
+        } else if (probe.success_streak > 0) {
+            return 'in-progress';
+        }
+        return 'not-started';
+    });
 };
 
 export const getJobTerminationReason = (job: IJob) => {

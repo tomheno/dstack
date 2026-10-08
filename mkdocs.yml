@@ -3,20 +3,26 @@ site_name: dstack
 site_url: https://dstack.ai
 site_author: dstack GmbH
 site_description: >-
-  dstack is an open-source control plane for GPU provisioning and orchestration across GPU clouds, Kubernetes, and on-prem clusters.
+  dstack is a unified control plane for GPU provisioning and orchestration that works with any GPU cloud, Kubernetes, or on-prem clusters.
 
 # Repository
 repo_url: https://github.com/dstackai/dstack
 repo_name: dstackai/dstack
-edit_uri: edit/master/docs/
+edit_uri: edit/master/mkdocs/
 
 #Copyright
-copyright: © 2025 dstack
+copyright: © 2026, dstack Inc. All rights reserved.
+
+# Source directory for site content
+docs_dir: mkdocs
+
+hooks:
+  - scripts/docs/hooks.py
 
 # Configuration
 theme:
   name: material
-  custom_dir: docs/overrides
+  custom_dir: mkdocs/overrides
   logo: assets/images/dstack-logo-notext.svg
   favicon: assets/images/dstack-fav-32.ico
   icon:
@@ -26,21 +32,23 @@ theme:
   font:
     text: Source Sans Pro
     code: IBM Plex Mono
+  # Light (default) + dark (slate) schemes WITH toggles — Material needs the toggle radios so its
+  # palette JS honors the stored __palette and applies it during parse (flash-free). We HIDE the
+  # toggle buttons via CSS (cloudscape-docs.css) and drive the choice from the shared `dstack-theme`
+  # localStorage key (website/src/theme.ts), translated into __palette in main.html's extrahead.
   palette:
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
+    - scheme: default
       primary: white
       accent: lilac
-  #        toggle:
-  #          icon: material/weather-night
-  #          name: Switch to dark mode
-  #      - media: "(prefers-color-scheme: dark)"
-  #        scheme: slate
-  #        primary: black
-  #        accent: light blue
-  #        toggle:
-  #          icon: material/weather-sunny
-  #          name: Switch to light mode
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: white
+      accent: lilac
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
   features:
     - content.tooltips
     - navigation.path
@@ -54,51 +62,12 @@ theme:
     - navigation.sections
     #    - navigation.expand
     - navigation.top
-    - announce.dismiss
+    # announce.dismiss removed — /old's banner has no dismiss (×) button
     - navigation.tracking
     - navigation.footer
 
 # Plugins
 plugins:
-  - llmstxt-md:
-      enable_copy_button: false
-      sections:
-        Getting started:
-          - docs/index.md: What dstack is
-          - docs/installation/index.md: How to set up the dstack server and the dstack CLI
-          - docs/quickstart.md: How to get started and submit your first run
-        Concepts:
-          - docs/concepts/backends.md: How to configure backends - to connect dstack to cloud providers, Kubernetes clusters, etc
-          - docs/concepts/fleets.md: How to create and manage fleets - required before submitting runs
-          - docs/concepts/dev-environments.md: How to create dev environments - for interactive development using a desktop IDE
-          - docs/concepts/tasks.md: How to run tasks - for training or fine-tuning, including distributed tasks
-          - docs/concepts/services.md: How to deploy services - for model inference or web apps
-          - docs/concepts/volumes.md: How to manage volumes - for persistent storage or caching
-          - docs/concepts/secrets.md: How to manage secrets - for API keys or other sensitive data
-          - docs/concepts/projects.md: How to manage projects - for managing separate teams
-          - docs/concepts/gateways.md: How to manage gateways - enabling auto-scaling, rate limits, and custom domains
-        Guides:
-          - docs/guides/clusters.md: How to work with clusters - for distributed tasks
-          - docs/guides/kubernetes.md: How to work with Kubernetes
-          - docs/guides/server-deployment.md: Detailed guide on how to deploy the dstack server
-          - docs/guides/troubleshooting.md: Common issues and how to troubleshoot them
-          - docs/guides/metrics.md: How to monitor metrics
-          - docs/guides/protips.md: Pro tips - tips and tricks to use dstack more efficiently
-        Examples:
-          - examples/single-node-training/trl/index.md: TRL
-          - examples/single-node-training/axolotl/index.md: Axolotl
-          - examples/distributed-training/trl/index.md: TRL
-          - examples/distributed-training/axolotl/index.md: Axolotl
-          - examples/distributed-training/ray-ragen/index.md: Ray+RAGEN
-          - examples/clusters/nccl-rccl-tests/index.md: NCCL/RCCL tests
-          - examples/inference/sglang/index.md: SGLang
-          - examples/inference/vllm/index.md: vLLM
-          - examples/inference/nim/index.md: NIM
-          - examples/inference/trtllm/index.md: TensorRT-LLM
-        Accelerators:
-          - examples/accelerators/amd/index.md: AMD
-          - examples/accelerators/tpu/index.md: TPU
-          - examples/accelerators/tenstorrent/index.md: Tenstorrent
   - blog:
       blog_dir: blog
       post_url_format: "{slug}"
@@ -113,7 +82,7 @@ plugins:
         color: "#FFFFFF"
         font_family: "Roboto"
       #      debug: true
-      cards_layout_dir: docs/layouts
+      cards_layout_dir: mkdocs/layouts
       cards_layout: custom
   - search
   - redirects:
@@ -134,50 +103,107 @@ plugins:
         "docs/tasks.md": "docs/concepts/tasks.md"
         "docs/services.md": "docs/concepts/services.md"
         "docs/fleets.md": "docs/concepts/fleets.md"
-        "docs/examples/llms/llama31.md": "examples/llms/llama/index.md"
-        "docs/examples/llms/llama32.md": "examples/llms/llama/index.md"
-        "examples/llms/llama31/index.md": "examples/llms/llama/index.md"
-        "examples/llms/llama32/index.md": "examples/llms/llama/index.md"
-        "docs/examples/accelerators/amd/index.md": "examples/accelerators/amd/index.md"
-        "docs/examples/deployment/nim/index.md": "examples/inference/nim/index.md"
-        "docs/examples/deployment/vllm/index.md": "examples/inference/vllm/index.md"
-        "docs/examples/deployment/tgi/index.md": "examples/inference/tgi/index.md"
-        "providers.md": "partners.md"
-        "backends.md": "partners.md"
+        "docs/concepts/endpoints.md": "docs/concepts/presets.md"
+        "docs/reference/cli/dstack/endpoint.md": "docs/reference/cli/dstack/preset.md"
+        "docs/examples/llms/llama31.md": "docs/examples/inference/vllm.md"
+        "docs/examples/llms/llama32.md": "docs/examples/inference/vllm.md"
+        "docs/examples/llms/qwen36.md": "docs/examples/models/qwen36.md"
+        "examples/llms/llama31/index.md": "docs/examples/inference/vllm.md"
+        "examples/llms/llama32/index.md": "docs/examples/inference/vllm.md"
+        "examples/llms/qwen36/index.md": "docs/examples/models/qwen36.md"
+        "docs/examples/deployment/nim/index.md": "docs/examples/inference/nim.md"
+        "docs/examples/deployment/vllm/index.md": "docs/examples/inference/vllm.md"
+        "backends.md": "docs/concepts/backends.md"
         "blog/monitoring-gpu-usage.md": "blog/posts/dstack-metrics.md"
         "blog/inactive-dev-environments-auto-shutdown.md": "blog/posts/inactivity-duration.md"
         "blog/data-centers-and-private-clouds.md": "blog/posts/gpu-blocks-and-proxy-jump.md"
-        "blog/distributed-training-with-aws-efa.md": "examples/clusters/aws/index.md"
+        "blog/distributed-training-with-aws-efa.md": "docs/examples/clusters/aws.md"
         "blog/dstack-stats.md": "blog/posts/dstack-metrics.md"
-        "docs/concepts/metrics.md": "docs/guides/metrics.md"
-        "docs/guides/monitoring.md": "docs/guides/metrics.md"
+        "docs/guides/metrics.md": "docs/concepts/metrics.md"
+        "docs/guides/monitoring.md": "docs/concepts/metrics.md"
         "blog/nvidia-and-amd-on-vultr.md.md": "blog/posts/nvidia-and-amd-on-vultr.md"
-        "examples/misc/nccl-tests/index.md": "examples/clusters/nccl-rccl-tests/index.md"
-        "examples/misc/a3high-clusters/index.md": "examples/clusters/gcp/index.md"
-        "examples/misc/a3mega-clusters/index.md": "examples/clusters/gcp/index.md"
-        "examples/distributed-training/nccl-tests/index.md": "examples/clusters/nccl-rccl-tests/index.md"
-        "examples/distributed-training/rccl-tests/index.md": "examples/clusters/nccl-rccl-tests/index.md"
-        "examples/deployment/nim/index.md": "examples/inference/nim/index.md"
-        "examples/deployment/vllm/index.md": "examples/inference/vllm/index.md"
-        "examples/deployment/tgi/index.md": "examples/inference/tgi/index.md"
-        "examples/deployment/sglang/index.md": "examples/inference/sglang/index.md"
-        "examples/deployment/trtllm/index.md": "examples/inference/trtllm/index.md"
-        "examples/fine-tuning/trl/index.md": "examples/single-node-training/trl/index.md"
-        "examples/fine-tuning/axolotl/index.md": "examples/single-node-training/axolotl/index.md"
-        "blog/efa.md": "examples/clusters/aws/index.md"
+        "examples/misc/nccl-tests/index.md": "docs/examples/clusters/nccl-rccl-tests.md"
+        "examples/misc/a3high-clusters/index.md": "docs/examples/clusters/gcp.md"
+        "examples/misc/a3mega-clusters/index.md": "docs/examples/clusters/gcp.md"
+        "examples/distributed-training/nccl-tests/index.md": "docs/examples/clusters/nccl-rccl-tests.md"
+        "examples/distributed-training/rccl-tests/index.md": "docs/examples/clusters/nccl-rccl-tests.md"
+        "examples/deployment/nim/index.md": "docs/examples/inference/nim.md"
+        "examples/deployment/vllm/index.md": "docs/examples/inference/vllm.md"
+        "examples/deployment/sglang/index.md": "docs/examples/inference/sglang.md"
+        "examples/deployment/trtllm/index.md": "docs/examples/inference/trtllm.md"
+        "examples/fine-tuning/trl/index.md": "docs/examples/training/trl.md"
+        "examples/fine-tuning/axolotl/index.md": "docs/examples/training/axolotl.md"
+        "blog/efa.md": "docs/examples/clusters/aws.md"
         "docs/concepts/repos.md": "docs/concepts/dev-environments.md#repos"
-        "examples/clusters/a3high/index.md": "examples/clusters/gcp/index.md"
-        "examples/clusters/a3mega/index.md": "examples/clusters/gcp/index.md"
-        "examples/clusters/a4/index.md": "examples/clusters/gcp/index.md"
-        "examples/clusters/efa/index.md": "examples/clusters/aws/index.md"
+        "examples/clusters/a3high/index.md": "docs/examples/clusters/gcp.md"
+        "examples/clusters/a3mega/index.md": "docs/examples/clusters/gcp.md"
+        "examples/clusters/a4/index.md": "docs/examples/clusters/gcp.md"
+        "examples/clusters/efa/index.md": "docs/examples/clusters/aws.md"
         "docs/guides/migration.md": "docs/guides/upgrade.md"
+        "docs/reference/api/rest/index.md": "docs/reference/http/index.md"
+        "docs/reference/api/http/index.md": "docs/reference/http/index.md"
+        "docs/reference/api/http/auth.md": "docs/reference/http/authentication.md"
+        "docs/reference/api/http/backends.md": "docs/reference/http/backends.md"
+        "docs/reference/api/http/default.md": "docs/reference/http/default.md"
+        "docs/reference/api/http/events.md": "docs/reference/http/events.md"
+        "docs/reference/api/http/exports.md": "docs/reference/http/exports.md"
+        "docs/reference/api/http/files.md": "docs/reference/http/files.md"
+        "docs/reference/api/http/fleets.md": "docs/reference/http/fleets.md"
+        "docs/reference/api/http/gateways.md": "docs/reference/http/gateways.md"
+        "docs/reference/api/http/gpus.md": "docs/reference/http/gpus.md"
+        "docs/reference/api/http/imports.md": "docs/reference/http/exports.md"
+        "docs/reference/api/http/instances.md": "docs/reference/http/fleets.md"
+        "docs/reference/api/http/logs.md": "docs/reference/http/logs.md"
+        "docs/reference/api/http/metrics.md": "docs/reference/http/metrics.md"
+        "docs/reference/api/http/model-proxy.md": "docs/reference/http/proxy.md"
+        "docs/reference/api/http/projects.md": "docs/reference/http/projects.md"
+        "docs/reference/api/http/prometheus.md": "docs/reference/http/metrics.md"
+        "docs/reference/api/http/repos.md": "docs/reference/http/repos.md"
+        "docs/reference/api/http/runs.md": "docs/reference/http/runs.md"
+        "docs/reference/api/http/secrets.md": "docs/reference/http/secrets.md"
+        "docs/reference/api/http/server.md": "docs/reference/http/server.md"
+        "docs/reference/api/http/service-proxy.md": "docs/reference/http/proxy.md"
+        "docs/reference/api/http/sshproxy.md": "docs/reference/http/proxy.md"
+        "docs/reference/api/http/templates.md": "docs/reference/http/templates.md"
+        "docs/reference/api/http/user-public-keys.md": "docs/reference/http/users.md"
+        "docs/reference/api/http/users.md": "docs/reference/http/users.md"
+        "docs/reference/api/http/volumes.md": "docs/reference/http/volumes.md"
+        # Examples moved from /examples/ to /docs/examples/
+        "examples.md": "docs/examples.md"
+        "examples/single-node-training/trl.md": "docs/examples/training/trl.md"
+        "examples/single-node-training/axolotl.md": "docs/examples/training/axolotl.md"
+        "examples/distributed-training/trl.md": "docs/examples/training/trl.md"
+        "examples/distributed-training/axolotl.md": "docs/examples/training/axolotl.md"
+        "examples/distributed-training/ray-ragen.md": "docs/examples/training/ray-ragen.md"
+        "examples/distributed-training/miles.md": "docs/examples/training/miles.md"
+        # Single-node and distributed training merged under Training
+        "docs/examples/single-node-training/trl.md": "docs/examples/training/trl.md"
+        "docs/examples/single-node-training/axolotl.md": "docs/examples/training/axolotl.md"
+        "docs/examples/distributed-training/trl.md": "docs/examples/training/trl.md"
+        "docs/examples/distributed-training/axolotl.md": "docs/examples/training/axolotl.md"
+        "docs/examples/distributed-training/ray-ragen.md": "docs/examples/training/ray-ragen.md"
+        "docs/examples/distributed-training/miles.md": "docs/examples/training/miles.md"
+        "examples/clusters/aws.md": "docs/examples/clusters/aws.md"
+        "examples/clusters/gcp.md": "docs/examples/clusters/gcp.md"
+        "examples/clusters/lambda.md": "docs/examples/clusters/lambda.md"
+        "examples/clusters/crusoe.md": "docs/examples/clusters/crusoe.md"
+        "examples/clusters/nebius.md": "docs/examples/clusters/nebius.md"
+        "examples/clusters/nccl-rccl-tests.md": "docs/examples/clusters/nccl-rccl-tests.md"
+        "examples/inference/sglang.md": "docs/examples/inference/sglang.md"
+        "examples/inference/vllm.md": "docs/examples/inference/vllm.md"
+        "examples/inference/nim.md": "docs/examples/inference/nim.md"
+        "examples/inference/trtllm.md": "docs/examples/inference/trtllm.md"
+        "examples/models/deepseek-v4.md": "docs/examples/models/deepseek-v4.md"
+        "examples/models/qwen36.md": "docs/examples/models/qwen36.md"
+        "examples/accelerators/amd.md": "docs/examples/accelerators/amd.md"
+        "examples/accelerators/tpu.md": "docs/examples/accelerators/tpu.md"
+        "examples/accelerators/tenstorrent.md": "docs/examples/accelerators/tenstorrent.md"
   - typeset
   - gen-files:
+      # TODO: convert these to hooks (schema reference migrated)
       scripts: # always relative to mkdocs.yml
-        - scripts/docs/gen_examples.py
         - scripts/docs/gen_cli_reference.py
         - scripts/docs/gen_openapi_reference.py
-        - scripts/docs/gen_schema_reference.py
         - scripts/docs/gen_rest_plugin_spec_reference.py
   - mkdocstrings:
       handlers:
@@ -185,7 +211,6 @@ plugins:
           options:
             docstring_style: google
             show_source: false
-  - render_swagger
 
 # Extensions
 markdown_extensions:
@@ -207,7 +232,7 @@ markdown_extensions:
   - pymdownx.details
   - pymdownx.superfences
   - pymdownx.snippets:
-      base_path: ["docs"]
+      base_path: ["mkdocs"]
   - pymdownx.tabbed:
       alternate_style: true
       slugify: !!python/object/apply:pymdownx.slugs.slugify
@@ -225,11 +250,16 @@ markdown_extensions:
 
 # Customization
 extra_css:
+  - https://unpkg.com/swagger-ui-dist@5.32.0/swagger-ui.css
   - assets/stylesheets/extra.css
+  - assets/stylesheets/swagger.css
   - assets/stylesheets/termynal.css
   - assets/stylesheets/landing.css
   - assets/stylesheets/pricing.css
+  - assets/stylesheets/cloudscape-docs.css
 extra_javascript:
+  - https://unpkg.com/swagger-ui-dist@5.32.0/swagger-ui-bundle.js
+  - assets/javascripts/swagger.js
   - assets/javascripts/extra.js
   - assets/javascripts/pricing.js
 extra:
@@ -248,7 +278,7 @@ extra:
     - icon: /fontawesome/brands/discord
       link: https://discord.gg/u8SmfwPpMd
     - icon: /simple/x
-      link: https://twitter.com/dstackai
+      link: https://x.com/dstackai
     - icon: /fontawesome/brands/linkedin
       link: https://www.linkedin.com/company/dstackai
   status:
@@ -259,7 +289,7 @@ nav:
   - Docs:
       - Getting started:
           - Overview: docs/index.md
-          - Installation: docs/installation/index.md
+          - Installation: docs/installation.md
           - Quickstart: docs/quickstart.md
       - Concepts:
           - Backends: docs/concepts/backends.md
@@ -267,20 +297,51 @@ nav:
           - Dev environments: docs/concepts/dev-environments.md
           - Tasks: docs/concepts/tasks.md
           - Services: docs/concepts/services.md
-          - Volumes: docs/concepts/volumes.md
-          - Secrets: docs/concepts/secrets.md
-          - Projects: docs/concepts/projects.md
-          - Gateways: docs/concepts/gateways.md
+          - Presets: docs/concepts/presets.md
+          - More:
+            - Volumes: docs/concepts/volumes.md
+            - Gateways: docs/concepts/gateways.md
+            - Secrets: docs/concepts/secrets.md
+            - Projects: docs/concepts/projects.md
+            - Metrics: docs/concepts/metrics.md
+            - Events: docs/concepts/events.md
+            - Exports: docs/concepts/exports.md
       - Guides:
-          - Clusters: docs/guides/clusters.md
-          - Kubernetes: docs/guides/kubernetes.md
+          - CLI & API: docs/guides/cli-api.md
           - Server deployment: docs/guides/server-deployment.md
           - Troubleshooting: docs/guides/troubleshooting.md
-          - Metrics: docs/guides/metrics.md
-          - Protips: docs/guides/protips.md
-          - Upgrade: docs/guides/upgrade.md
-      - Migration:
-        - Slurm: docs/guides/migration/slurm.md
+          - More:
+            - Protips: docs/guides/protips.md
+            - Tenant isolation: docs/guides/tenant-isolation.md
+            - Upgrade: docs/guides/upgrade.md
+            - Migration: 
+              - Slurm: docs/guides/migration/slurm.md
+      - Examples:
+        - Training:
+            - TRL: docs/examples/training/trl.md
+            - Axolotl: docs/examples/training/axolotl.md
+            - Ray+RAGEN: docs/examples/training/ray-ragen.md
+            - Miles: docs/examples/training/miles.md
+        - Clusters:
+            - AWS: docs/examples/clusters/aws.md
+            - GCP: docs/examples/clusters/gcp.md
+            - Lambda: docs/examples/clusters/lambda.md
+            - Crusoe: docs/examples/clusters/crusoe.md
+            - Nebius: docs/examples/clusters/nebius.md
+            - NCCL/RCCL tests: docs/examples/clusters/nccl-rccl-tests.md
+        - Inference:
+            - SGLang: docs/examples/inference/sglang.md
+            - Dynamo: docs/examples/inference/dynamo.md
+            - vLLM: docs/examples/inference/vllm.md
+            - NIM: docs/examples/inference/nim.md
+            - TensorRT-LLM: docs/examples/inference/trtllm.md
+        - Models:
+            - DeepSeek V4: docs/examples/models/deepseek-v4.md
+            - Qwen 3.6: docs/examples/models/qwen36.md
+        - Accelerators:
+            - AMD: docs/examples/accelerators/amd.md
+            - Tenstorrent: docs/examples/accelerators/tenstorrent.md
+            - TPU: docs/examples/accelerators/tpu.md
       - Reference:
           - .dstack.yml:
               - dev-environment: docs/reference/dstack.yml/dev-environment.md
@@ -289,6 +350,7 @@ nav:
               - fleet: docs/reference/dstack.yml/fleet.md
               - gateway: docs/reference/dstack.yml/gateway.md
               - volume: docs/reference/dstack.yml/volume.md
+              - preset: docs/reference/dstack.yml/preset.md
           - server/config.yml: docs/reference/server/config.yml.md
           - CLI:
               - dstack server: docs/reference/cli/dstack/server.md
@@ -308,48 +370,40 @@ nav:
               - dstack volume: docs/reference/cli/dstack/volume.md
               - dstack gateway: docs/reference/cli/dstack/gateway.md
               - dstack secret: docs/reference/cli/dstack/secret.md
-          - API:
-              - Python API: docs/reference/api/python/index.md
-              - REST API: docs/reference/api/rest/index.md
-          - Environment variables: docs/reference/environment-variables.md
-          - .dstack/profiles.yml: docs/reference/profiles.yml.md
-          - Plugins:
-              - Python API: docs/reference/plugins/python/index.md
-              - REST API: docs/reference/plugins/rest/index.md
-          - llms-full.txt: https://dstack.ai/llms-full.txt
-  - Examples:
-      - examples.md
-      - Single-node training:
-          - TRL: examples/single-node-training/trl/index.md
-          - Axolotl: examples/single-node-training/axolotl/index.md
-      - Distributed training:
-          - TRL: examples/distributed-training/trl/index.md
-          - Axolotl: examples/distributed-training/axolotl/index.md
-          - Ray+RAGEN: examples/distributed-training/ray-ragen/index.md
-      - Clusters:
-          - AWS: examples/clusters/aws/index.md
-          - GCP: examples/clusters/gcp/index.md
-          - Lambda: examples/clusters/lambda/index.md
-          - Crusoe: examples/clusters/crusoe/index.md
-          - NCCL/RCCL tests: examples/clusters/nccl-rccl-tests/index.md
-      - Inference:
-          - SGLang: examples/inference/sglang/index.md
-          - vLLM: examples/inference/vllm/index.md
-          - TGI: examples/inference/tgi/index.md
-          - NIM: examples/inference/nim/index.md
-          - TensorRT-LLM: examples/inference/trtllm/index.md
-      - Accelerators:
-          - AMD: examples/accelerators/amd/index.md
-          - TPU: examples/accelerators/tpu/index.md
-          - Intel Gaudi: examples/accelerators/intel/index.md
-          - Tenstorrent: examples/accelerators/tenstorrent/index.md
-      - Models:
-          - Wan2.2: examples/models/wan22/index.md
+              - dstack preset: docs/reference/cli/dstack/preset.md
+              - dstack export: docs/reference/cli/dstack/export.md
+              - dstack import: docs/reference/cli/dstack/import.md
+          - HTTP API:
+            - users: docs/reference/http/users.md
+            - projects: docs/reference/http/projects.md
+            - backends: docs/reference/http/backends.md
+            - fleets: docs/reference/http/fleets.md
+            - runs: docs/reference/http/runs.md
+            - gateways: docs/reference/http/gateways.md
+            - volumes: docs/reference/http/volumes.md
+            - logs: docs/reference/http/logs.md
+            - events: docs/reference/http/events.md
+            - repos: docs/reference/http/repos.md
+            - files: docs/reference/http/files.md
+            - secrets: docs/reference/http/secrets.md
+            - exports: docs/reference/http/exports.md
+            - metrics: docs/reference/http/metrics.md
+            - gpus: docs/reference/http/gpus.md
+            - templates: docs/reference/http/templates.md
+            - proxy: docs/reference/http/proxy.md
+            - authentication: docs/reference/http/authentication.md
+            - server: docs/reference/http/server.md
+          - Environment variables: docs/reference/env.md
+          - More:
+            - .dstack/profiles.yml: docs/reference/profiles.yml.md
+            - Plugins:
+                - Python API: docs/reference/plugins/python/index.md
+                - REST API: docs/reference/plugins/rest/index.md
+            - llms-full.txt: https://dstack.ai/llms-full.txt
+            - skill.md: https://dstack.ai/skill.md
+  - Case studies: blog/case-studies.md
   - Blog:
       - blog/index.md
-  - Case studies: blog/case-studies.md
-  - Benchmarks: blog/benchmarks.md
-#  - Discord: https://discord.gg/u8SmfwPpMd" target="_blank
 #  - Changelog: https://github.com/dstackai/dstack/releases" target="_blank
 #  - GitHub: https://github.com/dstackai/dstack" target="_blank
 #  - Sign in: https://sky.dstack.ai" target="_blank

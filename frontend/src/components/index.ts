@@ -64,8 +64,11 @@ export type { ModalProps } from '@cloudscape-design/components/modal';
 export { default as AnchorNavigation } from '@cloudscape-design/components/anchor-navigation';
 export { default as ExpandableSection } from '@cloudscape-design/components/expandable-section';
 export { default as KeyValuePairs } from '@cloudscape-design/components/key-value-pairs';
+export { default as TreeView } from '@cloudscape-design/components/tree-view';
 export { I18nProvider } from '@cloudscape-design/components/i18n';
 export { default as Wizard } from '@cloudscape-design/components/wizard';
+export { default as SegmentedControl } from '@cloudscape-design/components/segmented-control';
+export type { SegmentedControlProps } from '@cloudscape-design/components/segmented-control';
 
 // custom components
 export { NavigateLink } from './NavigateLink';
@@ -73,6 +76,7 @@ export { ListEmptyMessage } from './ListEmptyMessage';
 export { DetailsHeader } from './DetailsHeader';
 export { Loader } from './Loader';
 export { FormCheckbox } from './form/Checkbox';
+export { FormToggle } from './form/Toogle';
 export { FormInput } from './form/Input';
 export { FormMultiselect } from './form/Multiselect';
 export { FormSelect } from './form/Select';

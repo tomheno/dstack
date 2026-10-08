@@ -1,5 +1,6 @@
 import { configureStore } from '@reduxjs/toolkit';
 
+import confirmationReducer from 'components/ConfirmationDialog/slice';
 import notificationsReducer from 'components/Notifications/slice';
 
 import { artifactApi } from 'services/artifact';
@@ -9,11 +10,14 @@ import { fleetApi } from 'services/fleet';
 import { gatewayApi } from 'services/gateway';
 import { instanceApi } from 'services/instance';
 import { mainApi } from 'services/mainApi';
+import { presetApi } from 'services/preset';
 import { projectApi } from 'services/project';
+import { publicKeysApi } from 'services/publicKeys';
 import { repoApi } from 'services/repo';
 import { runApi } from 'services/run';
 import { secretApi } from 'services/secrets';
 import { serverApi } from 'services/server';
+import { templateApi } from 'services/templates';
 import { userApi } from 'services/user';
 import { volumeApi } from 'services/volume';
 
@@ -25,6 +29,7 @@ export const store = configureStore({
     reducer: {
         app: appReducer,
         notifications: notificationsReducer,
+        confirmation: confirmationReducer,
         [projectApi.reducerPath]: projectApi.reducer,
         [runApi.reducerPath]: runApi.reducer,
         [artifactApi.reducerPath]: artifactApi.reducer,
@@ -35,11 +40,14 @@ export const store = configureStore({
         [authApi.reducerPath]: authApi.reducer,
         [serverApi.reducerPath]: serverApi.reducer,
         [volumeApi.reducerPath]: volumeApi.reducer,
+        [presetApi.reducerPath]: presetApi.reducer,
         [secretApi.reducerPath]: secretApi.reducer,
         [gpuApi.reducerPath]: gpuApi.reducer,
         [repoApi.reducerPath]: repoApi.reducer,
         [mainApi.reducerPath]: mainApi.reducer,
+        [publicKeysApi.reducerPath]: publicKeysApi.reducer,
         [eventApi.reducerPath]: eventApi.reducer,
+        [templateApi.reducerPath]: templateApi.reducer,
     },
 
     middleware: (getDefaultMiddleware) =>
@@ -56,10 +64,13 @@ export const store = configureStore({
             .concat(authApi.middleware)
             .concat(serverApi.middleware)
             .concat(volumeApi.middleware)
+            .concat(presetApi.middleware)
             .concat(secretApi.middleware)
             .concat(gpuApi.middleware)
+            .concat(publicKeysApi.middleware)
             .concat(eventApi.middleware)
             .concat(repoApi.middleware)
+            .concat(templateApi.middleware)
             .concat(mainApi.middleware),
 });
 

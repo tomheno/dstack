@@ -1,11 +1,13 @@
 """
-Environment variables read by the dstack server. Documented in reference/environment-variables.md
+Environment variables read by the dstack server. Documented in reference/env.md
 """
 
 import os
 from enum import Enum
 from pathlib import Path
+from typing import Optional
 
+from dstack._internal.server.utils.settings import parse_hostname_port
 from dstack._internal.utils.env import environ
 from dstack._internal.utils.logging import get_logger
 
@@ -15,13 +17,38 @@ DSTACK_DIR_PATH = Path("~/.dstack/").expanduser()
 
 SERVER_DIR_PATH = Path(os.getenv("DSTACK_SERVER_DIR", DSTACK_DIR_PATH / "server")).resolve()
 
-SERVER_CONFIG_FILE_PATH = SERVER_DIR_PATH / "config.yml"
 
-SERVER_DATA_DIR_PATH = SERVER_DIR_PATH / "data"
-SERVER_DATA_DIR_PATH.mkdir(parents=True, exist_ok=True)
-DATABASE_URL = os.getenv(
-    "DSTACK_DATABASE_URL", f"sqlite+aiosqlite:///{str(SERVER_DATA_DIR_PATH.absolute())}/sqlite.db"
-)
+# Paths under `SERVER_DIR_PATH` are derived on access rather than at import time, so that
+# patching `SERVER_DIR_PATH` redirects all of them. Tests rely on this to keep each worker's
+# server state out of the real `~/.dstack`.
+#
+# TODO: Turn module level-constants into a ServerSettings class instance so that
+# all settings can be properties and there is no constant/function distinction.
+
+
+def get_server_config_file_path() -> Path:
+    return SERVER_DIR_PATH / "config.yml"
+
+
+def get_server_data_dir_path() -> Path:
+    return SERVER_DIR_PATH / "data"
+
+
+def init_server_data_dir() -> Path:
+    """
+    Creates the server data dir. Call before connecting to the default SQLite database.
+    """
+    data_dir = get_server_data_dir_path()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+
+def get_database_url() -> str:
+    return os.getenv(
+        "DSTACK_DATABASE_URL",
+        f"sqlite+aiosqlite:///{get_server_data_dir_path()}/sqlite.db",
+    )
+
 
 SERVER_HOST = os.getenv("DSTACK_SERVER_HOST", "localhost")
 SERVER_PORT = int(os.getenv("DSTACK_SERVER_PORT", "8000"))
@@ -37,19 +64,13 @@ ALEMBIC_MIGRATIONS_LOCATION = os.getenv(
     "DSTACK_ALEMBIC_MIGRATIONS_LOCATION", "dstack._internal.server:migrations"
 )
 
-# Users may want to increase client pool size to support more concurrent resources
-# if their db supports many connections.
+# Users may want to decrease client pool size to run on small DB instances
+# or increase client pool size to support more concurrent requests.
 DB_POOL_SIZE = int(os.getenv("DSTACK_DB_POOL_SIZE", 20))
 DB_MAX_OVERFLOW = int(os.getenv("DSTACK_DB_MAX_OVERFLOW", 20))
-
-# Scale the number of background processing tasks
-# allowing to process more resources on one server replica.
-# Not recommended to change on SQLite.
-# DSTACK_DB_POOL_SIZE and DSTACK_DB_MAX_OVERFLOW
-# must be increased proportionally.
-SERVER_BACKGROUND_PROCESSING_FACTOR = int(
-    os.getenv("DSTACK_SERVER_BACKGROUND_PROCESSING_FACTOR", 1)
-)
+DB_COMMAND_TIMEOUT: Optional[float] = float(os.getenv("DSTACK_DB_COMMAND_TIMEOUT", 300)) or None
+"""Bounds every operation on a Postgres connection so that a connection whose
+socket died silently is released back to the pool instead of being held forever. 0 disables the timeout."""
 
 SERVER_BACKGROUND_PROCESSING_DISABLED = (
     os.getenv("DSTACK_SERVER_BACKGROUND_PROCESSING_DISABLED") is not None
@@ -61,6 +82,8 @@ SERVER_EXECUTOR_MAX_WORKERS = int(os.getenv("DSTACK_SERVER_EXECUTOR_MAX_WORKERS"
 MAX_OFFERS_TRIED = int(os.getenv("DSTACK_SERVER_MAX_OFFERS_TRIED", 25))
 MAX_PROBES_PER_JOB = int(os.getenv("DSTACK_SERVER_MAX_PROBES_PER_JOB", 10))
 MAX_PROBE_TIMEOUT = int(os.getenv("DSTACK_SERVER_MAX_PROBE_TIMEOUT", 60 * 5))
+
+GATEWAY_MAX_REPLICAS = int(os.getenv("DSTACK_SERVER_GATEWAY_MAX_REPLICAS", 9))
 
 SERVER_CONFIG_DISABLED = os.getenv("DSTACK_SERVER_CONFIG_DISABLED") is not None
 SERVER_CONFIG_ENABLED = not SERVER_CONFIG_DISABLED
@@ -78,6 +101,15 @@ SERVER_CLOUDWATCH_LOG_REGION = os.getenv("DSTACK_SERVER_CLOUDWATCH_LOG_REGION")
 
 SERVER_GCP_LOGGING_PROJECT = os.getenv("DSTACK_SERVER_GCP_LOGGING_PROJECT")
 
+SERVER_FLUENTBIT_HOST = os.getenv("DSTACK_SERVER_FLUENTBIT_HOST")
+SERVER_FLUENTBIT_PORT = int(os.getenv("DSTACK_SERVER_FLUENTBIT_PORT", "24224"))
+SERVER_FLUENTBIT_PROTOCOL = os.getenv("DSTACK_SERVER_FLUENTBIT_PROTOCOL", "forward")
+SERVER_FLUENTBIT_TAG_PREFIX = os.getenv("DSTACK_SERVER_FLUENTBIT_TAG_PREFIX", "dstack")
+
+SERVER_ELASTICSEARCH_HOST = os.getenv("DSTACK_SERVER_ELASTICSEARCH_HOST")
+SERVER_ELASTICSEARCH_INDEX = os.getenv("DSTACK_SERVER_ELASTICSEARCH_INDEX", "dstack-logs")
+SERVER_ELASTICSEARCH_API_KEY = os.getenv("DSTACK_SERVER_ELASTICSEARCH_API_KEY")
+
 SERVER_METRICS_RUNNING_TTL_SECONDS = environ.get_int(
     "DSTACK_SERVER_METRICS_RUNNING_TTL_SECONDS", default=3600
 )
@@ -92,9 +124,19 @@ SERVER_INSTANCE_HEALTH_MIN_COLLECT_INTERVAL_SECONDS = environ.get_int(
 )
 
 SERVER_EVENTS_TTL_SECONDS = int(
-    # default documented in reference/environment-variables.md, keep in sync
+    # default documented in reference/env.md, keep in sync
     os.getenv("DSTACK_SERVER_EVENTS_TTL_SECONDS", 30 * 24 * 3600)
 )
+
+SSHPROXY_API_TOKEN = environ.get("DSTACK_SSHPROXY_API_TOKEN") or None
+SSHPROXY_HOSTNAME, SSHPROXY_PORT = environ.get_callback(
+    "DSTACK_SERVER_SSHPROXY_ADDRESS", parse_hostname_port, default=(None, None)
+)
+SSHPROXY_ENABLED = SSHPROXY_API_TOKEN is not None and SSHPROXY_HOSTNAME is not None
+SSHPROXY_ENFORCED = os.getenv("DSTACK_SERVER_SSHPROXY_ENFORCED") is not None
+if SSHPROXY_ENFORCED and not SSHPROXY_ENABLED:
+    logger.warning("sshproxy is not enabled, ignoring DSTACK_SERVER_SSHPROXY_ENFORCED")
+    SSHPROXY_ENFORCED = False
 
 SERVER_KEEP_SHIM_TASKS = os.getenv("DSTACK_SERVER_KEEP_SHIM_TASKS") is not None
 
@@ -107,6 +149,28 @@ SENTRY_TRACES_BACKGROUND_SAMPLE_RATE = float(
 )
 SENTRY_PROFILES_SAMPLE_RATE = float(os.getenv("DSTACK_SENTRY_PROFILES_SAMPLE_RATE", 0))
 
+OTEL_TRACES_ENABLED = os.getenv("DSTACK_OTEL_TRACES_ENABLED") is not None
+"""Enables OpenTelemetry tracing. Requires the `otel` extra to be installed.
+The exporter is configured via standard `OTEL_*` env vars, e.g. `OTEL_EXPORTER_OTLP_ENDPOINT`.
+"""
+OTEL_TRACES_SAMPLE_RATE = float(os.getenv("DSTACK_OTEL_TRACES_SAMPLE_RATE", 1.0))
+"""Head sampling rate for traces. The default assumes sampling is done in an OTel collector."""
+OTEL_TRACES_BACKGROUND_SAMPLE_RATE = float(
+    os.getenv("DSTACK_OTEL_TRACES_BACKGROUND_SAMPLE_RATE", 1.0)
+)
+"""Head sampling rate for background task traces."""
+OTEL_LOGS_ENABLED = os.getenv("DSTACK_OTEL_LOGS_ENABLED") is not None
+"""Enables log export via OTLP. Requires the `otel` extra to be installed.
+The exporter is configured via standard `OTEL_*` env vars, e.g. `OTEL_EXPORTER_OTLP_ENDPOINT`.
+"""
+OTEL_METRICS_ENABLED = os.getenv("DSTACK_OTEL_METRICS_ENABLED") is not None
+"""Enables OpenTelemetry metrics. Requires the `otel` extra to be installed."""
+OTEL_METRICS_EXPORTERS = os.getenv("DSTACK_OTEL_METRICS_EXPORTERS")
+"""A comma-separated list of metrics exporters: `otlp` (push via OTLP, configured by
+standard `OTEL_*` env vars) and/or `prometheus` (expose via the /metrics endpoint).
+Defaults to `otlp`.
+"""
+
 DEFAULT_CREDS_DISABLED = os.getenv("DSTACK_DEFAULT_CREDS_DISABLED") is not None
 DEFAULT_CREDS_ENABLED = not DEFAULT_CREDS_DISABLED
 
@@ -116,11 +180,32 @@ ACME_EAB_HMAC_KEY = os.getenv("DSTACK_ACME_EAB_HMAC_KEY")
 DEFAULT_SERVICE_CLIENT_MAX_BODY_SIZE = int(
     os.getenv("DSTACK_DEFAULT_SERVICE_CLIENT_MAX_BODY_SIZE", 64 * 1024 * 1024)
 )
+SERVICE_CLIENT_TIMEOUT = environ.get_int("DSTACK_SERVICE_CLIENT_TIMEOUT", default=300)
+
+SERVER_DEFAULT_DOCKER_REGISTRY = os.getenv("DSTACK_SERVER_DEFAULT_DOCKER_REGISTRY") or None
+SERVER_DEFAULT_DOCKER_REGISTRY_USERNAME = (
+    os.getenv("DSTACK_SERVER_DEFAULT_DOCKER_REGISTRY_USERNAME") or None
+)
+SERVER_DEFAULT_DOCKER_REGISTRY_PASSWORD = (
+    os.getenv("DSTACK_SERVER_DEFAULT_DOCKER_REGISTRY_PASSWORD") or None
+)
 
 USER_PROJECT_DEFAULT_QUOTA = int(os.getenv("DSTACK_USER_PROJECT_DEFAULT_QUOTA", 10))
 FORBID_SERVICES_WITHOUT_GATEWAY = os.getenv("DSTACK_FORBID_SERVICES_WITHOUT_GATEWAY") is not None
+FORBID_DSTACK_IN_RUNS = os.getenv("DSTACK_FORBID_DSTACK_IN_RUNS") is not None
 
 SERVER_CODE_UPLOAD_LIMIT = int(os.getenv("DSTACK_SERVER_CODE_UPLOAD_LIMIT", 2 * 2**20))
+
+SERVER_TEMPLATES_REPO = os.getenv("DSTACK_SERVER_TEMPLATES_REPO")
+
+# Per-job log quota: maximum bytes of log output per calendar hour. 0 = unlimited.
+SERVER_LOG_QUOTA_PER_JOB_HOUR = int(
+    os.getenv("DSTACK_SERVER_LOG_QUOTA_PER_JOB_HOUR", 50 * 1024 * 1024)  # 50 MB
+)
+
+SERVER_SSH_POOL_DISABLED = os.getenv("DSTACK_SERVER_SSH_POOL_DISABLED") is not None
+SERVER_SSH_POOL_ENABLED = not SERVER_SSH_POOL_DISABLED
+SERVER_SSH_CONNECT_TIMEOUT = int(os.getenv("DSTACK_SERVER_SSH_CONNECT_TIMEOUT", 3))
 
 # Development settings
 
