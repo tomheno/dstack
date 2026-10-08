@@ -2,7 +2,7 @@ from base64 import b64decode
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 
 from dstack._internal.core.models.common import CoreModel, NetworkMode
 from dstack._internal.core.models.repos.remote import RemoteRepoCreds
@@ -195,9 +195,11 @@ class ShimVolumeInfo(CoreModel):
     volume_id: str
     init_fs: bool
     device_name: Optional[str] = None
-    # NFS mount details for SFS/network volumes
-    nfs_host: Optional[str] = None    # e.g., "nfs.fin-03.datacrunch.io"
-    nfs_pseudo: Optional[str] = None  # e.g., "/path/to/share"
+    # Fork: NFS mount details of a Verda SFS volume, for example
+    # "nfs.fin-03.datacrunch.io" and "/path/to/share". Sent only when set, so the body
+    # of every other volume stays as upstream sends it.
+    nfs_host: Optional[str] = Field(default=None, exclude_if=lambda v: v is None)
+    nfs_pseudo: Optional[str] = Field(default=None, exclude_if=lambda v: v is None)
 
 
 class PortMapping(CoreModel):
