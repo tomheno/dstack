@@ -100,7 +100,9 @@ class TestCreateInstanceForkFeatures:
             backend="verda",
             instance=SimpleNamespace(
                 name="CPU.4V.16G",
-                resources=SimpleNamespace(disk=SimpleNamespace(size_mib=102400), gpus=[], spot=False),
+                resources=SimpleNamespace(
+                    disk=SimpleNamespace(size_mib=102400), gpus=[], spot=False
+                ),
             ),
             region="FIN-03",
             price=0.0279,
@@ -169,9 +171,7 @@ class TestCreateInstanceForkFeatures:
 
     def test_mounts_sfs_volumes_before_the_shim_starts(self):
         os.environ.pop("DSTACK_DEBUG_SSH_PUBLIC_KEY", None)
-        _, _, script = self._run(
-            {}, volumes=[_sfs_volume()], volume_mounts={"vol-1": "/data"}
-        )
+        _, _, script = self._run({}, volumes=[_sfs_volume()], volume_mounts={"vol-1": "/data"})
         assert script.index("mount -t nfs") < script.index("echo shim")
 
 
@@ -180,7 +180,9 @@ class TestRunJob:
         compute = VerdaCompute.__new__(VerdaCompute)
         captured = {}
 
-        def fake_create_instance(instance_offer, instance_config, placement_group, volume_mounts=None):
+        def fake_create_instance(
+            instance_offer, instance_config, placement_group, volume_mounts=None
+        ):
             captured["config"] = instance_config
             captured["volume_mounts"] = volume_mounts
             return "jpd"

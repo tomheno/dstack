@@ -154,7 +154,14 @@ class VerdaCompute(
         logger.info(
             "run_job called with %d volumes: %s",
             len(volumes),
-            [(v.name, v.volume_id, v.provisioning_data.backend_data if v.provisioning_data else None) for v in volumes]
+            [
+                (
+                    v.name,
+                    v.volume_id,
+                    v.provisioning_data.backend_data if v.provisioning_data else None,
+                )
+                for v in volumes
+            ],
         )
 
         volume_mounts: Dict[str, str] = {}
@@ -172,7 +179,9 @@ class VerdaCompute(
                             volume_mounts[vol.volume_id] = mount_point.path
                             logger.info(
                                 "Mapped volume %s (id=%s) to mount path %s",
-                                vol.name, vol.volume_id, mount_point.path
+                                vol.name,
+                                vol.volume_id,
+                                mount_point.path,
                             )
                             break
 
@@ -385,11 +394,13 @@ class VerdaCompute(
         size_gb = volume_data.get("size", 0)
 
         # Store SFS-specific data for NFS mounting
-        backend_data = json.dumps({
-            "pseudo_path": pseudo_path,
-            "location_code": location,
-            "volume_type": volume_type,
-        })
+        backend_data = json.dumps(
+            {
+                "pseudo_path": pseudo_path,
+                "location_code": location,
+                "volume_type": volume_type,
+            }
+        )
 
         return VolumeProvisioningData(
             backend=self.backend_type,
@@ -440,10 +451,7 @@ class VerdaCompute(
         volume_id = volume.volume_id
         instance_id = provisioning_data.instance_id
 
-        logger.info(
-            "Attaching SFS volume %s to instance %s",
-            volume_id, instance_id
-        )
+        logger.info("Attaching SFS volume %s to instance %s", volume_id, instance_id)
 
         try:
             token = _get_verda_access_token(
@@ -461,10 +469,7 @@ class VerdaCompute(
                 "instance_ids": [instance_id],
             }
 
-            logger.info(
-                "Calling Verda volume API: PUT /v1/volumes with payload=%s",
-                payload
-            )
+            logger.info("Calling Verda volume API: PUT /v1/volumes with payload=%s", payload)
 
             response = requests.put(
                 "https://api.datacrunch.io/v1/volumes",
@@ -475,7 +480,8 @@ class VerdaCompute(
 
             logger.info(
                 "Verda volume API response: status=%d body=%s",
-                response.status_code, response.text[:500] if response.text else "(empty)"
+                response.status_code,
+                response.text[:500] if response.text else "(empty)",
             )
 
             # 202 Accepted is a valid response - means the request was accepted for async processing
@@ -492,8 +498,7 @@ class VerdaCompute(
                 )
 
             logger.info(
-                "Successfully attached SFS volume %s to instance %s",
-                volume_id, instance_id
+                "Successfully attached SFS volume %s to instance %s", volume_id, instance_id
             )
 
             # SFS volumes don't have a device_name - they're mounted via NFS
@@ -518,8 +523,7 @@ class VerdaCompute(
         instance_id = provisioning_data.instance_id
 
         logger.info(
-            "Detaching SFS volume %s from instance %s (force=%s)",
-            volume_id, instance_id, force
+            "Detaching SFS volume %s from instance %s (force=%s)", volume_id, instance_id, force
         )
 
         try:
@@ -562,13 +566,14 @@ class VerdaCompute(
                 else:
                     logger.warning(
                         "Failed to detach volume %s from instance %s (force=True, ignoring): %s",
-                        volume_id, instance_id, error_msg
+                        volume_id,
+                        instance_id,
+                        error_msg,
                     )
                     return
 
             logger.info(
-                "Successfully detached SFS volume %s from instance %s",
-                volume_id, instance_id
+                "Successfully detached SFS volume %s from instance %s", volume_id, instance_id
             )
 
         except requests.exceptions.RequestException as e:
@@ -576,8 +581,7 @@ class VerdaCompute(
                 raise ComputeError(f"Failed to detach volume {volume_id}: {e}")
             else:
                 logger.warning(
-                    "Failed to detach volume %s (force=True, ignoring): %s",
-                    volume_id, e
+                    "Failed to detach volume %s (force=True, ignoring): %s", volume_id, e
                 )
 
 
@@ -664,13 +668,16 @@ def _get_sfs_mount_commands(
 
     logger.info(
         "_get_sfs_mount_commands: processing %d volumes, volume_mounts=%s",
-        len(volumes), volume_mounts
+        len(volumes),
+        volume_mounts,
     )
 
     # Check if we have any volumes to mount - if so, ensure nfs-common is installed
     has_volumes_to_mount = any(
-        volume.provisioning_data and volume.provisioning_data.backend_data
-        and volume.volume_id and volume.volume_id in volume_mounts
+        volume.provisioning_data
+        and volume.provisioning_data.backend_data
+        and volume.volume_id
+        and volume.volume_id in volume_mounts
         for volume in volumes
     )
     if has_volumes_to_mount:
@@ -685,18 +692,12 @@ def _get_sfs_mount_commands(
 
     for volume in volumes:
         if not volume.provisioning_data or not volume.provisioning_data.backend_data:
-            logger.info(
-                "Skipping volume %s: no provisioning_data or backend_data",
-                volume.name
-            )
+            logger.info("Skipping volume %s: no provisioning_data or backend_data", volume.name)
             continue
 
         volume_id = volume.volume_id
         if not volume_id or volume_id not in volume_mounts:
-            logger.info(
-                "Skipping volume %s (id=%s): not in volume_mounts",
-                volume.name, volume_id
-            )
+            logger.info("Skipping volume %s (id=%s): not in volume_mounts", volume.name, volume_id)
             continue
 
         try:
@@ -731,7 +732,10 @@ def _get_sfs_mount_commands(
 
         logger.info(
             "SFS mount for volume %s: nfs.%s.datacrunch.io:%s -> %s",
-            volume.name, dc, pseudo_path, host_mount_path
+            volume.name,
+            dc,
+            pseudo_path,
+            host_mount_path,
         )
 
     logger.info("_get_sfs_mount_commands: returning %d commands: %s", len(commands), commands)
