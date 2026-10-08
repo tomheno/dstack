@@ -1,3 +1,5 @@
+import json
+import os
 from collections.abc import Iterable
 from typing import Dict, List, Optional
 
@@ -11,7 +13,9 @@ from dstack._internal.core.backends.base.compute import (
     ComputeWithCreateInstanceSupport,
     ComputeWithInstanceVolumesSupport,
     ComputeWithPrivilegedSupport,
+    ComputeWithVolumeSupport,
     generate_unique_instance_name,
+    get_job_instance_name,
     get_shim_commands,
 )
 from dstack._internal.core.backends.base.offers import (
@@ -22,6 +26,7 @@ from dstack._internal.core.backends.base.offers import (
 from dstack._internal.core.backends.verda.models import VerdaConfig
 from dstack._internal.core.errors import (
     BackendError,
+    ComputeError,
     NoCapacityError,
     NotYetTerminated,
     ProvisioningError,
@@ -33,13 +38,21 @@ from dstack._internal.core.models.instances import (
     InstanceConfiguration,
     InstanceOffer,
     InstanceOfferWithAvailability,
+    SSHKey,
 )
 from dstack._internal.core.models.placement import PlacementGroup
 from dstack._internal.core.models.resources import Memory, Range
-from dstack._internal.core.models.runs import JobProvisioningData, Requirements
+from dstack._internal.core.models.runs import Job, JobProvisioningData, Requirements, Run
+from dstack._internal.core.models.volumes import (
+    Volume,
+    VolumeAttachmentData,
+    VolumeMountPoint,
+    VolumeProvisioningData,
+)
+from dstack._internal.utils.common import get_or_error
 from dstack._internal.utils.logging import get_logger
 
-logger = get_logger("verda.compute")
+logger = get_logger(__name__)
 
 MAX_INSTANCE_NAME_LEN = 60
 
@@ -53,6 +66,7 @@ class VerdaCompute(
     ComputeWithCreateInstanceSupport,
     ComputeWithPrivilegedSupport,
     ComputeWithInstanceVolumesSupport,
+    ComputeWithVolumeSupport,
     Compute,
 ):
     def __init__(self, config: VerdaConfig, backend_type: BackendType):
@@ -102,11 +116,84 @@ class VerdaCompute(
 
         return availability_offers
 
+    def run_job(
+        self,
+        run: Run,
+        job: Job,
+        instance_offer: InstanceOfferWithAvailability,
+        project_ssh_public_key: str,
+        project_ssh_private_key: str,
+        volumes: List[Volume],
+        placement_group: Optional[PlacementGroup],
+        requirements: Requirements,
+        extra_authorized_keys: list[str],
+    ) -> JobProvisioningData:
+        """
+        Override run_job to handle SFS volume mounting.
+        SFS volumes are mounted via NFS in the startup script.
+        """
+        # Fork: authorize the caller's keys (typically the user key) on the Verda host too,
+        # next to the project key, for host-level debug access. Upstream passes them as
+        # `extra_authorized_keys` (VM backends otherwise send them to the shim only).
+        ssh_keys = [SSHKey(public=project_ssh_public_key.strip())]
+        for key in extra_authorized_keys:
+            if key and key.strip():
+                ssh_keys.append(SSHKey(public=key.strip()))
+
+        instance_config = InstanceConfiguration(
+            project_name=run.project_name,
+            instance_name=get_job_instance_name(run, job),
+            user=run.user,
+            ssh_keys=ssh_keys,
+            volumes=volumes,
+            reservation=requirements.reservation,
+            tags=run.run_spec.merged_profile.tags,
+        )
+
+        # Build volume mount mapping: volume_id -> mount_path
+        logger.info(
+            "run_job called with %d volumes: %s",
+            len(volumes),
+            [(v.name, v.volume_id, v.provisioning_data.backend_data if v.provisioning_data else None) for v in volumes]
+        )
+
+        volume_mounts: Dict[str, str] = {}
+        if run.run_spec.configuration.volumes:
+            for mount_point in run.run_spec.configuration.volumes:
+                if isinstance(mount_point, VolumeMountPoint):
+                    # Find the matching volume
+                    names = (
+                        mount_point.name
+                        if isinstance(mount_point.name, list)
+                        else [mount_point.name]
+                    )
+                    for vol in volumes:
+                        if vol.name in names and vol.volume_id:
+                            volume_mounts[vol.volume_id] = mount_point.path
+                            logger.info(
+                                "Mapped volume %s (id=%s) to mount path %s",
+                                vol.name, vol.volume_id, mount_point.path
+                            )
+                            break
+
+        logger.info("Final volume_mounts: %s", volume_mounts)
+
+        instance_offer = instance_offer.model_copy()
+        self._restrict_instance_offer_az_to_volumes_az(instance_offer, volumes)
+
+        return self.create_instance(
+            instance_offer,
+            instance_config,
+            placement_group=placement_group,
+            volume_mounts=volume_mounts,
+        )
+
     def create_instance(
         self,
         instance_offer: InstanceOfferWithAvailability,
         instance_config: InstanceConfiguration,
         placement_group: Optional[PlacementGroup],
+        volume_mounts: Optional[Dict[str, str]] = None,
     ) -> JobProvisioningData:
         instance_name = generate_unique_instance_name(
             instance_config, max_length=MAX_INSTANCE_NAME_LEN
@@ -124,8 +211,35 @@ class VerdaCompute(
                     )
                 )
 
-            commands = get_shim_commands()
+            # Fork: an optional debug SSH key from the server env (DSTACK_DEBUG_SSH_PUBLIC_KEY).
+            # Created per instance like the other keys, so the upstream cleanup removes it.
+            debug_ssh_key = os.environ.get("DSTACK_DEBUG_SSH_PUBLIC_KEY")
+            if debug_ssh_key:
+                logger.info("Adding debug SSH key from DSTACK_DEBUG_SSH_PUBLIC_KEY")
+                ssh_ids.append(
+                    _create_ssh_key(
+                        client=self.client,
+                        name=f"{instance_name}-debug.key",
+                        public_key=debug_ssh_key.strip(),
+                    )
+                )
+
+            # Fork: mount Verda SFS volumes over NFS before the shim starts.
+            sfs_mount_commands = _get_sfs_mount_commands(
+                volumes=instance_config.volumes or [],
+                volume_mounts=volume_mounts or {},
+                instance_region=instance_offer.region,
+            )
+            logger.info(
+                "SFS mount commands for instance %s: %s", instance_name, sfs_mount_commands
+            )
+            commands = sfs_mount_commands + get_shim_commands()
             startup_script = " ".join([" && ".join(commands)])
+            logger.info(
+                "Full startup script for instance %s: %s",
+                instance_name,
+                startup_script[:500] + "..." if len(startup_script) > 500 else startup_script,
+            )
             script_name = f"{instance_name}.sh"
             startup_script_id = _create_startup_script(
                 client=self.client,
@@ -235,6 +349,392 @@ class VerdaCompute(
             raise ProvisioningError(f"Unexpected Verda instance status: {instance.status!r}")
         if instance.status == "running":
             provisioning_data.hostname = instance.ip
+
+    def register_volume(self, volume: Volume) -> VolumeProvisioningData:
+        """
+        Register an existing SFS (Shared File System) volume from Verda.
+
+        SFS volumes are NFS-based shared filesystems that can be mounted to instances.
+        The volume must already exist in Verda and be of type *_Shared (e.g. NVMe_Shared).
+        """
+        volume_id = get_or_error(volume.configuration.volume_id)
+        volume_data = _get_volume_by_id(self.config, volume_id)
+
+        if volume_data is None:
+            raise ComputeError(f"Volume {volume_id} not found in Verda")
+
+        volume_type = volume_data.get("type", "")
+        if "Shared" not in volume_type:
+            raise ComputeError(
+                f"Volume {volume_id} is not an SFS volume (type: {volume_type}). "
+                "Only shared filesystem volumes (HDD_Shared, NVMe_Shared) are supported."
+            )
+
+        location = volume_data.get("location", "")
+        if volume.configuration.region and location.upper() != volume.configuration.region.upper():
+            raise ComputeError(
+                f"Volume {volume_id} is in region {location}, "
+                f"but configuration specifies region {volume.configuration.region}"
+            )
+
+        pseudo_path = volume_data.get("pseudo_path")
+        if not pseudo_path:
+            raise ComputeError(f"Volume {volume_id} has no pseudo_path for NFS mounting")
+
+        size_gb = volume_data.get("size", 0)
+
+        # Store SFS-specific data for NFS mounting
+        backend_data = json.dumps({
+            "pseudo_path": pseudo_path,
+            "location_code": location,
+            "volume_type": volume_type,
+        })
+
+        return VolumeProvisioningData(
+            backend=self.backend_type,
+            volume_id=volume_id,
+            size_gb=size_gb,
+            availability_zone=location,
+            # SFS volumes don't have dynamic pricing; use monthly price / 730 hours as estimate
+            price=volume_data.get("monthly_price"),
+            # SFS volumes must be attached via Verda API to authorize instance IP access
+            attachable=True,
+            detachable=True,
+            backend_data=backend_data,
+        )
+
+    def create_volume(self, volume: Volume) -> VolumeProvisioningData:
+        """
+        Creating SFS volumes via dstack is not supported.
+        Create volumes directly in the Verda dashboard and use volume_id to register them.
+        """
+        raise ComputeError(
+            "Creating SFS volumes via dstack is not supported for Verda/DataCrunch. "
+            "Please create the volume in the Verda dashboard and register it using volume_id."
+        )
+
+    def delete_volume(self, volume: Volume):
+        """
+        Deleting SFS volumes via dstack is not supported.
+        Delete volumes directly in the Verda dashboard.
+        """
+        raise ComputeError(
+            "Deleting SFS volumes via dstack is not supported for Verda/DataCrunch. "
+            "Please delete the volume in the Verda dashboard."
+        )
+
+    def attach_volume(
+        self, volume: Volume, provisioning_data: JobProvisioningData
+    ) -> VolumeAttachmentData:
+        """
+        Attach an SFS volume to an instance via Verda API.
+
+        This authorizes the instance IP to access the NFS share.
+        The actual NFS mount is done via the startup script.
+
+        API: PUT /v1/volumes with body {"action": "attach", "id": "<volume_id>", "instance_ids": ["<instance_id>"]}
+        """
+        import requests
+
+        volume_id = volume.volume_id
+        instance_id = provisioning_data.instance_id
+
+        logger.info(
+            "Attaching SFS volume %s to instance %s",
+            volume_id, instance_id
+        )
+
+        try:
+            token = _get_verda_access_token(
+                self.config.creds.client_id,
+                self.config.creds.client_secret,
+            )
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+
+            payload = {
+                "action": "attach",
+                "id": volume_id,
+                "instance_ids": [instance_id],
+            }
+
+            logger.info(
+                "Calling Verda volume API: PUT /v1/volumes with payload=%s",
+                payload
+            )
+
+            response = requests.put(
+                "https://api.datacrunch.io/v1/volumes",
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+
+            logger.info(
+                "Verda volume API response: status=%d body=%s",
+                response.status_code, response.text[:500] if response.text else "(empty)"
+            )
+
+            # 202 Accepted is a valid response - means the request was accepted for async processing
+            if response.status_code not in (200, 201, 202, 204):
+                error_msg = response.text
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get("message", error_data)
+                except Exception:
+                    pass
+                raise ComputeError(
+                    f"Failed to attach volume {volume_id} to instance {instance_id}: "
+                    f"HTTP {response.status_code} - {error_msg}"
+                )
+
+            logger.info(
+                "Successfully attached SFS volume %s to instance %s",
+                volume_id, instance_id
+            )
+
+            # SFS volumes don't have a device_name - they're mounted via NFS
+            return VolumeAttachmentData(device_name=None)
+
+        except requests.exceptions.RequestException as e:
+            raise ComputeError(f"Failed to attach volume {volume_id}: {e}")
+
+    def detach_volume(
+        self, volume: Volume, provisioning_data: JobProvisioningData, force: bool = False
+    ):
+        """
+        Detach an SFS volume from an instance via Verda API.
+
+        This revokes the instance IP's authorization to access the NFS share.
+
+        API: PUT /v1/volumes with body {"action": "detach", "id": "<volume_id>", "instance_ids": ["<instance_id>"]}
+        """
+        import requests
+
+        volume_id = volume.volume_id
+        instance_id = provisioning_data.instance_id
+
+        logger.info(
+            "Detaching SFS volume %s from instance %s (force=%s)",
+            volume_id, instance_id, force
+        )
+
+        try:
+            token = _get_verda_access_token(
+                self.config.creds.client_id,
+                self.config.creds.client_secret,
+            )
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+
+            payload = {
+                "action": "detach",
+                "id": volume_id,
+                "instance_ids": [instance_id],
+            }
+
+            response = requests.put(
+                "https://api.datacrunch.io/v1/volumes",
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+
+            # 202 Accepted is a valid response - means the request was accepted for async processing
+            if response.status_code not in (200, 201, 202, 204):
+                error_msg = response.text
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get("message", error_data)
+                except Exception:
+                    pass
+                # Don't fail on detach errors unless not forcing
+                if not force:
+                    raise ComputeError(
+                        f"Failed to detach volume {volume_id} from instance {instance_id}: "
+                        f"HTTP {response.status_code} - {error_msg}"
+                    )
+                else:
+                    logger.warning(
+                        "Failed to detach volume %s from instance %s (force=True, ignoring): %s",
+                        volume_id, instance_id, error_msg
+                    )
+                    return
+
+            logger.info(
+                "Successfully detached SFS volume %s from instance %s",
+                volume_id, instance_id
+            )
+
+        except requests.exceptions.RequestException as e:
+            if not force:
+                raise ComputeError(f"Failed to detach volume {volume_id}: {e}")
+            else:
+                logger.warning(
+                    "Failed to detach volume %s (force=True, ignoring): %s",
+                    volume_id, e
+                )
+
+
+def _get_verda_access_token(client_id: str, client_secret: str) -> str:
+    """
+    Get an OAuth2 access token from the Verda/DataCrunch API using client credentials.
+    """
+    import requests
+
+    token_url = "https://api.datacrunch.io/v1/oauth2/token"
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+
+    response = requests.post(token_url, data=data, timeout=30)
+    response.raise_for_status()
+    token_data = response.json()
+    return token_data["access_token"]
+
+
+def _get_volume_by_id(config: VerdaConfig, volume_id: str) -> Optional[Dict]:
+    """
+    Fetch volume details from Verda API via direct HTTP request.
+    The SDK's volume methods may not return all fields we need, so we use the REST API directly.
+    """
+    import requests
+
+    try:
+        # Get access token using OAuth2 client credentials
+        token = _get_verda_access_token(
+            config.creds.client_id,
+            config.creds.client_secret,
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        response = requests.get(
+            f"https://api.datacrunch.io/v1/volumes/{volume_id}",
+            headers=headers,
+            timeout=30,
+        )
+
+        if response.status_code == 404:
+            return None
+
+        response.raise_for_status()
+        data = response.json()
+        logger.debug(f"Volume API response for {volume_id}: {data}")
+        return data
+
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return None
+        raise ComputeError(f"Failed to fetch volume {volume_id}: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to fetch volume {volume_id}: {e}")
+        raise ComputeError(f"Failed to fetch volume {volume_id}: {e}")
+
+
+def _get_sfs_mount_commands(
+    volumes: List[Volume],
+    volume_mounts: Dict[str, str],
+    instance_region: str,
+) -> List[str]:
+    """
+    Generate NFS mount commands for SFS volumes.
+
+    SFS (Shared File System) volumes in Verda are NFS-based.
+    Mount command format: mount -t nfs -o nconnect=16 nfs.<DC>.datacrunch.io:<PSEUDO> <HOST_PATH>
+
+    The volume is mounted at /mnt/disks/dstack-volumes/<volume_name> on the host.
+    The shim then bind-mounts this to the user-specified container path.
+
+    Args:
+        volumes: List of Volume objects with provisioning data
+        volume_mounts: Mapping of volume_id -> mount_path (used to filter which volumes to mount)
+        instance_region: The region/datacenter of the instance (e.g., "FIN-01")
+
+    Returns:
+        List of shell commands to mount SFS volumes
+    """
+    commands = []
+
+    logger.info(
+        "_get_sfs_mount_commands: processing %d volumes, volume_mounts=%s",
+        len(volumes), volume_mounts
+    )
+
+    # Check if we have any volumes to mount - if so, ensure nfs-common is installed
+    has_volumes_to_mount = any(
+        volume.provisioning_data and volume.provisioning_data.backend_data
+        and volume.volume_id and volume.volume_id in volume_mounts
+        for volume in volumes
+    )
+    if has_volumes_to_mount:
+        # Install nfs-common if not already installed (needed for NFS mounts)
+        # Also unmask rpcbind.socket which may be masked on some images
+        commands.append(
+            "(which mount.nfs > /dev/null 2>&1 || "
+            "(systemctl unmask rpcbind.socket 2>/dev/null; "
+            "apt-get update -qq && apt-get install -y -qq nfs-common)) || "
+            "echo 'WARNING: Failed to install nfs-common'"
+        )
+
+    for volume in volumes:
+        if not volume.provisioning_data or not volume.provisioning_data.backend_data:
+            logger.info(
+                "Skipping volume %s: no provisioning_data or backend_data",
+                volume.name
+            )
+            continue
+
+        volume_id = volume.volume_id
+        if not volume_id or volume_id not in volume_mounts:
+            logger.info(
+                "Skipping volume %s (id=%s): not in volume_mounts",
+                volume.name, volume_id
+            )
+            continue
+
+        try:
+            backend_data = json.loads(volume.provisioning_data.backend_data)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(f"Failed to parse backend_data for volume {volume_id}")
+            continue
+
+        pseudo_path = backend_data.get("pseudo_path")
+        location_code = backend_data.get("location_code", instance_region)
+
+        if not pseudo_path:
+            logger.warning(f"Volume {volume_id} has no pseudo_path, skipping mount")
+            continue
+
+        # Datacenter code for NFS server (lowercase, e.g., "fin-01")
+        dc = location_code.lower()
+
+        # Mount at the path the shim expects: /mnt/disks/dstack-volumes/<volume_name>
+        # The shim will bind-mount this to the user-specified container path
+        host_mount_path = f"/mnt/disks/dstack-volumes/{volume.name}"
+
+        # Generate mount commands with error logging but non-blocking
+        # Use a subshell so failures don't stop the entire startup script
+        mount_cmd = (
+            f"(mkdir -p {host_mount_path} && "
+            f"mount -t nfs -o nconnect=16 nfs.{dc}.datacrunch.io:{pseudo_path} {host_mount_path} && "
+            f"echo 'SFS volume {volume.name} mounted successfully') || "
+            f"echo 'WARNING: Failed to mount SFS volume {volume.name}'"
+        )
+        commands.append(mount_cmd)
+
+        logger.info(
+            "SFS mount for volume %s: nfs.%s.datacrunch.io:%s -> %s",
+            volume.name, dc, pseudo_path, host_mount_path
+        )
+
+    logger.info("_get_sfs_mount_commands: returning %d commands: %s", len(commands), commands)
+    return commands
 
 
 def _get_vm_image_id(instance_offer: InstanceOfferWithAvailability) -> str:
