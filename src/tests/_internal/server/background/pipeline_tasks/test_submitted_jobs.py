@@ -64,6 +64,7 @@ from dstack._internal.server.models import (
     VolumeAttachmentModel,
 )
 from dstack._internal.server.services.docker import ImageConfig
+from dstack._internal.server.services.jobs import get_job_runtime_data
 from dstack._internal.server.services.jobs.configurators.base import JobConfigurator
 from dstack._internal.server.testing.common import (
     ComputeMockSpec,
@@ -2474,6 +2475,83 @@ class TestJobSubmittedWorker:
         assert volume.lock_token is None
         assert volume.lock_expires_at is None
         backend_mock.compute.return_value.attach_volume.assert_called_once()
+
+    async def test_reuses_existing_volume_attachment_on_existing_instance(
+        self, test_db, session: AsyncSession, worker: JobSubmittedWorker
+    ):
+        # Fork (db1d670ed): a reused fleet instance can still hold the attachment row of
+        # the volume from an earlier job. A second row breaks the UNIQUE constraint on
+        # (volume_id, instance_id), so the job must reuse the row and skip the attach call.
+        project = await create_project(session=session)
+        user = await create_user(session=session)
+        repo = await create_repo(session=session, project_id=project.id)
+        volume = await create_volume(
+            session=session,
+            project=project,
+            user=user,
+            status=VolumeStatus.ACTIVE,
+            volume_provisioning_data=get_volume_provisioning_data(),
+            backend=BackendType.AWS,
+            region="us-east-1",
+        )
+        fleet = await create_fleet(session=session, project=project)
+        instance = await create_instance(
+            session=session,
+            project=project,
+            fleet=fleet,
+            status=InstanceStatus.BUSY,
+            busy_blocks=1,
+            backend=BackendType.AWS,
+            region="us-east-1",
+        )
+        session.add(
+            VolumeAttachmentModel(
+                volume_id=volume.id,
+                instance=instance,
+                attachment_data=VolumeAttachmentData().model_dump_json(),
+            )
+        )
+        await session.commit()
+        run_spec = get_run_spec(repo_id=repo.name)
+        run_spec.configuration.volumes = [VolumeMountPoint(name=volume.name, path="/volume")]
+        run = await create_run(
+            session=session, project=project, repo=repo, user=user, run_spec=run_spec
+        )
+        job = await create_job(
+            session=session,
+            run=run,
+            instance=instance,
+            instance_assigned=True,
+        )
+
+        with patch("dstack._internal.server.services.backends.get_project_backend_by_type") as m:
+            backend_mock = Mock()
+            m.return_value = backend_mock
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value = Mock(spec=ComputeMockSpec)
+            backend_mock.compute.return_value.attach_volume.return_value = VolumeAttachmentData()
+
+            await _process_job(session=session, worker=worker, job_model=job)
+
+        res = await session.execute(
+            select(JobModel)
+            .where(JobModel.id == job.id)
+            .options(
+                joinedload(JobModel.instance)
+                .joinedload(InstanceModel.volume_attachments)
+                .joinedload(VolumeAttachmentModel.volume)
+            )
+            .execution_options(populate_existing=True)
+        )
+        job = res.unique().scalar_one()
+        assert job.status == JobStatus.PROVISIONING
+        assert job.instance is not None
+        assert len(job.instance.volume_attachments) == 1
+        assert job.instance.volume_attachments[0].volume_id == volume.id
+        backend_mock.compute.return_value.attach_volume.assert_not_called()
+        job_runtime_data = get_job_runtime_data(job)
+        assert job_runtime_data is not None
+        assert job_runtime_data.volume_names == [volume.name]
 
     async def test_terminates_job_when_volume_is_locked_for_processing(
         self, test_db, session: AsyncSession, worker: JobSubmittedWorker

@@ -413,6 +413,9 @@ class _VolumeAttachmentPayload:
     volume_id: uuid.UUID
     attachment_data: str
     volume_name: str
+    # Fork (db1d670ed): True when the instance already holds this attachment (a reused
+    # fleet instance). No backend attach call and no new attachment row then.
+    already_attached: bool = False
 
 
 @dataclass
@@ -1387,6 +1390,7 @@ async def _process_existing_instance_provisioning(
         job_model=context.job_model,
         prepared_job_volumes=prepared_job_volumes,
         job_provisioning_data=get_or_error(get_instance_provisioning_data(instance_model)),
+        instance_id=instance_model.id,
     )
     return _ExistingInstanceProvisioning(
         volume_attachment_result=volume_attachment_result,
@@ -1860,6 +1864,7 @@ async def _process_volume_attachments(
     job_model: JobModel,
     prepared_job_volumes: _PreparedJobVolumes,
     job_provisioning_data: JobProvisioningData,
+    instance_id: Optional[uuid.UUID] = None,
 ) -> _VolumeAttachmentResult:
     if len(prepared_job_volumes.volume_model_ids) == 0:
         return _VolumeAttachmentResult(attachments=[], locked_volume_ids=[])
@@ -1910,6 +1915,27 @@ async def _process_volume_attachments(
                     continue
                 if volume.provisioning_data is None or not volume.provisioning_data.attachable:
                     continue
+                existing_attachment = None
+                if instance_id is not None:
+                    existing_attachment = next(
+                        (a for a in volume_model.attachments if a.instance_id == instance_id),
+                        None,
+                    )
+                if existing_attachment is not None:
+                    logger.info(
+                        "%s: volume %s is already attached to the instance, skipping attach",
+                        fmt(job_model),
+                        volume.name,
+                    )
+                    attachments.append(
+                        _VolumeAttachmentPayload(
+                            volume_id=volume_model.id,
+                            attachment_data=existing_attachment.attachment_data or "",
+                            volume_name=volume.name,
+                            already_attached=True,
+                        )
+                    )
+                    break
                 attachment_data = await run_async(
                     compute.attach_volume,
                     volume=volume,
@@ -2097,6 +2123,8 @@ async def _apply_volume_attachment_result(
             .values(last_job_processed_at=now)
         )
         for attachment in volume_attachment_result.attachments:
+            if attachment.already_attached:
+                continue
             session.add(
                 VolumeAttachmentModel(
                     volume_id=attachment.volume_id,
