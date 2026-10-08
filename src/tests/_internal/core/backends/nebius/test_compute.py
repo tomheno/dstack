@@ -1,7 +1,9 @@
+from types import SimpleNamespace
+
 import pytest
 
 from dstack._internal.core.backends.nebius import compute as compute_module
-from dstack._internal.core.backends.nebius.compute import NebiusCompute
+from dstack._internal.core.backends.nebius.compute import NebiusCompute, _supported_instances
 from dstack._internal.core.backends.nebius.models import (
     NebiusConfig,
     NebiusServiceAccountCreds,
@@ -109,3 +111,22 @@ class TestGetAllOffersWithAvailability:
         offers = make_compute().get_all_offers_with_availability(unallocated_resources=False)
 
         assert offers[0].price == 1.2341
+
+
+class TestSupportedInstances:
+    # Fork: the RTX PRO 6000 runs as `gpu-rtx6000` (us-central1) and `gpu-rtx6000-a`
+    # (uk-south2). The deployed fork served both. Upstream lists only `gpu-rtx6000`.
+    @pytest.mark.parametrize(
+        "instance_name",
+        [
+            "gpu-rtx6000 1gpu-24vcpu-218gb",
+            "gpu-rtx6000-a 1gpu-24vcpu-218gb",
+        ],
+    )
+    def test_accepts_both_rtx_pro_6000_platforms(self, instance_name):
+        offer = SimpleNamespace(instance=SimpleNamespace(name=instance_name))
+        assert _supported_instances(offer)
+
+    def test_rejects_an_unknown_platform(self):
+        offer = SimpleNamespace(instance=SimpleNamespace(name="gpu-unknown 1gpu-8vcpu-32gb"))
+        assert not _supported_instances(offer)

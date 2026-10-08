@@ -90,6 +90,8 @@ SUPPORTED_PLATFORMS = [
     "gpu-l40s-a",
     "gpu-l40s-d",
     "gpu-rtx6000",
+    # Fork: the RTX PRO 6000 platform name in uk-south2.
+    "gpu-rtx6000-a",
     "cpu-d3",
     "cpu-e2",
 ]
