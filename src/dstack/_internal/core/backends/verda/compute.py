@@ -44,6 +44,7 @@ from dstack._internal.core.models.placement import PlacementGroup
 from dstack._internal.core.models.resources import Memory, Range
 from dstack._internal.core.models.runs import Job, JobProvisioningData, Requirements, Run
 from dstack._internal.core.models.volumes import (
+    VerdaVolumeConfiguration,
     Volume,
     VolumeAttachmentData,
     VolumeMountPoint,
@@ -367,6 +368,7 @@ class VerdaCompute(
         SFS volumes are NFS-based shared filesystems that can be mounted to instances.
         The volume must already exist in Verda and be of type *_Shared (e.g. NVMe_Shared).
         """
+        assert isinstance(volume.configuration, VerdaVolumeConfiguration)
         volume_id = get_or_error(volume.configuration.volume_id)
         volume_data = _get_volume_by_id(self.config, volume_id)
 

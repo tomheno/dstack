@@ -140,6 +140,20 @@ class RunpodVolumeConfiguration(
     """Runpod doesn't have AZs but we accept this field for compatibility with older clients."""
 
 
+class VerdaVolumeConfiguration(
+    VolumeConfigurationWithRegion, VolumeConfigurationWithVolumeID, VolumeConfigurationWithSize
+):
+    """Fork: an existing Verda (DataCrunch) SFS volume, registered by `volume_id` and mounted
+    over NFS. dstack does not create or delete SFS volumes."""
+
+    backend: Annotated[
+        Literal[BackendType.VERDA, BackendType.DATACRUNCH],
+        Field(description="The volume backend"),
+    ] = BackendType.VERDA
+    availability_zone: Annotated[Optional[str], Field(exclude=True)] = None
+    """Verda has no AZs. The field is accepted for the rows that dstack 0.20.3 stored."""
+
+
 class KubernetesVolumeConfiguration(VolumeConfigurationWithRegion, VolumeConfigurationWithSize):
     backend: Annotated[
         Literal[BackendType.KUBERNETES], Field(description="The volume backend")
@@ -192,6 +206,7 @@ AnyVolumeConfiguration = Union[
     AWSVolumeConfiguration,
     GCPVolumeConfiguration,
     RunpodVolumeConfiguration,
+    VerdaVolumeConfiguration,
     KubernetesVolumeConfiguration,
     DaytonaVolumeConfiguration,
 ]

@@ -17,6 +17,7 @@ from dstack._internal.core.backends.verda.compute import (
     _get_sfs_mount_commands,
 )
 from dstack._internal.core.errors import ComputeError
+from dstack._internal.core.models.volumes import VerdaVolumeConfiguration
 
 
 def _sfs_volume(name="data", volume_id="vol-1", location="FIN-03", pseudo="/share-1"):
@@ -61,7 +62,7 @@ class TestGetSfsMountCommands:
 class TestRegisterVolume:
     def _volume(self):
         return SimpleNamespace(
-            configuration=SimpleNamespace(volume_id="vol-1", region="FIN-03"),
+            configuration=VerdaVolumeConfiguration(volume_id="vol-1", region="FIN-03"),
         )
 
     def test_rejects_a_volume_that_is_not_shared(self):
