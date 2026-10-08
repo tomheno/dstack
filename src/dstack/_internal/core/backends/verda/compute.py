@@ -226,7 +226,8 @@ class VerdaCompute(
 
             # Fork: mount Verda SFS volumes over NFS before the shim starts.
             sfs_mount_commands = _get_sfs_mount_commands(
-                volumes=instance_config.volumes or [],
+                # getattr: some callers (and upstream tests) pass a config without volumes.
+                volumes=getattr(instance_config, "volumes", None) or [],
                 volume_mounts=volume_mounts or {},
                 instance_region=instance_offer.region,
             )
